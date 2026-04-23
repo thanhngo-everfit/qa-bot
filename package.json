@@ -1,0 +1,23 @@
+{
+  "name": "everfit-qabot",
+  "version": "1.0.0",
+  "description": "QA bot: tag @qa-tracker in a bug thread → log to Jira with Epic + FixVersion",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@slack/bolt": "^3.22.0",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "form-data": "^4.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
