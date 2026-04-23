@@ -30,8 +30,12 @@ async function resolveJiraAccountId(slackClient, slackUserId) {
   } catch { return null; }
 }
 
-async function getThread(client, channelId, threadTs) {
-  const result   = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 });
+function buildSlackThreadUrl(channelId, threadTs) {
+  const ts = threadTs.replace('.', '');
+  return `https://everfit.slack.com/archives/${channelId}/p${ts}`;
+}
+
+async function getThread(client, channelId, threadTs) {  const result   = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 });
   const messages = result.messages || [];
   const lines    = await Promise.all(messages.map(async msg => {
     let name = msg.username || msg.user || 'user';
@@ -220,7 +224,7 @@ function buildAdfDescription(text) {
   return { type: 'doc', version: 1, content };
 }
 
-async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, parentKey) {
+async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, parentKey, reporterJiraId) {
   const fields = {
     project:     { key: JIRA_PROJECT },
     summary:     ticket.summary,
@@ -234,6 +238,12 @@ async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, pa
   if (epicKey) fields['customfield_10014'] = epicKey;
   if (fixVersionId) fields.fixVersions = [{ id: fixVersionId }];
   if (jiraAccountIds.length > 0) fields.assignee = { accountId: jiraAccountIds[0] };
+
+  // Reporter + QA: person who tagged the bot
+  if (reporterJiraId) {
+    fields.reporter                = { accountId: reporterJiraId };
+    fields['customfield_10010']    = { accountId: reporterJiraId };  // QA field
+  }
 
   const res = await axios.post(`${JIRA_HOST}/rest/api/3/issue`, { fields }, {
     headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -552,10 +562,18 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     const parentKey = await pickParentFromCanvas(client, event.channel, ticket.platform);
     logger.info(`[QABot] Parent from canvas: ${parentKey || 'none'}`);
 
+    // Resolve triggering user's Jira ID for Reporter + QA field
+    const reporterJiraId = await resolveJiraAccountId(client, event.user);
+    logger.info(`[QABot] Reporter/QA set to: ${event.user} → Jira ${reporterJiraId || 'not found'}`);
+
+    // Prepend Slack thread URL to description
+    const slackThreadUrl = buildSlackThreadUrl(event.channel, threadTs);
+    ticket.description = `Slack thread: ${slackThreadUrl}\n\n${ticket.description}`;
+
     const attachments = await getFirstMessageAttachments(client, event.channel, threadTs);
     logger.info(`[QABot] Creating: epic=${epicKey || 'none'} fixVersion=${fixVersionId || 'none'} parent=${parentKey || 'none'} attachments=${attachments.length}`);
 
-    const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey);
+    const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId);
 
     const sprintId = '249';
     if (sprintId) await addIssueToSprint(jira.key, sprintId);
