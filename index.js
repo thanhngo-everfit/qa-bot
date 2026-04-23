@@ -183,7 +183,7 @@ function buildAdfDescription(text) {
   return { type: 'doc', version: 1, content };
 }
 
-async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId) {
+async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, parentKey) {
   const fields = {
     project:     { key: JIRA_PROJECT },
     summary:     ticket.summary,
@@ -192,7 +192,8 @@ async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId) {
     description: buildAdfDescription(ticket.description),
   };
 
-  // Parent (platform) — do NOT auto-fill; QA/PM sets manually
+  // Parent from channel canvas (if found)
+  if (parentKey) fields.parent = { key: parentKey };
   if (epicKey) fields['customfield_10014'] = epicKey;
   if (fixVersionId) fields.fixVersions = [{ id: fixVersionId }];
   if (jiraAccountIds.length > 0) fields.assignee = { accountId: jiraAccountIds[0] };
@@ -239,6 +240,47 @@ async function findSlackUserByName(client, name) {
     );
     return match?.id ?? null;
   } catch { return null; }
+}
+
+// ── Read channel canvas and extract parent Jira key ──
+async function getParentFromChannelCanvas(client, channelId) {
+  try {
+    // Get channel info to find the canvas file_id
+    const info = await client.conversations.info({ channel: channelId });
+    const canvasFileId = info.channel?.properties?.canvas?.file_id;
+    if (!canvasFileId) {
+      console.warn('[QABot] No canvas found on channel', channelId);
+      return null;
+    }
+
+    // Get the canvas file metadata
+    const fileInfo = await client.files.info({ file: canvasFileId });
+    const downloadUrl = fileInfo.file?.url_private_download || fileInfo.file?.url_private;
+    if (!downloadUrl) {
+      console.warn('[QABot] Canvas file has no download URL');
+      return null;
+    }
+
+    // Download canvas content with bot token
+    const res = await axios.get(downloadUrl, {
+      headers:      { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+      responseType: 'text',
+      transformResponse: [d => d], // keep raw
+    });
+    const content = String(res.data || '');
+
+    // Match Jira URL pattern or UP-XXXXX key in the canvas
+    const urlMatch = content.match(/everfit\.atlassian\.net\/browse\/(UP-\d+)/i);
+    if (urlMatch) return urlMatch[1].toUpperCase();
+
+    const keyMatch = content.match(/\b(UP-\d+)\b/i);
+    if (keyMatch) return keyMatch[1].toUpperCase();
+
+    return null;
+  } catch (err) {
+    console.warn('[QABot] Could not read channel canvas:', err.message);
+    return null;
+  }
 }
 
 slackApp.event('app_mention', async ({ event, client, logger }) => {
@@ -291,10 +333,14 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     // Hardcoded fix version = "To be confirmed" (ID 12023)
     const fixVersionId = '12023';
 
-    const attachments = await getFirstMessageAttachments(client, event.channel, threadTs);
-    logger.info(`[QABot] Creating: epic=${epicKey || 'none'} fixVersion=${fixVersionId || 'none'} attachments=${attachments.length}`);
+    // Read parent from channel canvas
+    const parentKey = await getParentFromChannelCanvas(client, event.channel);
+    logger.info(`[QABot] Parent from canvas: ${parentKey || 'none'}`);
 
-    const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId);
+    const attachments = await getFirstMessageAttachments(client, event.channel, threadTs);
+    logger.info(`[QABot] Creating: epic=${epicKey || 'none'} fixVersion=${fixVersionId || 'none'} parent=${parentKey || 'none'} attachments=${attachments.length}`);
+
+    const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey);
 
     const sprintId = await getActiveSprintId();
     if (sprintId) await addIssueToSprint(jira.key, sprintId);
@@ -313,6 +359,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       ? `Assigned to ${assigneeSlackIds.map(id => `<@${id}>`).join(', ')}`
       : '_No assignee — please assign in Jira_';
 
+    const parentLine = parentKey ? `\nParent: <${JIRA_HOST}/browse/${parentKey}|${parentKey}>` : '';
     const epicLine   = epicKey ? `\nEpic: <${JIRA_HOST}/browse/${epicKey}|${epicKey}>` : '';
     const attachLine = uploaded > 0 ? `\n📎 ${uploaded} attachment${uploaded > 1 ? 's' : ''} uploaded` : '';
 
@@ -322,7 +369,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
         `🐛 *Bug logged!* → <${jira.url}|${jira.key}>\n` +
         `*${ticket.summary}*\n` +
         `Priority: *${ticket.priority}* · Platform: *${ticket.platform}*\n` +
-        `${assigneeLine}${epicLine}${attachLine}`,
+        `${assigneeLine}${parentLine}${epicLine}${attachLine}`,
     });
 
     await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
