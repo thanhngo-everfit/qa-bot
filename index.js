@@ -204,6 +204,99 @@ async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, pa
   return { key: res.data.key, url: `${JIRA_HOST}/browse/${res.data.key}` };
 }
 
+// ── Fetch Jira issue title ────────────────────
+async function getJiraIssueTitle(issueKey) {
+  try {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/issue/${issueKey}?fields=summary`, {
+      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+    });
+    return res.data?.fields?.summary || null;
+  } catch { return null; }
+}
+
+// ── Read channel canvas content ───────────────
+async function getChannelCanvasContent(client, channelId) {
+  try {
+    const chan = await client.conversations.info({ channel: channelId });
+    const tabs = chan.channel?.properties?.tabs || [];
+    const canvasTab = tabs.find(t => t.type === 'canvas');
+    const canvasFileId = canvasTab?.id || chan.channel?.properties?.canvas?.file_id;
+    if (!canvasFileId) return null;
+
+    const fileInfo = await client.files.info({ file: canvasFileId });
+    const url = fileInfo.file?.url_private;
+    if (!url) return null;
+
+    const res = await axios.get(url, {
+      headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+      responseType: 'text',
+    });
+    return typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+  } catch (err) {
+    console.warn('[QABot] Could not read canvas:', err.message);
+    return null;
+  }
+}
+
+// ── Pick parent from canvas based on bug platform ──
+async function pickParentFromCanvas(client, channelId, bugPlatform) {
+  const canvasContent = await getChannelCanvasContent(client, channelId);
+  if (!canvasContent) return null;
+
+  // Extract all UP-XXXXX keys from canvas
+  const keys = [...new Set((canvasContent.match(/UP-\d+/g) || []))];
+  if (keys.length === 0) return null;
+
+  // Fetch all titles
+  const results = await Promise.all(keys.map(async k => ({ key: k, title: await getJiraIssueTitle(k) })));
+  const parents = results.filter(r => r.title);
+  if (parents.length === 0) return null;
+
+  // Check if a title starts with a given platform prefix (e.g. "iOS -", "iOS |", "iOS-")
+  const matchPrefix = prefix => parents.find(p => {
+    const lower = p.title.toLowerCase().trim();
+    const pf    = prefix.toLowerCase();
+    return lower.startsWith(pf + ' -')
+        || lower.startsWith(pf + '-')
+        || lower.startsWith(pf + ' |')
+        || lower.startsWith(pf + '|');
+  });
+
+  // Priority: exact match → Mobile (for iOS/Android) → All Platforms
+  let priorities;
+  switch (bugPlatform) {
+    case 'iOS Client':
+    case 'iOS Coach':
+      priorities = ['iOS', 'Mobile', 'All Platforms'];
+      break;
+    case 'Android Client':
+    case 'Android Coach':
+      priorities = ['Android', 'Mobile', 'All Platforms'];
+      break;
+    case 'Web':
+      priorities = ['Web', 'All Platforms'];
+      break;
+    case 'API':
+      priorities = ['API', 'All Platforms'];
+      break;
+    case 'CMS':
+      priorities = ['CMS', 'All Platforms'];
+      break;
+    default:
+      priorities = ['All Platforms'];
+  }
+
+  for (const prefix of priorities) {
+    const match = matchPrefix(prefix);
+    if (match) {
+      console.log(`[QABot] Parent matched: ${match.key} "${match.title}" via prefix "${prefix}"`);
+      return match.key;
+    }
+  }
+  console.log(`[QABot] No parent found in canvas for platform=${bugPlatform}`);
+  return null;
+}
+
 async function getActiveSprintId() {
   try {
     const boardRes = await axios.get(`${JIRA_HOST}/rest/agile/1.0/board`, {
@@ -333,8 +426,8 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     // Hardcoded fix version = "To be confirmed" (ID 12023)
     const fixVersionId = '12023';
 
-    // Read parent from channel canvas
-    const parentKey = await getParentFromChannelCanvas(client, event.channel);
+    // Read parent from channel canvas (matched by bug platform)
+    const parentKey = await pickParentFromCanvas(client, event.channel, ticket.platform);
     logger.info(`[QABot] Parent from canvas: ${parentKey || 'none'}`);
 
     const attachments = await getFirstMessageAttachments(client, event.channel, threadTs);
