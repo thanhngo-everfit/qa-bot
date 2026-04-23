@@ -7,16 +7,6 @@ const FormData = require('form-data');
 const JIRA_HOST    = 'https://everfit.atlassian.net';
 const JIRA_PROJECT = 'UP';
 
-// ── Platform → Jira parent ticket ─────────────
-const PLATFORM_PARENTS = {
-  'iOS Client':     'UP-23735',
-  'iOS Coach':      'UP-23735',
-  'Android Client': 'UP-23734',
-  'Android Coach':  'UP-23734',
-  'Web':            'UP-23736',
-  'API':            'UP-23733',
-};
-
 const slackApp = new App({
   token:         process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
@@ -122,28 +112,38 @@ async function parseBugReport(context) {
   const res = await anthropic.messages.create({
     model:      'claude-haiku-4-5-20251001',
     max_tokens: 1500,
-    system: `You are QABot for Everfit. Parse a QA bug report from a Slack thread. Return ONLY valid JSON, NO markdown fences, NO explanation.
+    system: `You are QABot for Everfit. Parse a QA bug report from a Slack thread.
 
-REQUIRED fields (you MUST fill every one — never return null or empty):
+CRITICAL RULES:
+1. Focus ONLY on the FIRST message in the thread — that's the QA's bug report. Ignore everything else.
+2. Ignore bot messages (lines starting with "[qa-bot]" or "[bug-reporting-tracker]").
+3. Ignore command messages (lines like "@X assign to @Y", "@qa-bot ...", "@bug-reporting-tracker ...").
+4. Extract the actual bug: what is broken, on what platform, steps to reproduce.
+5. Translate any Vietnamese content to English.
+6. The summary should describe the bug clearly — NOT include "[Thanh Ngo]:" or usernames or "Nhờ team check" boilerplate.
+
+Return ONLY valid JSON (NO markdown fences, NO explanation):
+
 {
-  "summary": "Title in EXACT format: [Platform][Feature] Short description. NEVER use [Client Report] prefix. Platform MUST be one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach. Feature = affected feature area. Keep under 80 chars total. Always include a description after the brackets.",
+  "summary": "[Platform][Feature] Clear bug description. Platform MUST be one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach. Under 80 chars total. NEVER include @mentions, subteam IDs, or [Thanh Ngo]: prefixes.",
   "priority": "High" or "Medium" or "Low",
   "platform": "one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach",
-  "description": "Use this exact format:\\n\\nSteps to reproduce:\\n1. <step>\\n2. <step>\\n\\nExpected behavior:\\n- <expected>\\n\\nActual behavior:\\n- <actual>\\n\\nEnvironment:\\n- <browser/device/OS/app version if mentioned, else N/A>\\n\\nNote: <useful context or N/A>",
-  "assignee_names": ["Full Name of assignee — look for '@X check', 'nhờ @X', '@X fix'. Empty array [] if unclear."]
+  "description": "Clean, well-formatted description in this EXACT structure (use real newlines):\\n\\nSteps to reproduce:\\n1. <clear step>\\n2. <clear step>\\n3. <clear step>\\n\\nExpected behavior:\\n- <what should happen>\\n\\nActual behavior:\\n- <what is happening>\\n\\nEnvironment:\\n- <browser, device, OS, app version if mentioned, else N/A>\\n\\nNote: <any useful context like 'Happen on PROD', test account info, etc. Or N/A>",
+  "assignee_names": ["Full Name of person asked to fix — look for '@X check', 'nhờ @X', '@X fix', '@X coi với'. Empty array [] if no one was tagged for the fix."]
 }
 
 PLATFORM DETECTION:
-- Web → dashboard UI issues
+- Web → dashboard UI issues, desktop browser
 - API → backend, data, sync, auth
-- iOS Client / iOS Coach → iOS app (client-facing vs coach-facing)
-- Android Client / Android Coach → Android app
-- When BOTH iOS AND Android are mentioned, pick the first one in the report
+- iOS Client → iOS app (client-facing)
+- iOS Coach → iOS app (coach-facing)
+- Android Client → Android app (client-facing)
+- Android Coach → Android app (coach-facing)
+- When BOTH iOS AND Android are mentioned as having issues, pick the one most central to the report
 
-PRIORITY: High = crash/data loss/blocking QA. Medium = broken feature. Low = cosmetic/UI glitch.
+PRIORITY: High = crash/data loss/blocks QA. Medium = broken feature. Low = cosmetic.
 
-If the thread is in Vietnamese, return everything in English.
-NEVER return null, undefined, or empty strings. Always make a reasonable guess.`,
+NEVER return null/undefined/empty. Always make a reasonable guess based on the first message.`,
     messages: [{ role: 'user', content: `QA bug report thread:\n\n${context}` }],
   });
 
@@ -153,10 +153,10 @@ NEVER return null, undefined, or empty strings. Always make a reasonable guess.`
 
   // Defensive defaults — never undefined
   return {
-    summary:        parsed.summary        || `[Web][Bug] ${context.substring(0, 60).replace(/\n/g, ' ')}`,
+    summary:        parsed.summary        || `[Web][Bug] Bug report from QA`,
     priority:       parsed.priority       || 'Medium',
     platform:       parsed.platform       || 'Web',
-    description:    parsed.description    || context,
+    description:    parsed.description    || 'Description not parsed. Please update manually.',
     assignee_names: Array.isArray(parsed.assignee_names) ? parsed.assignee_names : [],
   };
 }
@@ -217,44 +217,45 @@ async function getJiraIssueTitle(issueKey) {
 // ── Read channel canvas content ───────────────
 async function getChannelCanvasContent(client, channelId) {
   try {
-    // Try 3 ways to find the canvas file ID
+    let canvasFileId = null;
 
-    // Method 1: channel.properties.canvas.file_id (primary channel canvas)
-    const chan = await client.conversations.info({ channel: channelId });
-    let canvasFileId = chan.channel?.properties?.canvas?.file_id;
-    console.log(`[QABot] Method 1 canvas.file_id: ${canvasFileId || 'none'}`);
+    // Method 1: channel properties (primary channel canvas)
+    try {
+      const chan = await client.conversations.info({ channel: channelId });
+      canvasFileId = chan.channel?.properties?.canvas?.file_id;
+      if (canvasFileId) console.log(`[QABot] Canvas via channel.properties: ${canvasFileId}`);
+    } catch (e) { console.log(`[QABot] conversations.info failed: ${e.message}`); }
 
-    // Method 2: channel.properties.tabs[] with type=canvas
-    if (!canvasFileId) {
-      const tabs = chan.channel?.properties?.tabs || [];
-      const canvasTab = tabs.find(t => t.type === 'canvas' || t.type === 'files');
-      canvasFileId = canvasTab?.id;
-      console.log(`[QABot] Method 2 tabs: ${canvasFileId || 'none'}`);
-    }
-
-    // Method 3: look in channel bookmarks for a canvas
+    // Method 2: bookmarks — canvas bookmark links contain the file ID
     if (!canvasFileId) {
       try {
         const bookmarks = await client.bookmarks.list({ channel_id: channelId });
-        const canvasBookmark = (bookmarks.bookmarks || []).find(b =>
-          b.type === 'canvas' || (b.link || '').includes('/docs/')
-        );
-        // Canvas bookmarks have a link like https://everfit.slack.com/docs/T.../F...
-        const fileIdMatch = canvasBookmark?.link?.match(/\/([FT][A-Z0-9]+)(?:\/|$|\?)/);
-        canvasFileId = fileIdMatch?.[1];
-        console.log(`[QABot] Method 3 bookmarks: ${canvasFileId || 'none'}`);
-      } catch (e) {
-        console.log(`[QABot] bookmarks.list failed: ${e.message}`);
-      }
+        for (const b of (bookmarks.bookmarks || [])) {
+          // Canvas bookmarks have link like https://everfit.slack.com/docs/TXXX/FXXX
+          const m = (b.link || '').match(/\/docs\/[A-Z0-9]+\/(F[A-Z0-9]+)/i);
+          if (m) { canvasFileId = m[1]; console.log(`[QABot] Canvas via bookmarks: ${canvasFileId}`); break; }
+        }
+      } catch (e) { console.log(`[QABot] bookmarks.list failed: ${e.message}`); }
+    }
+
+    // Method 3: files.list scoped to channel, look for a file of type 'quip' or 'canvas'
+    if (!canvasFileId) {
+      try {
+        const files = await client.files.list({ channel: channelId, types: 'canvases', count: 5 });
+        const canvasFile = (files.files || []).find(f => f.filetype === 'quip' || f.filetype === 'canvas');
+        if (canvasFile) { canvasFileId = canvasFile.id; console.log(`[QABot] Canvas via files.list: ${canvasFileId}`); }
+      } catch (e) { console.log(`[QABot] files.list failed: ${e.message}`); }
     }
 
     if (!canvasFileId) {
-      console.warn('[QABot] No canvas found for channel');
+      console.warn('[QABot] No canvas found for channel ' + channelId);
       return null;
     }
 
+    // Fetch canvas content — Slack canvases use this endpoint
     const fileInfo = await client.files.info({ file: canvasFileId });
-    const url = fileInfo.file?.url_private;
+    const url = fileInfo.file?.url_private || fileInfo.file?.url_private_download;
+
     if (!url) {
       console.warn('[QABot] Canvas file has no url_private');
       return null;
@@ -265,7 +266,7 @@ async function getChannelCanvasContent(client, channelId) {
       responseType: 'text',
     });
     const content = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-    console.log(`[QABot] Canvas content length: ${content.length}`);
+    console.log(`[QABot] Canvas content length: ${content.length}, sample: ${content.substring(0, 200)}`);
     return content;
   } catch (err) {
     console.warn('[QABot] Could not read canvas:', err.message);
