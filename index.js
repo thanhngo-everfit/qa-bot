@@ -192,8 +192,7 @@ async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId) {
     description: buildAdfDescription(ticket.description),
   };
 
-  const parentKey = PLATFORM_PARENTS[ticket.platform];
-  if (parentKey) fields.parent = { key: parentKey };
+  // Parent (platform) — do NOT auto-fill; QA/PM sets manually
   if (epicKey) fields['customfield_10014'] = epicKey;
   if (fixVersionId) fields.fixVersions = [{ id: fixVersionId }];
   if (jiraAccountIds.length > 0) fields.assignee = { accountId: jiraAccountIds[0] };
@@ -289,8 +288,8 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     const epicMatch = event.text.match(/\b(PLAN-\d+|UP-\d+)\b/i);
     const epicKey   = epicMatch ? epicMatch[0].toUpperCase() : null;
 
-    // Auto-pick latest unreleased fix version
-    const fixVersionId = await getLatestFixVersionId();
+    // Hardcoded fix version = "To be confirmed" (ID 12023)
+    const fixVersionId = '12023';
 
     const attachments = await getFirstMessageAttachments(client, event.channel, threadTs);
     logger.info(`[QABot] Creating: epic=${epicKey || 'none'} fixVersion=${fixVersionId || 'none'} attachments=${attachments.length}`);
