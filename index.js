@@ -217,21 +217,56 @@ async function getJiraIssueTitle(issueKey) {
 // ── Read channel canvas content ───────────────
 async function getChannelCanvasContent(client, channelId) {
   try {
+    // Try 3 ways to find the canvas file ID
+
+    // Method 1: channel.properties.canvas.file_id (primary channel canvas)
     const chan = await client.conversations.info({ channel: channelId });
-    const tabs = chan.channel?.properties?.tabs || [];
-    const canvasTab = tabs.find(t => t.type === 'canvas');
-    const canvasFileId = canvasTab?.id || chan.channel?.properties?.canvas?.file_id;
-    if (!canvasFileId) return null;
+    let canvasFileId = chan.channel?.properties?.canvas?.file_id;
+    console.log(`[QABot] Method 1 canvas.file_id: ${canvasFileId || 'none'}`);
+
+    // Method 2: channel.properties.tabs[] with type=canvas
+    if (!canvasFileId) {
+      const tabs = chan.channel?.properties?.tabs || [];
+      const canvasTab = tabs.find(t => t.type === 'canvas' || t.type === 'files');
+      canvasFileId = canvasTab?.id;
+      console.log(`[QABot] Method 2 tabs: ${canvasFileId || 'none'}`);
+    }
+
+    // Method 3: look in channel bookmarks for a canvas
+    if (!canvasFileId) {
+      try {
+        const bookmarks = await client.bookmarks.list({ channel_id: channelId });
+        const canvasBookmark = (bookmarks.bookmarks || []).find(b =>
+          b.type === 'canvas' || (b.link || '').includes('/docs/')
+        );
+        // Canvas bookmarks have a link like https://everfit.slack.com/docs/T.../F...
+        const fileIdMatch = canvasBookmark?.link?.match(/\/([FT][A-Z0-9]+)(?:\/|$|\?)/);
+        canvasFileId = fileIdMatch?.[1];
+        console.log(`[QABot] Method 3 bookmarks: ${canvasFileId || 'none'}`);
+      } catch (e) {
+        console.log(`[QABot] bookmarks.list failed: ${e.message}`);
+      }
+    }
+
+    if (!canvasFileId) {
+      console.warn('[QABot] No canvas found for channel');
+      return null;
+    }
 
     const fileInfo = await client.files.info({ file: canvasFileId });
     const url = fileInfo.file?.url_private;
-    if (!url) return null;
+    if (!url) {
+      console.warn('[QABot] Canvas file has no url_private');
+      return null;
+    }
 
     const res = await axios.get(url, {
       headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
       responseType: 'text',
     });
-    return typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+    const content = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+    console.log(`[QABot] Canvas content length: ${content.length}`);
+    return content;
   } catch (err) {
     console.warn('[QABot] Could not read canvas:', err.message);
     return null;
