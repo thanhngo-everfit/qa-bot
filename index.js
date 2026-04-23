@@ -254,16 +254,28 @@ async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, pa
   if (fixVersionId) fields.fixVersions = [{ id: fixVersionId }];
   if (jiraAccountIds.length > 0) fields.assignee = { accountId: jiraAccountIds[0] };
 
-  // Reporter + QA: person who tagged the bot
-  if (reporterJiraId) {
-    fields.reporter                = { accountId: reporterJiraId };
-    fields['customfield_10010']    = { accountId: reporterJiraId };  // QA field
-  }
+  // Reporter — safe to set at creation (standard Jira field)
+  if (reporterJiraId) fields.reporter = { accountId: reporterJiraId };
 
   const res = await axios.post(`${JIRA_HOST}/rest/api/3/issue`, { fields }, {
     headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' },
   });
-  return { key: res.data.key, url: `${JIRA_HOST}/browse/${res.data.key}` };
+  const issueKey = res.data.key;
+
+  // QA field — set via update because it may not be on the Create screen for UP project
+  if (reporterJiraId) {
+    try {
+      await axios.put(
+        `${JIRA_HOST}/rest/api/3/issue/${issueKey}`,
+        { fields: { customfield_10074: { accountId: reporterJiraId } } },
+        { headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' } }
+      );
+    } catch (err) {
+      console.warn(`[QABot] Could not set QA field on ${issueKey}: ${err.response?.data?.errors?.customfield_10074 || err.message}`);
+    }
+  }
+
+  return { key: issueKey, url: `${JIRA_HOST}/browse/${issueKey}` };
 }
 
 // ── Fetch Jira issue title ────────────────────
@@ -631,10 +643,15 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
 
   } catch (err) {
+    const jiraErrors = err.response?.data?.errors;
+    const jiraMessages = err.response?.data?.errorMessages;
+    const errDetail = jiraErrors
+      ? Object.entries(jiraErrors).map(([f, m]) => `${f}: ${m}`).join(', ')
+      : (jiraMessages || []).join(', ') || err.message;
     logger.error('[QABot]', err.response?.data ?? err.message);
     await client.chat.postMessage({
       channel: event.channel, thread_ts: event.thread_ts || event.ts,
-      text: `❌ QABot error: \`${err.message}\``,
+      text: `❌ QABot error: \`${errDetail}\``,
     });
     await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
     await client.reactions.add({ channel: event.channel, name: 'x', timestamp: event.ts }).catch(() => {});
