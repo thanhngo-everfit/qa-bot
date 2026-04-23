@@ -342,7 +342,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
 
     const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey);
 
-    const sprintId = await getActiveSprintId();
+    const sprintId = '249';
     if (sprintId) await addIssueToSprint(jira.key, sprintId);
 
     // Upload attachments
