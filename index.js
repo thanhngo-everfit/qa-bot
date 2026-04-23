@@ -49,19 +49,28 @@ async function getThread(client, channelId, threadTs) {  const result   = await 
   return lines.join('\n');
 }
 
-async function getFirstMessageAttachments(client, channelId, threadTs) {
+// ── Collect attachments from ALL messages in a thread ──
+async function getAllThreadAttachments(client, channelId, threadTs) {
   try {
-    const result = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 1 });
-    const first  = result.messages?.[0];
-    if (!first) return [];
-    const files = first.files || [];
-    return files
-      .filter(f => f.url_private_download)
-      .map(f => ({
-        name:     f.name || f.title || 'attachment',
-        url:      f.url_private_download,
-        mimetype: f.mimetype || 'application/octet-stream',
-      }));
+    const result = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 });
+    const messages = result.messages || [];
+    const attachments = [];
+    for (const msg of messages) {
+      // Skip bot messages — don't re-upload bot's own posts
+      if (msg.bot_id) continue;
+      const files = msg.files || [];
+      for (const f of files) {
+        if (!f.url_private_download) continue;
+        attachments.push({
+          name:     f.name || f.title || 'attachment',
+          url:      f.url_private_download,
+          mimetype: f.mimetype || 'application/octet-stream',
+          size:     f.size || 0,
+        });
+      }
+    }
+    console.log(`[QABot] Thread has ${attachments.length} attachment(s) total`);
+    return attachments;
   } catch (err) {
     console.warn('[QABot] Could not get attachments:', err.message);
     return [];
@@ -72,6 +81,9 @@ async function downloadSlackFile(url) {
   const res = await axios.get(url, {
     headers:      { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
     responseType: 'arraybuffer',
+    timeout:      120000,   // 2 minutes — screen recordings can be large
+    maxContentLength: 100 * 1024 * 1024,  // 100MB max
+    maxBodyLength:    100 * 1024 * 1024,
   });
   return Buffer.from(res.data);
 }
@@ -86,9 +98,12 @@ async function uploadAttachmentToJira(issueKey, filename, fileBuffer, mimetype) 
       {
         headers: {
           ...form.getHeaders(),
-          Authorization:     jiraAuth(),
+          Authorization:       jiraAuth(),
           'X-Atlassian-Token': 'no-check',
         },
+        timeout:          120000,
+        maxContentLength: 100 * 1024 * 1024,
+        maxBodyLength:    100 * 1024 * 1024,
       }
     );
     return true;
@@ -570,7 +585,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     const slackThreadUrl = buildSlackThreadUrl(event.channel, threadTs);
     ticket.description = `Slack thread: ${slackThreadUrl}\n\n${ticket.description}`;
 
-    const attachments = await getFirstMessageAttachments(client, event.channel, threadTs);
+    const attachments = await getAllThreadAttachments(client, event.channel, threadTs);
     logger.info(`[QABot] Creating: epic=${epicKey || 'none'} fixVersion=${fixVersionId || 'none'} parent=${parentKey || 'none'} attachments=${attachments.length}`);
 
     const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId);
@@ -578,15 +593,22 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     const sprintId = '249';
     if (sprintId) await addIssueToSprint(jira.key, sprintId);
 
-    // Upload attachments
+    // Upload attachments with per-file logging
     let uploaded = 0;
     for (const att of attachments) {
+      const sizeMB = (att.size / 1024 / 1024).toFixed(1);
+      logger.info(`[QABot] Downloading ${att.name} (${sizeMB}MB)...`);
       try {
         const buf = await downloadSlackFile(att.url);
+        logger.info(`[QABot] Uploading ${att.name} to ${jira.key}...`);
         const ok  = await uploadAttachmentToJira(jira.key, att.name, buf, att.mimetype);
-        if (ok) uploaded++;
-      } catch (_) {}
+        if (ok) { uploaded++; logger.info(`[QABot] ✓ ${att.name}`); }
+        else     { logger.warn(`[QABot] ✗ ${att.name} failed to upload`); }
+      } catch (err) {
+        logger.warn(`[QABot] ✗ ${att.name}: ${err.message}`);
+      }
     }
+    logger.info(`[QABot] Uploaded ${uploaded}/${attachments.length} attachments to ${jira.key}`);
 
     const assigneeLine = assigneeSlackIds.length > 0
       ? `Assigned to ${assigneeSlackIds.map(id => `<@${id}>`).join(', ')}`
