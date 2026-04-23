@@ -126,7 +126,7 @@ Return ONLY valid JSON (NO markdown fences, NO explanation):
 
 {
   "summary": "[Platform][Feature] Clear bug description. Platform MUST be one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach. Under 80 chars total. NEVER include @mentions, subteam IDs, or [Thanh Ngo]: prefixes.",
-  "priority": "High" or "Medium" or "Low",
+  "priority": "Highest" or "High" or "Medium" or "Low" or "Lowest",
   "platform": "one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach",
   "description": "Clean, well-formatted description in this EXACT structure (use real newlines):\\n\\nSteps to reproduce:\\n1. <clear step>\\n2. <clear step>\\n3. <clear step>\\n\\nExpected behavior:\\n- <what should happen>\\n\\nActual behavior:\\n- <what is happening>\\n\\nEnvironment:\\n- <browser, device, OS, app version if mentioned, else N/A>\\n\\nNote: <any useful context like 'Happen on PROD', test account info, etc. Or N/A>",
   "assignee_names": ["Full Name of person asked to fix — look for '@X check', 'nhờ @X', '@X fix', '@X coi với'. Empty array [] if no one was tagged for the fix."]
@@ -141,7 +141,44 @@ PLATFORM DETECTION:
 - Android Coach → Android app (coach-facing)
 - When BOTH iOS AND Android are mentioned as having issues, pick the one most central to the report
 
-PRIORITY: High = crash/data loss/blocks QA. Medium = broken feature. Low = cosmetic.
+PRIORITY RUBRIC (follow strictly):
+
+"Highest" — Blocker:
+- App/web completely down or crashes on launch
+- Data loss or corruption (lost workouts, payments, saved work)
+- Security issue (auth bypass, data leak)
+- Payment failure
+- Cannot log in at all
+
+"High" — Major:
+- Core feature fully broken for many users (e.g., cannot assign workouts at all)
+- Crash on a specific common action
+- Production-only issue affecting active coaches/clients
+- Sync failure blocking client usage
+
+"Medium" — Normal:
+- Feature partially broken but has a workaround
+- Non-crash but confusing UX
+- Affects a limited set of users/scenarios
+- Typos (misspellings, wrong words in copy)
+- UI issues that block understanding of data/action (e.g., button completely missing its label)
+
+"Low" — Minor:
+- Spacing, padding, alignment, or color issues on client's interface that are NOT critical (data/action still understandable)
+- UI flicker, minor animation glitches
+- Edge case affecting rare scenarios
+- Nice-to-have improvements
+
+"Lowest" — Trivial:
+- Internal-only cosmetic issues (coach admin backend visuals)
+- Non-blocking suggestions
+
+Examples:
+- "Bottom sheet value and unit misaligned, user can still read them" → Low
+- "Button flickers when switching tabs" → Low
+- "Typo in error message 'occured' should be 'occurred'" → Medium
+- "Client cannot mark workout as complete" → High
+- "App crashes on launch for iOS 17 users" → Highest
 
 NEVER return null/undefined/empty. Always make a reasonable guess based on the first message.`,
     messages: [{ role: 'user', content: `QA bug report thread:\n\n${context}` }],
