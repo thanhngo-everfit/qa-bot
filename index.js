@@ -251,6 +251,31 @@ async function getJiraIssueTitle(issueKey) {
   } catch { return null; }
 }
 
+// ── Resolve a PI (PLAN-XXX) to its linked Epics ──
+// Returns array of { key, title } for every linked Epic/UP-ticket
+async function getLinkedEpicsFromPI(planKey) {
+  try {
+    const res = await axios.get(
+      `${JIRA_HOST}/rest/api/3/issue/${planKey}?fields=issuelinks,summary`,
+      { headers: { Authorization: jiraAuth(), Accept: 'application/json' } }
+    );
+    const links = res.data?.fields?.issuelinks || [];
+    const epics = [];
+    for (const l of links) {
+      const target = l.outwardIssue || l.inwardIssue;
+      if (!target) continue;
+      // Only collect UP-XXXXX keys (actual Epics/tickets in our project)
+      if (!target.key?.startsWith('UP-')) continue;
+      epics.push({ key: target.key, title: target.fields?.summary || null });
+    }
+    console.log(`[QABot] PI ${planKey} → linked epics: ${epics.map(e => e.key).join(', ') || 'none'}`);
+    return epics;
+  } catch (err) {
+    console.warn(`[QABot] Could not fetch PI ${planKey}:`, err.message);
+    return [];
+  }
+}
+
 // ── Read channel canvas content ───────────────
 async function getChannelCanvasContent(client, channelId) {
   try {
@@ -316,17 +341,41 @@ async function pickParentFromCanvas(client, channelId, bugPlatform) {
   const canvasContent = await getChannelCanvasContent(client, channelId);
   if (!canvasContent) return null;
 
-  // Extract all UP-XXXXX keys from canvas
-  const keys = [...new Set((canvasContent.match(/UP-\d+/g) || []))];
-  if (keys.length === 0) return null;
+  // Extract all UP- and PLAN- keys from canvas
+  const upKeys   = [...new Set((canvasContent.match(/UP-\d+/g)   || []))];
+  const planKeys = [...new Set((canvasContent.match(/PLAN-\d+/g) || []))];
+  console.log(`[QABot] Canvas keys: UP=${upKeys.join(',')} PLAN=${planKeys.join(',')}`);
 
-  // Fetch all titles
-  const results = await Promise.all(keys.map(async k => ({ key: k, title: await getJiraIssueTitle(k) })));
-  const parents = results.filter(r => r.title);
-  if (parents.length === 0) return null;
+  // Build candidate list: direct UP tickets + Epics linked from PIs
+  const candidates = [];
 
-  // Check if a title starts with a given platform prefix (e.g. "iOS -", "iOS |", "iOS-")
-  const matchPrefix = prefix => parents.find(p => {
+  // Direct UP keys from canvas
+  for (const key of upKeys) {
+    const title = await getJiraIssueTitle(key);
+    if (title) candidates.push({ key, title });
+  }
+
+  // Expand each PI to its linked Epics
+  for (const plan of planKeys) {
+    const linked = await getLinkedEpicsFromPI(plan);
+    for (const e of linked) {
+      if (!candidates.find(c => c.key === e.key)) {
+        // Fetch title if missing
+        const title = e.title || await getJiraIssueTitle(e.key);
+        if (title) candidates.push({ key: e.key, title });
+      }
+    }
+  }
+
+  if (candidates.length === 0) {
+    console.log('[QABot] No candidate parents found');
+    return null;
+  }
+
+  console.log(`[QABot] Candidates: ${candidates.map(c => `${c.key}="${c.title}"`).join(' | ')}`);
+
+  // Match a title against a platform prefix (iOS -, iOS |, iOS-, iOS|)
+  const matchPrefix = prefix => candidates.find(p => {
     const lower = p.title.toLowerCase().trim();
     const pf    = prefix.toLowerCase();
     return lower.startsWith(pf + ' -')
@@ -366,7 +415,7 @@ async function pickParentFromCanvas(client, channelId, bugPlatform) {
       return match.key;
     }
   }
-  console.log(`[QABot] No parent found in canvas for platform=${bugPlatform}`);
+  console.log(`[QABot] No parent found for platform=${bugPlatform}`);
   return null;
 }
 
