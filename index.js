@@ -257,9 +257,31 @@ OUTPUT — valid JSON only, NO fences, NO explanation, NO thinking outside JSON:
   "priority": "Highest" | "High" | "Medium" | "Low" | "Lowest",
   "platform": "Web" | "API" | "iOS Client" | "iOS Coach" | "Android Client" | "Android Coach",
   "root_cause_reasoning": "One short sentence explaining WHY you picked this platform. Reference which signal won (team label, explicit text, backend root cause, etc).",
-  "description": "Clean multi-section text using real \\n newlines:\\n\\nSteps to reproduce:\\n1. ...\\n2. ...\\n\\nExpected behavior:\\n- ...\\n\\nActual behavior:\\n- ...\\n\\nEnvironment:\\n- <browser, device, OS, app version, or N/A>\\n\\nNote: <test account, PROD/STG, extra context, or N/A>",
+  "description": "<see DESCRIPTION FORMAT below — do NOT include any meta text like 'Clean multi-section text' or 'See below' — output only the sections>",
   "assignee_names": ["Full Name of the person the QA tagged to fix. Look for '@X check', 'nhờ @X', '@X fix', '@X coi với'. Empty array if nobody."]
 }
+
+====================================================================
+DESCRIPTION FORMAT — the value of the "description" field must start DIRECTLY with "Steps to reproduce:" and follow this exact shape, using literal \\n newlines in the JSON string:
+
+Steps to reproduce:
+1. <step>
+2. <step>
+3. <step>
+
+Expected behavior:
+- <what should happen>
+
+Actual behavior:
+- <what is happening>
+
+Environment:
+- <browser / device / OS / app version, or N/A>
+
+Note: <test account, PROD/STG, extra context, or N/A>
+
+DO NOT prepend any preamble, heading, or instructional phrase before "Steps to reproduce:".
+====================================================================
 
 ====================================================================
 PRIORITY RUBRIC (unchanged):
@@ -308,14 +330,37 @@ ${threadContext}`
   }
 
   // Defensive defaults — never undefined
+  // Also strip any meta-preamble the AI might leak above the real content
+  // (e.g. "Clean multi-section text using real newlines:" — that was a prompt
+  //  instruction the model occasionally echoed back into the description).
+  const cleanedDescription = stripLeakyPreamble(parsed.description);
+
   return {
     summary:        parsed.summary        || `[Web][Bug] Bug report from QA`,
     priority:       parsed.priority       || 'Medium',
     platform:       parsed.platform       || 'Web',
     root_cause_reasoning: parsed.root_cause_reasoning || '',
-    description:    parsed.description    || 'Description not parsed. Please update manually.',
+    description:    cleanedDescription    || 'Description not parsed. Please update manually.',
     assignee_names: Array.isArray(parsed.assignee_names) ? parsed.assignee_names : [],
   };
+}
+
+// Remove any instructional preamble the model echoed above the real content.
+// Keeps everything from "Steps to reproduce:" onward. Also trims common
+// meta-phrases that might appear before it.
+function stripLeakyPreamble(desc) {
+  if (!desc || typeof desc !== 'string') return desc;
+  let s = desc;
+
+  // If "Steps to reproduce:" exists anywhere, cut everything before it.
+  const idx = s.search(/Steps to reproduce\s*:/i);
+  if (idx > 0) s = s.slice(idx);
+
+  // Otherwise, remove lines that are obvious echoes of prompt instructions.
+  const leakyLineRegex = /^[ \t]*(clean multi-section text|see description format|multi-section text|see below|as follows)[^\n]*\n+/gi;
+  s = s.replace(leakyLineRegex, '');
+
+  return s.trim();
 }
 
 function lineToAdfContent(line) {
@@ -359,11 +404,12 @@ function buildAdfDescription(text, curlCommands) {
   const lines = (text || '').split('\n');
   const content = [];
   for (const line of lines) {
-    if (line.trim() === '') content.push({ type: 'paragraph', content: [] });
-    else content.push({ type: 'paragraph', content: renderLineAdf(line) });
+    // Skip blank lines entirely — bold headers already separate sections,
+    // and empty paragraphs just add unwanted vertical gaps in Jira.
+    if (line.trim() === '') continue;
+    content.push({ type: 'paragraph', content: renderLineAdf(line) });
   }
   if (Array.isArray(curlCommands) && curlCommands.length > 0) {
-    content.push({ type: 'paragraph', content: [] });
     content.push({
       type: 'heading',
       attrs: { level: 3 },
