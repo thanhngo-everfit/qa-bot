@@ -330,12 +330,37 @@ function lineToAdfContent(line) {
   return parts.length > 0 ? parts : [{ type: 'text', text: line }];
 }
 
+// Section headers we auto-bold in Jira descriptions.
+// Matches the exact labels QABot generates — including any trailing content
+// on the same line (so "Slack thread: https://…" keeps the URL as a link).
+const HEADER_PATTERNS = [
+  /^(Steps to reproduce)(:)(.*)$/i,
+  /^(Expected behavior)(:)(.*)$/i,
+  /^(Actual behavior)(:)(.*)$/i,
+  /^(Environment)(:)(.*)$/i,
+  /^(Notes?)(:)(.*)$/i,
+  /^(Slack thread)(:)(.*)$/i,
+];
+
+function renderLineAdf(line) {
+  for (const re of HEADER_PATTERNS) {
+    const m = line.match(re);
+    if (!m) continue;
+    const headerText = `${m[1]}${m[2]}`;
+    const rest = m[3] || '';
+    const parts = [{ type: 'text', text: headerText, marks: [{ type: 'strong' }] }];
+    if (rest.length > 0) parts.push(...lineToAdfContent(rest));
+    return parts;
+  }
+  return lineToAdfContent(line);
+}
+
 function buildAdfDescription(text, curlCommands) {
   const lines = (text || '').split('\n');
   const content = [];
   for (const line of lines) {
     if (line.trim() === '') content.push({ type: 'paragraph', content: [] });
-    else content.push({ type: 'paragraph', content: lineToAdfContent(line) });
+    else content.push({ type: 'paragraph', content: renderLineAdf(line) });
   }
   if (Array.isArray(curlCommands) && curlCommands.length > 0) {
     content.push({ type: 'paragraph', content: [] });
