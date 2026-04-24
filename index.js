@@ -13,6 +13,23 @@ const slackApp = new App({
 });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// ── Team map: Slack user ID → platform they own ─
+// Populate via env var TEAM_MAP_JSON, e.g.
+//   TEAM_MAP_JSON='{"U01LAMBUI":"Android Client","U02TUANNG":"iOS Coach","U03HUNGVO":"Web","U04BENGUYEN":"API"}'
+// Used as a strong hint when the QA assigns a bug to a specific dev —
+// the bot will prefer that dev's team platform for client-side bugs.
+let TEAM_MAP = {};
+try {
+  TEAM_MAP = JSON.parse(process.env.TEAM_MAP_JSON || '{}');
+  console.log(`[QABot] Loaded TEAM_MAP with ${Object.keys(TEAM_MAP).length} entries`);
+} catch (err) {
+  console.warn('[QABot] TEAM_MAP_JSON invalid, ignoring:', err.message);
+}
+
+function getTeamForSlackUser(slackUserId) {
+  return TEAM_MAP[slackUserId] || null;
+}
+
 function jiraAuth() {
   return 'Basic ' + Buffer.from(`${process.env.JIRA_EMAIL}:${process.env.JIRA_API_TOKEN}`).toString('base64');
 }
@@ -33,6 +50,40 @@ async function resolveJiraAccountId(slackClient, slackUserId) {
 function buildSlackThreadUrl(channelId, threadTs) {
   const ts = threadTs.replace('.', '');
   return `https://everfit.slack.com/archives/${channelId}/p${ts}`;
+}
+
+// ── Pull out any curl commands from the thread ──
+// Grabs: (a) fenced code blocks starting with `curl`
+//        (b) inline `curl ...` lines with backslash-continued lines joined
+// Slack adds smart quotes sometimes — normalize them so the command is runnable.
+function extractCurlCommands(text) {
+  if (!text) return [];
+  const curls = [];
+  const seen = new Set();
+  const norm = s => s
+    .replace(/[\u2018\u2019]/g, "'")     // curly single → straight
+    .replace(/[\u201C\u201D]/g, '"')     // curly double → straight
+    .trim();
+  const push = c => {
+    const n = norm(c);
+    if (n && !seen.has(n.slice(0, 80))) { seen.add(n.slice(0, 80)); curls.push(n); }
+  };
+
+  // (a) fenced blocks
+  const fence = /```([\s\S]*?)```/g;
+  let m;
+  while ((m = fence.exec(text)) !== null) {
+    const body = m[1].replace(/^\w+\n/, '').trim(); // drop any language tag
+    if (/^\s*curl\b/i.test(body)) push(body);
+  }
+
+  // (b) inline curls (ignore anything already inside fences)
+  const stripped = text.replace(fence, '');
+  const inline = /(?:^|\n)[ \t>]*(curl\b[^\n]*(?:\\\s*\n[^\n]*)*)/gi;
+  while ((m = inline.exec(stripped)) !== null) {
+    push(m[1].replace(/\\\s*\n\s*/g, ' '));
+  }
+  return curls;
 }
 
 async function getThread(client, channelId, threadTs) {  const result   = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 });
@@ -127,80 +178,93 @@ async function getLatestFixVersionId() {
 }
 
 // ── Parse QA bug with Claude (robust) ────────
-async function parseBugReport(context) {
+async function parseBugReport(threadContext, triggerText, assigneeTeamHints) {
+  const teamHint = Array.isArray(assigneeTeamHints) && assigneeTeamHints.length > 0
+    ? `\n\nASSIGNEE TEAM HINT (the QA tagged devs from these teams — strong signal for client-side bugs): ${assigneeTeamHints.join(', ')}`
+    : '';
+
   const res = await anthropic.messages.create({
-    model:      'claude-haiku-4-5-20251001',
-    max_tokens: 1500,
-    system: `You are QABot for Everfit. Parse a QA bug report from a Slack thread.
+    model:      'claude-sonnet-4-6',
+    max_tokens: 2000,
+    system: `You are QABot for Everfit. Your job: parse a QA bug report from a Slack thread and decide the CORRECT platform based on root cause — not just where the bug was seen.
 
-CRITICAL RULES:
-1. Focus ONLY on the FIRST message in the thread — that's the QA's bug report. Ignore everything else.
-2. Ignore bot messages (lines starting with "[qa-bot]" or "[bug-reporting-tracker]").
-3. Ignore command messages (lines like "@X assign to @Y", "@qa-bot ...", "@bug-reporting-tracker ...").
-4. Extract the actual bug: what is broken, on what platform, steps to reproduce.
-5. Translate any Vietnamese content to English.
-6. The summary should describe the bug clearly — NOT include "[Thanh Ngo]:" or usernames or "Nhờ team check" boilerplate.
+INPUTS YOU RECEIVE:
+- TRIGGER MESSAGE: the message that mentioned the bot. Often contains assignment/team hints like "nhờ @X team mobile check", "@BE coi với", "assign to @Y".
+- THREAD: the full Slack thread. The FIRST message is the QA's bug report. Later messages are discussion/commands — use them for context (platform hints, team mentions, additional details) but do NOT treat them as the bug itself.
+- ASSIGNEE TEAM HINT (optional): the teams the tagged devs belong to. Trust this for client-side bugs.
 
-Return ONLY valid JSON (NO markdown fences, NO explanation):
+WHAT TO IGNORE:
+- Bot messages ([qa-bot], [bug-reporting-tracker])
+- Command-only messages ("@qa-bot log this", "@bug-reporting-tracker ...")
+- Boilerplate like "Nhờ team check giúp"
+- @mentions and subteam IDs in the summary — the summary must be clean English bug description.
 
+====================================================================
+PLATFORM DECISION — follow in order, stop at first match:
+====================================================================
+
+STEP 1 — ROOT CAUSE ANALYSIS (most important):
+Decide whether the bug lives in the BACKEND or a CLIENT, regardless of who reported it or where they saw it.
+
+Signals the bug is BACKEND → platform = "API":
+- API/endpoint returns wrong data, 4xx/5xx, timeouts
+- Data not saving, sync failure, data inconsistency between clients
+- Auth/token/session issues
+- Calculation happens server-side and value is wrong (e.g., wrong calorie total, wrong progress %)
+- Same bug visible on multiple clients
+- Reporter pastes a curl / request / response payload as evidence
+- Reporter is from BE team, or message says "BE check", "API trả sai", "server returns…"
+- Webhook / push notification / email delivery issue
+- Permissions/ACL issue
+
+If ANY of these apply → platform is "API". Do NOT use iOS/Android/Web even if the Android dev reported it or it was seen on the Android app. The root cause is backend.
+
+STEP 2 — CLIENT-SIDE BUG: pick the client platform.
+Only reach this step if the bug is clearly a UI/UX/rendering/interaction issue on one specific client.
+
+Priority order for picking the client:
+  2a. Explicit mention in the bug text: "trên iOS", "on Android", "Web dashboard", "coach app iOS", "client app Android", "UI của web", etc.
+  2b. ASSIGNEE TEAM HINT (if provided). If QA assigned the bug to a mobile dev, it's a mobile bug. If to a web dev, it's Web.
+  2c. Explicit team mention in trigger: "team mobile" → iOS/Android Client (default iOS Client unless Android is more specific), "team web" → Web.
+  2d. Default: "Web".
+
+Within mobile:
+  - Coach-facing features (assign workout, client list, programs, coach dashboard) → iOS Coach / Android Coach
+  - Client-facing features (log workout, meal plan, progress photos, macros, metrics the client sees) → iOS Client / Android Client
+
+Valid platforms (one of): Web, API, iOS Client, iOS Coach, Android Client, Android Coach
+
+====================================================================
+OUTPUT — valid JSON only, NO fences, NO explanation:
+====================================================================
 {
-  "summary": "[Platform][Feature] Clear bug description. Platform MUST be one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach. Under 80 chars total. NEVER include @mentions, subteam IDs, or [Thanh Ngo]: prefixes.",
-  "priority": "Highest" or "High" or "Medium" or "Low" or "Lowest",
-  "platform": "one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach",
-  "description": "Clean, well-formatted description in this EXACT structure (use real newlines):\\n\\nSteps to reproduce:\\n1. <clear step>\\n2. <clear step>\\n3. <clear step>\\n\\nExpected behavior:\\n- <what should happen>\\n\\nActual behavior:\\n- <what is happening>\\n\\nEnvironment:\\n- <browser, device, OS, app version if mentioned, else N/A>\\n\\nNote: <any useful context like 'Happen on PROD', test account info, etc. Or N/A>",
-  "assignee_names": ["Full Name of person asked to fix — look for '@X check', 'nhờ @X', '@X fix', '@X coi với'. Empty array [] if no one was tagged for the fix."]
+  "summary": "[Platform][Feature] Clear English bug description under 80 chars. No @mentions, no usernames, no 'Nhờ team check'.",
+  "priority": "Highest" | "High" | "Medium" | "Low" | "Lowest",
+  "platform": "Web" | "API" | "iOS Client" | "iOS Coach" | "Android Client" | "Android Coach",
+  "root_cause_reasoning": "One short sentence explaining WHY you picked this platform. E.g. 'Reporter is on Android team but the bug is about wrong calorie total returned by the server — backend calculation issue, so API.'",
+  "description": "Clean multi-section text using real \\n newlines:\\n\\nSteps to reproduce:\\n1. ...\\n2. ...\\n\\nExpected behavior:\\n- ...\\n\\nActual behavior:\\n- ...\\n\\nEnvironment:\\n- <browser, device, OS, app version, or N/A>\\n\\nNote: <test account, PROD/STG, extra context, or N/A>",
+  "assignee_names": ["Full Name of the person the QA tagged to fix. Look for '@X check', 'nhờ @X', '@X fix', '@X coi với'. Empty array if nobody."]
 }
 
-PLATFORM DETECTION:
-- Web → dashboard UI issues, desktop browser
-- API → backend, data, sync, auth
-- iOS Client → iOS app (client-facing)
-- iOS Coach → iOS app (coach-facing)
-- Android Client → Android app (client-facing)
-- Android Coach → Android app (coach-facing)
-- When BOTH iOS AND Android are mentioned as having issues, pick the one most central to the report
+====================================================================
+PRIORITY RUBRIC (unchanged):
+====================================================================
+"Highest" — Blocker: app down, crash on launch, data loss, payment failure, auth bypass, can't log in at all
+"High" — Major: core feature fully broken for many users, crash on common action, PROD-only affecting active users, sync failure blocking usage
+"Medium" — Normal: feature partially broken w/ workaround, confusing UX, limited users, typos, UI hiding critical info
+"Low" — Minor: spacing/padding/alignment/color on client UI (still understandable), UI flicker, edge-case bugs, nice-to-haves
+"Lowest" — Trivial: internal-only cosmetic issues, non-blocking suggestions
 
-PRIORITY RUBRIC (follow strictly):
+NEVER return null/undefined/empty. Always make a reasonable decision.`,
+    messages: [{
+      role: 'user',
+      content:
+`TRIGGER MESSAGE (this mentioned the bot — contains team/assignment hints):
+${triggerText || '(none)'}${teamHint}
 
-"Highest" — Blocker:
-- App/web completely down or crashes on launch
-- Data loss or corruption (lost workouts, payments, saved work)
-- Security issue (auth bypass, data leak)
-- Payment failure
-- Cannot log in at all
-
-"High" — Major:
-- Core feature fully broken for many users (e.g., cannot assign workouts at all)
-- Crash on a specific common action
-- Production-only issue affecting active coaches/clients
-- Sync failure blocking client usage
-
-"Medium" — Normal:
-- Feature partially broken but has a workaround
-- Non-crash but confusing UX
-- Affects a limited set of users/scenarios
-- Typos (misspellings, wrong words in copy)
-- UI issues that block understanding of data/action (e.g., button completely missing its label)
-
-"Low" — Minor:
-- Spacing, padding, alignment, or color issues on client's interface that are NOT critical (data/action still understandable)
-- UI flicker, minor animation glitches
-- Edge case affecting rare scenarios
-- Nice-to-have improvements
-
-"Lowest" — Trivial:
-- Internal-only cosmetic issues (coach admin backend visuals)
-- Non-blocking suggestions
-
-Examples:
-- "Bottom sheet value and unit misaligned, user can still read them" → Low
-- "Button flickers when switching tabs" → Low
-- "Typo in error message 'occured' should be 'occurred'" → Medium
-- "Client cannot mark workout as complete" → High
-- "App crashes on launch for iOS 17 users" → Highest
-
-NEVER return null/undefined/empty. Always make a reasonable guess based on the first message.`,
-    messages: [{ role: 'user', content: `QA bug report thread:\n\n${context}` }],
+THREAD:
+${threadContext}`
+    }],
   });
 
   const raw = res.content[0].text.replace(/```json|```/g, '').trim();
@@ -212,6 +276,7 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the f
     summary:        parsed.summary        || `[Web][Bug] Bug report from QA`,
     priority:       parsed.priority       || 'Medium',
     platform:       parsed.platform       || 'Web',
+    root_cause_reasoning: parsed.root_cause_reasoning || '',
     description:    parsed.description    || 'Description not parsed. Please update manually.',
     assignee_names: Array.isArray(parsed.assignee_names) ? parsed.assignee_names : [],
   };
@@ -229,23 +294,38 @@ function lineToAdfContent(line) {
   return parts.length > 0 ? parts : [{ type: 'text', text: line }];
 }
 
-function buildAdfDescription(text) {
+function buildAdfDescription(text, curlCommands) {
   const lines = (text || '').split('\n');
   const content = [];
   for (const line of lines) {
     if (line.trim() === '') content.push({ type: 'paragraph', content: [] });
     else content.push({ type: 'paragraph', content: lineToAdfContent(line) });
   }
+  if (Array.isArray(curlCommands) && curlCommands.length > 0) {
+    content.push({ type: 'paragraph', content: [] });
+    content.push({
+      type: 'heading',
+      attrs: { level: 3 },
+      content: [{ type: 'text', text: 'Reproduction (curl)' }],
+    });
+    for (const cmd of curlCommands) {
+      content.push({
+        type: 'codeBlock',
+        attrs: { language: 'bash' },
+        content: [{ type: 'text', text: cmd }],
+      });
+    }
+  }
   return { type: 'doc', version: 1, content };
 }
 
-async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, parentKey, reporterJiraId) {
+async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, parentKey, reporterJiraId, curlCommands) {
   const fields = {
     project:     { key: JIRA_PROJECT },
     summary:     ticket.summary,
     issuetype:   { name: 'Bug' },
     priority:    { name: ticket.priority },
-    description: buildAdfDescription(ticket.description),
+    description: buildAdfDescription(ticket.description, curlCommands),
   };
 
   // Parent from channel canvas (if found)
@@ -566,14 +646,34 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       return;
     }
 
-    const ticket = await parseBugReport(context);
-    logger.info(`[QABot] Parsed: ${ticket.summary} [${ticket.priority}] platform=${ticket.platform}`);
-
-    // Detect assignee
+    // ── Detect explicit @mentions in the trigger message FIRST ──
+    // This lets us feed team info into the parser so platform detection
+    // can use "assignee is on mobile team" as a signal.
     const triggerMentions = (event.text.match(/<@([A-Z0-9]+)>/g) || [])
       .map(m => m.replace(/<@|>/g, ''))
       .filter(id => id !== botUserId);
 
+    // Look up each mentioned Slack user's team from TEAM_MAP
+    const assigneeTeamHints = triggerMentions
+      .map(id => getTeamForSlackUser(id))
+      .filter(Boolean);
+    if (assigneeTeamHints.length > 0) {
+      logger.info(`[QABot] Team hints from trigger: ${assigneeTeamHints.join(', ')}`);
+    }
+
+    // Extract any curl commands from the whole thread for the description
+    const curlCommands = extractCurlCommands(context);
+    if (curlCommands.length > 0) {
+      logger.info(`[QABot] Found ${curlCommands.length} curl command(s) in thread`);
+    }
+
+    const ticket = await parseBugReport(context, event.text, assigneeTeamHints);
+    logger.info(`[QABot] Parsed: ${ticket.summary} [${ticket.priority}] platform=${ticket.platform}`);
+    if (ticket.root_cause_reasoning) {
+      logger.info(`[QABot] Root cause: ${ticket.root_cause_reasoning}`);
+    }
+
+    // Finalize assignee list (trigger mentions win; else fall back to names the AI extracted)
     let assigneeSlackIds = triggerMentions;
     if (assigneeSlackIds.length === 0 && ticket.assignee_names.length > 0) {
       for (const name of ticket.assignee_names) {
@@ -586,7 +686,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       await Promise.all(assigneeSlackIds.map(id => resolveJiraAccountId(client, id)))
     ).filter(Boolean);
 
-    // Parse Epic from trigger message (PLAN-XXX or UP-XXX) — ignore if it matches an assignee mention
+    // Parse Epic from trigger message (PLAN-XXX or UP-XXX)
     const epicMatch = event.text.match(/\b(PLAN-\d+|UP-\d+)\b/i);
     const epicKey   = epicMatch ? epicMatch[0].toUpperCase() : null;
 
@@ -606,9 +706,9 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     ticket.description = `Slack thread: ${slackThreadUrl}\n\n${ticket.description}`;
 
     const attachments = await getAllThreadAttachments(client, event.channel, threadTs);
-    logger.info(`[QABot] Creating: epic=${epicKey || 'none'} fixVersion=${fixVersionId || 'none'} parent=${parentKey || 'none'} attachments=${attachments.length}`);
+    logger.info(`[QABot] Creating: epic=${epicKey || 'none'} fixVersion=${fixVersionId || 'none'} parent=${parentKey || 'none'} attachments=${attachments.length} curls=${curlCommands.length}`);
 
-    const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId);
+    const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId, curlCommands);
 
     // Always use the currently active (open) sprint on the board
     const sprintId = await getActiveSprintId();
