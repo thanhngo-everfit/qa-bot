@@ -757,20 +757,68 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
   const botUserId = (await client.auth.test()).user_id;
   const threadTs  = event.thread_ts || event.ts;
 
+  // Strip mentions from trigger text and normalize for command detection
+  const triggerText = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
+  const triggerLower = triggerText.toLowerCase();
+
+  // ── Command vocabulary ──
+  // Bare mention (just "@qa-bot" or "@qa-bot @person") → show help, do nothing.
+  // Create intent → proceed with ticket creation below.
+  const createPatterns = [
+    'create card', 'create a card', 'create ticket', 'create a ticket',
+    'log bug', 'log this', 'log it', 'report bug', 'file bug',
+    'assign to', 'tag as bug', 'make ticket',
+  ];
+  const hasCreateIntent = createPatterns.some(p => triggerLower.startsWith(p) || triggerLower.includes(` ${p}`));
+  // "Bare" = nothing left after mentions stripped, OR only words that don't imply a command
+  const isBare = triggerText.length === 0;
+
   try { await client.reactions.add({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }); } catch (_) {}
 
+  const helpText =
+    `👋 Hi <@${event.user}>! I'm QABot. Here's what I can do:\n\n` +
+    `• \`@qa-bot create card\` — parse this thread and log a bug to Jira\n` +
+    `  _Also: \`create ticket\`, \`log bug\`, \`log this\`, \`report bug\`_\n` +
+    `• \`@qa-bot assign to @person\` — create a card and assign it\n` +
+    `• \`@qa-bot create card PLAN-12345\` — create a card linked to that Epic\n\n` +
+    `⚠️ I only create cards when you give me an explicit command — just tagging me without a keyword won't create anything.`;
+
   try {
+    // ── Bare mention → show help, exit ──
+    if (isBare) {
+      logger.info(`[QABot] Bare mention from ${event.user} — showing help`);
+      await client.chat.postMessage({
+        channel: event.channel, thread_ts: threadTs,
+        text: helpText,
+      });
+      await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+      await client.reactions.add({ channel: event.channel, name: 'wave', timestamp: event.ts }).catch(() => {});
+      return;
+    }
+
+    // ── Trigger text exists but no recognized create command → also show help ──
+    if (!hasCreateIntent) {
+      logger.info(`[QABot] Unknown command from ${event.user}: "${triggerText.slice(0, 80)}"`);
+      await client.chat.postMessage({
+        channel: event.channel, thread_ts: threadTs,
+        text: `❓ I didn't recognize that command.\n\n${helpText}`,
+      });
+      await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+      await client.reactions.add({ channel: event.channel, name: 'question', timestamp: event.ts }).catch(() => {});
+      return;
+    }
+
     let context;
     if (event.thread_ts) {
       context = await getThread(client, event.channel, event.thread_ts);
     } else {
-      context = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
+      context = triggerText;
     }
 
     if (!context || context.trim().length < 10) {
       await client.chat.postMessage({
         channel: event.channel, thread_ts: event.ts,
-        text: '👋 Tag me *inside a QA bug thread* — I\'ll log the bug to Jira automatically!',
+        text: `🤔 Hi <@${event.user}>, I don't see enough content in this thread to log a bug. Please tag me *inside a QA bug thread* that has the actual bug report.`,
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       return;
