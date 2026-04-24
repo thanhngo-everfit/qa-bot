@@ -1039,7 +1039,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
   const triggerLower = triggerText.toLowerCase();
 
   // ── Command vocabulary ──
-  // Bare mention (just "@qa-bot" or "@qa-bot @person") → show help, do nothing.
+  // Bare mention (just the bot, or "bot + @person") → show help, do nothing.
   // Create intent → proceed with ticket creation below.
   // Some commands also FORCE the issue type, overriding the AI's decision.
   const createPatterns = [
@@ -1069,23 +1069,27 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
 
   try { await client.reactions.add({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }); } catch (_) {}
 
+  // Bot self-reference for help text — Slack renders <@BOTID> as the bot's
+  // current display name, so renaming the bot in Slack never makes help stale.
+  const botTag = `<@${botUserId}>`;
+
   const helpText =
     `👋 Hi <@${event.user}>! I'm QABot. Here's what I can do:\n\n` +
     `*Create a ticket (I'll decide Bug or Task automatically):*\n` +
-    `• \`@qa-bot create card\` — parse this thread and log to Jira\n` +
+    `• \`${botTag} create card\` — parse this thread and log to Jira\n` +
     `  _Also: \`create ticket\`, \`log this\`, \`make ticket\`_\n\n` +
     `*Force the type explicitly:*\n` +
-    `• \`@qa-bot create bug for ...\` — force type = Bug\n` +
+    `• \`${botTag} create bug for ...\` — force type = Bug\n` +
     `  _Also: \`create bug\`, \`log bug\`, \`report bug\`, \`file bug\`_\n` +
-    `• \`@qa-bot create task for ...\` — force type = Task\n` +
+    `• \`${botTag} create task for ...\` — force type = Task\n` +
     `  _Also: \`create task\`, \`log task\`_\n\n` +
     `*Bulk create from a spreadsheet:*\n` +
     `• Attach a CSV/XLSX/XLS/TSV file to your mention + say \`create cards\`\n` +
     `• I'll read the rows and create up to 25 tickets at once\n` +
     `• Use \`create bugs\` / \`create tasks\` to force the type for all rows\n\n` +
     `*Extras:*\n` +
-    `• \`@qa-bot assign to @person\` — create a ticket and assign it\n` +
-    `• \`@qa-bot create card PLAN-12345\` — link to an Epic\n\n` +
+    `• \`${botTag} assign to @person\` — create a ticket and assign it\n` +
+    `• \`${botTag} create card PLAN-12345\` — link to an Epic\n\n` +
     `⚠️ I only create tickets when you give me an explicit command — just tagging me without a keyword won't create anything.`;
 
   try {
