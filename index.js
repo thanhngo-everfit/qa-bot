@@ -139,6 +139,88 @@ async function downloadSlackFile(url) {
   return Buffer.from(res.data);
 }
 
+// ── Spreadsheet helpers (CSV / XLSX / XLS → rows → AI text) ──
+
+// Detect if a Slack file attachment is a spreadsheet we can read.
+function isSpreadsheetAttachment(file) {
+  const name = (file.name || '').toLowerCase();
+  const mt   = (file.mimetype || '').toLowerCase();
+  return name.endsWith('.csv')
+      || name.endsWith('.xlsx')
+      || name.endsWith('.xls')
+      || name.endsWith('.tsv')
+      || mt === 'text/csv'
+      || mt === 'text/tab-separated-values'
+      || mt.includes('spreadsheetml')
+      || mt.includes('ms-excel');
+}
+
+// Lightweight CSV/TSV parser. Handles quoted fields with commas, embedded
+// newlines, and "" escaped quotes. Returns a 2D array.
+function parseCsvText(text, delimiter = ',') {
+  const rows = [];
+  let row = [], field = '', inQuotes = false, i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
+        inQuotes = false; i++;
+      } else { field += c; i++; }
+    } else {
+      if (c === '"') { inQuotes = true; i++; }
+      else if (c === delimiter) { row.push(field); field = ''; i++; }
+      else if (c === '\r' && text[i + 1] === '\n') { row.push(field); rows.push(row); row = []; field = ''; i += 2; }
+      else if (c === '\n' || c === '\r') { row.push(field); rows.push(row); row = []; field = ''; i++; }
+      else { field += c; i++; }
+    }
+  }
+  if (field !== '' || row.length > 0) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+// Parse an uploaded spreadsheet buffer into rows. CSV/TSV are handled inline;
+// XLSX/XLS require the 'xlsx' npm package (optional — fails gracefully).
+function parseSpreadsheetBuffer(buffer, filename) {
+  const name = (filename || '').toLowerCase();
+
+  if (name.endsWith('.csv')) {
+    return { rows: parseCsvText(buffer.toString('utf8'), ','), format: 'csv' };
+  }
+  if (name.endsWith('.tsv')) {
+    return { rows: parseCsvText(buffer.toString('utf8'), '\t'), format: 'tsv' };
+  }
+  if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
+    try {
+      // Optional dependency — only required for Excel files.
+      // If not installed, advise the user to `npm install xlsx`.
+      const XLSX = require('xlsx');
+      const wb = XLSX.read(buffer, { type: 'buffer' });
+      const firstSheet = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(firstSheet, { header: 1, defval: '', raw: false });
+      return { rows, format: name.endsWith('.xlsx') ? 'xlsx' : 'xls' };
+    } catch (err) {
+      console.warn('[QABot] xlsx module unavailable or parse failed:', err.message);
+      return { rows: [], format: null, error: 'xlsx module not installed — run `npm install xlsx` to support Excel files. CSV/TSV still work.' };
+    }
+  }
+  return { rows: [], format: null, error: `Unsupported file format: ${filename}` };
+}
+
+// Serialize rows into a compact text block for the AI. Preserves row index so
+// the AI can cite specific rows. Drops rows that are entirely empty/whitespace.
+function rowsToAiText(rows, maxRows = 200) {
+  const out = [];
+  const slice = rows.slice(0, maxRows);
+  for (let i = 0; i < slice.length; i++) {
+    const r = slice[i];
+    const cells = (Array.isArray(r) ? r : []).map(c => String(c ?? '').replace(/\s+/g, ' ').trim());
+    if (cells.every(c => c === '')) continue; // skip entirely empty rows
+    out.push(`[Row ${i + 1}] ${cells.join(' | ')}`);
+  }
+  return out.join('\n');
+}
+
 async function uploadAttachmentToJira(issueKey, filename, fileBuffer, mimetype) {
   try {
     const form = new FormData();
@@ -410,6 +492,150 @@ function stripLeakyPreamble(desc) {
   return s.trim();
 }
 
+// ── Bulk parser: turn spreadsheet rows into an array of ticket candidates ──
+// Uses the same platform/type/priority rules as parseBugReport, but scans the
+// whole sheet and returns a list. The AI is responsible for:
+//   - recognizing section headers (e.g. "MOBILE (Android Client + iOS Client)",
+//     "I. UI/UX Bugs") and using them as CONTEXT for nearby rows
+//   - skipping rows that already reference an existing UP-XXXXX ticket
+//   - skipping empty, header-only, or informational rows
+//   - translating Vietnamese content to English in summaries
+async function parseBulkTicketsFromSpreadsheet(rowsText, triggerText, forcedType, assigneeProfiles, maxTickets = 25) {
+  const profileLines = (assigneeProfiles || [])
+    .filter(p => p && (p.real || p.display))
+    .map(p => `- ${p.label}`);
+  const profileBlock = profileLines.length > 0
+    ? `\n\nTAGGED USERS IN TRIGGER MESSAGE (team labels like "(iOS)", "(Android)", "(Web)", "(BE)" are strong platform hints):\n${profileLines.join('\n')}`
+    : '';
+
+  const forcedTypeBlock = forcedType
+    ? `\n\nFORCED TYPE: All returned tickets MUST have type="${forcedType}". The user's command explicitly requested this.`
+    : '';
+
+  const res = await anthropic.messages.create({
+    model:      'claude-sonnet-4-6',
+    max_tokens: 8000,
+    system: `You are QABot for Everfit, in BULK mode. A QA has attached a spreadsheet (CSV/XLSX) of bug/task candidates. Your job: extract a list of tickets to create in Jira.
+
+INPUT FORMAT:
+- TRIGGER MESSAGE: the Slack message where the QA tagged the bot (may contain platform/team hints, a PLAN-XXX epic, or assignment intent).
+- TAGGED USERS (optional): display labels of @mentioned users.
+- FORCED TYPE (optional): if present, every returned ticket must use that type.
+- SPREADSHEET ROWS: the file's rows formatted as "[Row N] col1 | col2 | col3 | ...". Rows are 1-indexed.
+
+HOW TO INTERPRET ROWS:
+Spreadsheets from QAs are MESSY. Expect:
+1. **Section headers** — e.g. "MOBILE (Android Client + iOS Client)", "I. UI/UX Bugs", "II. Functional Bugs", "IV. Data Bugs", "VIII. FRENCH FORMAT NUMBER". These establish CONTEXT (platform, category) for the bug rows that follow them until the next section header.
+2. **Bug rows** — short summaries in one or more cells, sometimes with a details cell and a source cell (e.g. "Message from X in #channel").
+3. **Already-filed rows** — contain a "UP-XXXXX" reference or a Jira URL → SKIP these, they already exist.
+4. **Empty-looking rows** with only a "Message from ..." note and no summary → SKIP, no actual bug content.
+5. **Multi-line cells** — a single cell may contain multiple related items separated by newlines.
+
+HOW TO SPLIT INTO TICKETS:
+- One row with a clear summary → one ticket.
+- A section header saying "MOBILE (Android + iOS)" with UI bugs underneath → decide platform per row. If the bug is clearly UI on both, pick "iOS Client" as default (user can adjust). If one specific platform is mentioned in the cell, use it.
+- Do NOT create a ticket for section headers themselves.
+- Do NOT create a ticket for rows already referencing UP-XXXXX.
+- Do NOT create tickets for empty/boilerplate rows.
+- If a row's summary is too vague to form a useful ticket (e.g., just "Habit" with no context) → include it anyway but prefix the summary with the section context (e.g. "[Android Client][Habit] Localization issue on Habit feature") so the dev knows where to look.
+
+PLATFORM DECISION (per ticket) — follow in order:
+1. Explicit platform in the row's text ("iOS", "Android", "Web", "API", "BE") → use that.
+2. Nearest section header above the row ("MOBILE ..." → pick mobile, "API ..." → API, etc.).
+3. TAGGED USER team labels from the trigger message.
+4. Default: "Web".
+
+Valid platforms: Web, API, iOS Client, iOS Coach, Android Client, Android Coach.
+
+TYPE DECISION (per ticket):
+- If FORCED TYPE is set, use it for every ticket.
+- Otherwise: "Bug" if the row describes broken/crashing/wrong behavior. "Task" if the row describes a change/addition/investigation/data migration.
+- Default: "Bug".
+
+PRIORITY DECISION (per ticket) — standard rubric:
+- Highest: crash, data loss, payment failure, can't log in.
+- High: core feature broken for many users, prod-only affecting active users.
+- Medium: partial break with workaround, typos, confusing UX, missing translations.
+- Low: cosmetic, alignment, minor edge cases.
+- Lowest: internal-only cosmetic.
+Default when unclear: "Medium".
+
+SUMMARY FORMAT (per ticket):
+"[Platform][Feature] Clear English description under 80 chars."
+Translate any Vietnamese content. Never include @mentions, channel names, or "Message from X" text in the summary.
+
+DESCRIPTION FORMAT (per ticket):
+For Bug: use headers "Steps to reproduce:", "Expected behavior:", "Actual behavior:", "Environment:", "Note:".
+For Task: use headers "Request details:", "Context:", "Acceptance criteria:", "Note:".
+If the row doesn't have enough info to fill all headers, use "N/A" for the missing parts and put the row's raw content under "Note:" so the dev can see what the QA wrote.
+Always cite the source row: include a "Source: Row N from uploaded spreadsheet" line inside the Note section.
+
+OUTPUT:
+Return a valid JSON object (NO fences, NO preamble) with this shape:
+
+{
+  "tickets": [
+    {
+      "summary": "[Platform][Feature] ...",
+      "type": "Bug" | "Task",
+      "priority": "Highest" | "High" | "Medium" | "Low" | "Lowest",
+      "platform": "Web" | "API" | "iOS Client" | "iOS Coach" | "Android Client" | "Android Coach",
+      "source_row": <integer — the [Row N] this came from>,
+      "description": "...",
+      "assignee_names": []
+    }
+  ],
+  "skipped": [
+    { "row": <int>, "reason": "already has UP-XXXXX" | "empty" | "section header" | "too vague" }
+  ]
+}
+
+HARD LIMITS:
+- Return AT MOST ${maxTickets} tickets in "tickets". If the sheet has more candidates, pick the most specific/actionable ones and note the rest under "skipped" with reason "over cap — please split into multiple uploads".
+- Every returned ticket must have a non-empty summary and description.
+- Start your response with "{" immediately — no preamble.`,
+    messages: [{
+      role: 'user',
+      content:
+`TRIGGER MESSAGE:
+${triggerText || '(none)'}${profileBlock}${forcedTypeBlock}
+
+SPREADSHEET ROWS:
+${rowsText}`
+    }],
+  });
+
+  const rawText = res.content[0].text || '';
+  let parsed = null;
+  const tryParse = s => { try { return JSON.parse(s); } catch { return null; } };
+  parsed = tryParse(rawText.replace(/```json|```/g, '').trim());
+  if (!parsed) {
+    const m = rawText.match(/\{[\s\S]*\}/);
+    if (m) parsed = tryParse(m[0]);
+  }
+  if (!parsed) {
+    console.warn('[QABot] parseBulkTicketsFromSpreadsheet: could not parse AI JSON. Raw:');
+    console.warn(rawText.slice(0, 2000));
+    return { tickets: [], skipped: [] };
+  }
+
+  const tickets = Array.isArray(parsed.tickets) ? parsed.tickets : [];
+  const skipped = Array.isArray(parsed.skipped) ? parsed.skipped : [];
+
+  // Defensive normalization on each ticket
+  const clean = tickets.map(t => ({
+    summary:        t.summary || '[Web][Bug] Untitled bulk item',
+    type:           forcedType || (t.type === 'Task' ? 'Task' : 'Bug'),
+    priority:       t.priority || 'Medium',
+    platform:       t.platform || 'Web',
+    source_row:     typeof t.source_row === 'number' ? t.source_row : null,
+    description:    stripLeakyPreamble(t.description) || 'Description not parsed.',
+    assignee_names: Array.isArray(t.assignee_names) ? t.assignee_names : [],
+  })).slice(0, maxTickets);
+
+  return { tickets: clean, skipped };
+}
+
 function lineToAdfContent(line) {
   const urlRegex = /(https?:\/\/[^\s]+)/g;
   const parts = []; let last = 0, match;
@@ -611,46 +837,47 @@ async function getChannelCanvasContent(client, channelId) {
 }
 
 // ── Pick parent from canvas based on bug platform ──
-async function pickParentFromCanvas(client, channelId, bugPlatform) {
+// Collect all potential parent candidates from the channel canvas. Expensive
+// (multiple Jira calls) — bulk mode should call this ONCE and reuse the list.
+async function getCanvasParentCandidates(client, channelId) {
   const canvasContent = await getChannelCanvasContent(client, channelId);
-  if (!canvasContent) return null;
+  if (!canvasContent) return [];
 
-  // Extract all UP- and PLAN- keys from canvas
   const upKeys   = [...new Set((canvasContent.match(/UP-\d+/g)   || []))];
   const planKeys = [...new Set((canvasContent.match(/PLAN-\d+/g) || []))];
   console.log(`[QABot] Canvas keys: UP=${upKeys.join(',')} PLAN=${planKeys.join(',')}`);
 
-  // Build candidate list: direct UP tickets + Epics linked from PIs
   const candidates = [];
 
-  // Direct UP keys from canvas
   for (const key of upKeys) {
     const title = await getJiraIssueTitle(key);
     if (title) candidates.push({ key, title });
   }
 
-  // Expand each PI to its linked Epics
   for (const plan of planKeys) {
     const linked = await getLinkedEpicsFromPI(plan);
     for (const e of linked) {
       if (!candidates.find(c => c.key === e.key)) {
-        // Fetch title if missing
         const title = e.title || await getJiraIssueTitle(e.key);
         if (title) candidates.push({ key: e.key, title });
       }
     }
   }
 
-  if (candidates.length === 0) {
+  if (candidates.length > 0) {
+    console.log(`[QABot] Candidates: ${candidates.map(c => `${c.key}="${c.title}"`).join(' | ')}`);
+  } else {
     console.log('[QABot] No candidate parents found');
-    return null;
   }
+  return candidates;
+}
 
-  console.log(`[QABot] Candidates: ${candidates.map(c => `${c.key}="${c.title}"`).join(' | ')}`);
+// Pick the parent whose title prefix matches the bug's platform.
+function matchCandidateToPlatform(candidates, bugPlatform) {
+  if (!candidates || candidates.length === 0) return null;
 
-  // Match a title against a platform prefix (iOS -, iOS |, iOS-, iOS|)
   const matchPrefix = prefix => candidates.find(p => {
-    const lower = p.title.toLowerCase().trim();
+    const lower = (p.title || '').toLowerCase().trim();
     const pf    = prefix.toLowerCase();
     return lower.startsWith(pf + ' -')
         || lower.startsWith(pf + '-')
@@ -658,26 +885,20 @@ async function pickParentFromCanvas(client, channelId, bugPlatform) {
         || lower.startsWith(pf + '|');
   });
 
-  // Priority: exact match → Mobile (for iOS/Android) → All Platforms
   let priorities;
   switch (bugPlatform) {
     case 'iOS Client':
     case 'iOS Coach':
-      priorities = ['iOS', 'Mobile', 'All Platforms'];
-      break;
+      priorities = ['iOS', 'Mobile', 'All Platforms']; break;
     case 'Android Client':
     case 'Android Coach':
-      priorities = ['Android', 'Mobile', 'All Platforms'];
-      break;
+      priorities = ['Android', 'Mobile', 'All Platforms']; break;
     case 'Web':
-      priorities = ['Web', 'All Platforms'];
-      break;
+      priorities = ['Web', 'All Platforms']; break;
     case 'API':
-      priorities = ['API', 'All Platforms'];
-      break;
+      priorities = ['API', 'All Platforms']; break;
     case 'CMS':
-      priorities = ['CMS', 'All Platforms'];
-      break;
+      priorities = ['CMS', 'All Platforms']; break;
     default:
       priorities = ['All Platforms'];
   }
@@ -691,6 +912,12 @@ async function pickParentFromCanvas(client, channelId, bugPlatform) {
   }
   console.log(`[QABot] No parent found for platform=${bugPlatform}`);
   return null;
+}
+
+// Thin wrapper for single-ticket mode — keeps existing callers working.
+async function pickParentFromCanvas(client, channelId, bugPlatform) {
+  const candidates = await getCanvasParentCandidates(client, channelId);
+  return matchCandidateToPlatform(candidates, bugPlatform);
 }
 
 async function getActiveSprintId() {
@@ -834,6 +1061,12 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
   // "Bare" = nothing left after mentions stripped
   const isBare = triggerText.length === 0;
 
+  // ── Bulk mode: spreadsheet attached to the triggering message ──
+  // Slack's app_mention event exposes the message's files in event.files.
+  // If any of them is a CSV/XLSX/XLS/TSV, this is a bulk request.
+  const spreadsheetAttachments = (event.files || []).filter(isSpreadsheetAttachment);
+  const isBulk = spreadsheetAttachments.length > 0;
+
   try { await client.reactions.add({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }); } catch (_) {}
 
   const helpText =
@@ -846,6 +1079,10 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     `  _Also: \`create bug\`, \`log bug\`, \`report bug\`, \`file bug\`_\n` +
     `• \`@qa-bot create task for ...\` — force type = Task\n` +
     `  _Also: \`create task\`, \`log task\`_\n\n` +
+    `*Bulk create from a spreadsheet:*\n` +
+    `• Attach a CSV/XLSX/XLS/TSV file to your mention + say \`create cards\`\n` +
+    `• I'll read the rows and create up to 25 tickets at once\n` +
+    `• Use \`create bugs\` / \`create tasks\` to force the type for all rows\n\n` +
     `*Extras:*\n` +
     `• \`@qa-bot assign to @person\` — create a ticket and assign it\n` +
     `• \`@qa-bot create card PLAN-12345\` — link to an Epic\n\n` +
@@ -883,10 +1120,11 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       context = triggerText;
     }
 
-    if (!context || context.trim().length < 10) {
+    // Skip the short-context guard in bulk mode — the file IS the content.
+    if (!isBulk && (!context || context.trim().length < 10)) {
       await client.chat.postMessage({
         channel: event.channel, thread_ts: event.ts,
-        text: `🤔 Hi <@${event.user}>, I don't see enough content in this thread to log a bug. Please tag me *inside a QA bug thread* that has the actual bug report.`,
+        text: `🤔 Hi <@${event.user}>, I don't see enough content in this thread to log a bug. Please tag me *inside a QA bug thread* that has the actual bug report, or attach a CSV/XLSX file for bulk import.`,
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       return;
@@ -914,6 +1152,145 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     if (assigneeTeamHints.length > 0) {
       logger.info(`[QABot] Team hints from TEAM_MAP: ${assigneeTeamHints.join(', ')}`);
     }
+
+    // ═════════════════════════════════════════════════════════
+    // BULK MODE — spreadsheet attached to the mention
+    // ═════════════════════════════════════════════════════════
+    if (isBulk) {
+      const file = spreadsheetAttachments[0]; // process the first spreadsheet
+      logger.info(`[QABot] Bulk mode — file="${file.name}" (${Math.round((file.size || 0) / 1024)}KB)`);
+
+      // Download + parse the spreadsheet
+      let rows = [], rowsText = '', parseErr = null;
+      try {
+        const buf = await downloadSlackFile(file.url_private_download || file.url_private);
+        const parsed = parseSpreadsheetBuffer(buf, file.name);
+        if (parsed.error) parseErr = parsed.error;
+        rows = parsed.rows || [];
+        rowsText = rowsToAiText(rows);
+      } catch (err) {
+        parseErr = err.message;
+      }
+
+      if (parseErr || rows.length === 0) {
+        await client.chat.postMessage({
+          channel: event.channel, thread_ts: threadTs,
+          text: `⚠️ Hi <@${event.user}>, I couldn't read \`${file.name}\`.\n${parseErr ? `_${parseErr}_` : 'The file appears empty or in an unsupported format.'}\n\nSupported: CSV, TSV, XLSX, XLS.`,
+        });
+        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+        await client.reactions.add({ channel: event.channel, name: 'x', timestamp: event.ts }).catch(() => {});
+        return;
+      }
+
+      // Let the user know we're working on it — bulk runs can take 30-60s
+      await client.chat.postMessage({
+        channel: event.channel, thread_ts: threadTs,
+        text: `📖 Hi <@${event.user}>, reading \`${file.name}\` (${rows.length} rows)... analyzing with AI, this may take a moment.`,
+      });
+
+      // AI extracts ticket candidates from the rows
+      const maxTickets = 25;
+      const { tickets, skipped } = await parseBulkTicketsFromSpreadsheet(
+        rowsText, event.text, forcedType, assigneeProfiles, maxTickets
+      );
+      logger.info(`[QABot] Bulk parsed: ${tickets.length} tickets, ${skipped.length} skipped`);
+
+      if (tickets.length === 0) {
+        const skipSummary = skipped.length > 0
+          ? `\n\nSkipped rows:\n${skipped.slice(0, 10).map(s => `• Row ${s.row}: ${s.reason}`).join('\n')}`
+          : '';
+        await client.chat.postMessage({
+          channel: event.channel, thread_ts: threadTs,
+          text: `🤔 Hi <@${event.user}>, I couldn't find any actionable bugs/tasks in \`${file.name}\`. Most rows appear to be headers, empty, or already-filed tickets.${skipSummary}`,
+        });
+        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+        await client.reactions.add({ channel: event.channel, name: 'shrug', timestamp: event.ts }).catch(() => {});
+        return;
+      }
+
+      // Resolve shared Jira metadata ONCE for all tickets
+      const epicMatch = event.text.match(/\b(PLAN-\d+|UP-\d+)\b/i);
+      const epicKey   = epicMatch ? epicMatch[0].toUpperCase() : null;
+      const fixVersionId = '12023';
+      const sprintId = await getActiveSprintId();
+      const reporterJiraId = await resolveJiraAccountId(client, event.user);
+      const slackThreadUrl = buildSlackThreadUrl(event.channel, threadTs);
+
+      // Canvas candidates fetched ONCE — matched per ticket below
+      const canvasCandidates = await getCanvasParentCandidates(client, event.channel);
+
+      // Create tickets sequentially (avoids Jira rate limits + keeps logs readable)
+      const results = [];
+      let okCount = 0;
+      for (const [idx, t] of tickets.entries()) {
+        try {
+          // Prepend source metadata to description
+          t.description =
+            `Slack thread: ${slackThreadUrl}\n` +
+            `Source: \`${file.name}\`, Row ${t.source_row || '?'}\n\n` +
+            t.description;
+
+          // Resolve per-ticket assignees (falls back to trigger mentions if none suggested)
+          let ticketAssigneeIds = triggerMentions;
+          if (ticketAssigneeIds.length === 0 && t.assignee_names.length > 0) {
+            ticketAssigneeIds = [];
+            for (const name of t.assignee_names) {
+              const id = await findSlackUserByName(client, name);
+              if (id) ticketAssigneeIds.push(id);
+            }
+          }
+          const ticketJiraIds = (
+            await Promise.all(ticketAssigneeIds.map(id => resolveJiraAccountId(client, id)))
+          ).filter(Boolean);
+
+          const parentKey = matchCandidateToPlatform(canvasCandidates, t.platform);
+
+          const jira = await createJiraIssue(
+            t, ticketJiraIds, epicKey, fixVersionId, parentKey, reporterJiraId, []
+          );
+          if (sprintId) await addIssueToSprint(jira.key, sprintId);
+
+          results.push({ ok: true, jira, ticket: t });
+          okCount++;
+          logger.info(`[QABot] Bulk ${idx + 1}/${tickets.length}: ${jira.key} — ${t.summary}`);
+        } catch (err) {
+          const msg = err.response?.data?.errors
+            ? Object.entries(err.response.data.errors).map(([f, m]) => `${f}: ${m}`).join(', ')
+            : err.message;
+          results.push({ ok: false, error: msg, ticket: t });
+          logger.warn(`[QABot] Bulk ${idx + 1}/${tickets.length} failed: ${msg}`);
+        }
+      }
+
+      // Build summary reply
+      const lines = results.map((r, i) => {
+        if (r.ok) {
+          const icon = r.ticket.type === 'Task' ? '📋' : '🐛';
+          return `${icon} <${r.jira.url}|${r.jira.key}> · *${r.ticket.priority}* · ${r.ticket.platform} — ${r.ticket.summary}`;
+        }
+        return `⚠️ Failed: ${r.ticket.summary} _(${r.error})_`;
+      });
+
+      const skipLines = skipped.slice(0, 8).map(s => `• Row ${s.row}: ${s.reason}`);
+      const skipBlock = skipLines.length > 0
+        ? `\n\n_Skipped ${skipped.length} row${skipped.length > 1 ? 's' : ''}:_\n${skipLines.join('\n')}${skipped.length > 8 ? `\n…and ${skipped.length - 8} more` : ''}`
+        : '';
+
+      await client.chat.postMessage({
+        channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+        text:
+          `✅ Hi <@${event.user}>, bulk import complete: *${okCount}/${tickets.length}* tickets created from \`${file.name}\`.\n\n` +
+          lines.join('\n') +
+          skipBlock,
+      });
+
+      await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+      await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
+      return;
+    }
+    // ═════════════════════════════════════════════════════════
+    // END BULK MODE
+    // ═════════════════════════════════════════════════════════
 
     // Extract any curl commands from the whole thread for the description
     const curlCommands = extractCurlCommands(context);
