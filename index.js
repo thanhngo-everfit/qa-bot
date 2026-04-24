@@ -178,9 +178,17 @@ async function getLatestFixVersionId() {
 }
 
 // ── Parse QA bug with Claude (robust) ────────
-async function parseBugReport(threadContext, triggerText, assigneeTeamHints) {
+async function parseBugReport(threadContext, triggerText, assigneeProfiles, assigneeTeamHints) {
+  // Build a compact "who was tagged" block the AI can read
+  const profileLines = (assigneeProfiles || [])
+    .filter(p => p && (p.real || p.display))
+    .map(p => `- ${p.label}`);
+  const profileBlock = profileLines.length > 0
+    ? `\n\nTAGGED USERS IN TRIGGER MESSAGE (their Slack display labels — often contain team in parens like "(iOS)", "(Android)", "(Web)", "(BE)"):\n${profileLines.join('\n')}`
+    : '';
+
   const teamHint = Array.isArray(assigneeTeamHints) && assigneeTeamHints.length > 0
-    ? `\n\nASSIGNEE TEAM HINT (the QA tagged devs from these teams — strong signal for client-side bugs): ${assigneeTeamHints.join(', ')}`
+    ? `\n\nEXPLICIT TEAM MAP (from config, most reliable): ${assigneeTeamHints.join(', ')}`
     : '';
 
   const res = await anthropic.messages.create({
@@ -191,7 +199,8 @@ async function parseBugReport(threadContext, triggerText, assigneeTeamHints) {
 INPUTS YOU RECEIVE:
 - TRIGGER MESSAGE: the message that mentioned the bot. Often contains assignment/team hints like "nhờ @X team mobile check", "@BE coi với", "assign to @Y".
 - THREAD: the full Slack thread. The FIRST message is the QA's bug report. Later messages are discussion/commands — use them for context (platform hints, team mentions, additional details) but do NOT treat them as the bug itself.
-- ASSIGNEE TEAM HINT (optional): the teams the tagged devs belong to. Trust this for client-side bugs.
+- TAGGED USERS (optional but important): Slack display labels of users the QA @mentioned. At Everfit, dev display names routinely encode their team in parens: "Thinh Le (iOS)" → iOS team, "Lam Bui (Android)" → Android team, "Hung (Web)" → Web, "Ben (BE)" → API/Backend, "Ly Nguyen (QA)" → QA. READ THESE LABELS and use them as a strong platform signal for client-side bugs.
+- EXPLICIT TEAM MAP (optional): authoritative team assignments from config. If present, trust these over display labels.
 
 WHAT TO IGNORE:
 - Bot messages ([qa-bot], [bug-reporting-tracker])
@@ -211,37 +220,43 @@ Signals the bug is BACKEND → platform = "API":
 - Data not saving, sync failure, data inconsistency between clients
 - Auth/token/session issues
 - Calculation happens server-side and value is wrong (e.g., wrong calorie total, wrong progress %)
-- Same bug visible on multiple clients
+- Same bug visible on multiple clients AND the QA is asking for backend investigation
 - Reporter pastes a curl / request / response payload as evidence
 - Reporter is from BE team, or message says "BE check", "API trả sai", "server returns…"
 - Webhook / push notification / email delivery issue
 - Permissions/ACL issue
 
-If ANY of these apply → platform is "API". Do NOT use iOS/Android/Web even if the Android dev reported it or it was seen on the Android app. The root cause is backend.
+Important nuance: "same bug on iOS and Android" alone does NOT mean backend. If the QA assigns it to a mobile dev and says "fix it on iOS to match Android" (or similar), that means iOS has a CLIENT-side bug where Android is correct — platform is iOS Client/Coach, not API.
+
+If backend signals apply AND the QA is asking for backend investigation → platform = "API".
 
 STEP 2 — CLIENT-SIDE BUG: pick the client platform.
 Only reach this step if the bug is clearly a UI/UX/rendering/interaction issue on one specific client.
 
-Priority order for picking the client:
-  2a. Explicit mention in the bug text: "trên iOS", "on Android", "Web dashboard", "coach app iOS", "client app Android", "UI của web", etc.
-  2b. ASSIGNEE TEAM HINT (if provided). If QA assigned the bug to a mobile dev, it's a mobile bug. If to a web dev, it's Web.
-  2c. Explicit team mention in trigger: "team mobile" → iOS/Android Client (default iOS Client unless Android is more specific), "team web" → Web.
-  2d. Default: "Web".
+Priority order for picking the client (STOP at first match):
+  2a. EXPLICIT TEAM MAP entry for a tagged user → that user's team.
+  2b. TAGGED USER display label contains "(iOS)" → iOS Client (or iOS Coach if coach-facing feature).
+      "(Android)" → Android Client (or Android Coach if coach-facing feature).
+      "(Web)" → Web. "(BE)" → API.
+  2c. Explicit mention in bug text: "trên iOS", "on Android", "Web dashboard", "coach app iOS", etc.
+  2d. Explicit team mention in trigger: "team mobile" → iOS Client (or Android if Android explicitly mentioned), "team web" → Web.
+  2e. Default: "Web".
 
-Within mobile:
-  - Coach-facing features (assign workout, client list, programs, coach dashboard) → iOS Coach / Android Coach
-  - Client-facing features (log workout, meal plan, progress photos, macros, metrics the client sees) → iOS Client / Android Client
+Coach vs Client (when platform is mobile):
+  - Features used by a COACH managing clients (assign workout, client list, programs, coach dashboard, "Coaching" tab viewed by coach) → iOS Coach / Android Coach
+  - Features used by the END USER/client themselves (log their own workout, meal plan, progress photos, macros, calorie display, personal metrics) → iOS Client / Android Client
+  - Screenshot showing a phone screen with a single user's personal data = Client app.
 
 Valid platforms (one of): Web, API, iOS Client, iOS Coach, Android Client, Android Coach
 
 ====================================================================
-OUTPUT — valid JSON only, NO fences, NO explanation:
+OUTPUT — valid JSON only, NO fences, NO explanation, NO thinking outside JSON:
 ====================================================================
 {
   "summary": "[Platform][Feature] Clear English bug description under 80 chars. No @mentions, no usernames, no 'Nhờ team check'.",
   "priority": "Highest" | "High" | "Medium" | "Low" | "Lowest",
   "platform": "Web" | "API" | "iOS Client" | "iOS Coach" | "Android Client" | "Android Coach",
-  "root_cause_reasoning": "One short sentence explaining WHY you picked this platform. E.g. 'Reporter is on Android team but the bug is about wrong calorie total returned by the server — backend calculation issue, so API.'",
+  "root_cause_reasoning": "One short sentence explaining WHY you picked this platform. Reference which signal won (team label, explicit text, backend root cause, etc).",
   "description": "Clean multi-section text using real \\n newlines:\\n\\nSteps to reproduce:\\n1. ...\\n2. ...\\n\\nExpected behavior:\\n- ...\\n\\nActual behavior:\\n- ...\\n\\nEnvironment:\\n- <browser, device, OS, app version, or N/A>\\n\\nNote: <test account, PROD/STG, extra context, or N/A>",
   "assignee_names": ["Full Name of the person the QA tagged to fix. Look for '@X check', 'nhờ @X', '@X fix', '@X coi với'. Empty array if nobody."]
 }
@@ -255,21 +270,42 @@ PRIORITY RUBRIC (unchanged):
 "Low" — Minor: spacing/padding/alignment/color on client UI (still understandable), UI flicker, edge-case bugs, nice-to-haves
 "Lowest" — Trivial: internal-only cosmetic issues, non-blocking suggestions
 
-NEVER return null/undefined/empty. Always make a reasonable decision.`,
+NEVER return null/undefined/empty. Always make a reasonable decision. Start your response with "{" immediately — no preamble.`,
     messages: [{
       role: 'user',
       content:
 `TRIGGER MESSAGE (this mentioned the bot — contains team/assignment hints):
-${triggerText || '(none)'}${teamHint}
+${triggerText || '(none)'}${profileBlock}${teamHint}
 
 THREAD:
 ${threadContext}`
     }],
   });
 
-  const raw = res.content[0].text.replace(/```json|```/g, '').trim();
-  let parsed;
-  try { parsed = JSON.parse(raw); } catch { parsed = {}; }
+  // ── Robust JSON extraction ──
+  // Model might wrap JSON in fences, add preamble, or include thinking text.
+  // Extract the first {...} block. If that fails, log the raw response so we
+  // can diagnose rather than silently falling back to defaults.
+  const rawText = res.content[0].text || '';
+  let parsed = null;
+  const tryParse = s => { try { return JSON.parse(s); } catch { return null; } };
+
+  // Attempt 1: clean fences and parse whole thing
+  parsed = tryParse(rawText.replace(/```json|```/g, '').trim());
+
+  // Attempt 2: greedy match of first {...} through last }
+  if (!parsed) {
+    const m = rawText.match(/\{[\s\S]*\}/);
+    if (m) parsed = tryParse(m[0]);
+  }
+
+  if (!parsed) {
+    console.warn('[QABot] parseBugReport: could not parse AI response as JSON. Raw response follows:');
+    console.warn('---BEGIN AI RESPONSE---');
+    console.warn(rawText.slice(0, 2000));
+    console.warn('---END AI RESPONSE---');
+    parsed = {};
+  }
 
   // Defensive defaults — never undefined
   return {
@@ -582,6 +618,29 @@ async function findSlackUserByName(client, name) {
   } catch { return null; }
 }
 
+// ── Resolve mentioned Slack users to their display labels ──
+// Returns array of "Real Name (display_name)" strings — e.g.
+//   ["Thinh Le (Thinh Le (iOS))", "Lam Bui (Lâm Android)"]
+// Display names at Everfit often contain the team label in parens:
+//   "(iOS)", "(Android)", "(Web)", "(BE)", "(QA)" — which is the single
+// strongest signal the bot has for which platform owns the bug.
+async function resolveSlackProfiles(client, slackUserIds) {
+  const profiles = [];
+  for (const id of slackUserIds) {
+    try {
+      const info = await client.users.info({ user: id });
+      const real    = info.user?.real_name || info.user?.profile?.real_name || '';
+      const display = info.user?.profile?.display_name || '';
+      const label   = display && display !== real ? `${real} (${display})` : (real || id);
+      profiles.push({ id, real, display, label });
+    } catch (err) {
+      console.warn(`[QABot] Could not resolve Slack profile for ${id}:`, err.message);
+      profiles.push({ id, real: '', display: '', label: id });
+    }
+  }
+  return profiles;
+}
+
 // ── Read channel canvas and extract parent Jira key ──
 async function getParentFromChannelCanvas(client, channelId) {
   try {
@@ -653,12 +712,20 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       .map(m => m.replace(/<@|>/g, ''))
       .filter(id => id !== botUserId);
 
-    // Look up each mentioned Slack user's team from TEAM_MAP
+    // Resolve display names — at Everfit these routinely contain the team label
+    // in parens like "Thinh Le (iOS)", "Lâm Bui (Android)", "Hung (Web)".
+    // This is the PRIMARY signal for platform detection, no config needed.
+    const assigneeProfiles = await resolveSlackProfiles(client, triggerMentions);
+    if (assigneeProfiles.length > 0) {
+      logger.info(`[QABot] Tagged profiles: ${assigneeProfiles.map(p => p.label).join(' | ')}`);
+    }
+
+    // Optional: authoritative override from TEAM_MAP env var (if configured)
     const assigneeTeamHints = triggerMentions
       .map(id => getTeamForSlackUser(id))
       .filter(Boolean);
     if (assigneeTeamHints.length > 0) {
-      logger.info(`[QABot] Team hints from trigger: ${assigneeTeamHints.join(', ')}`);
+      logger.info(`[QABot] Team hints from TEAM_MAP: ${assigneeTeamHints.join(', ')}`);
     }
 
     // Extract any curl commands from the whole thread for the description
@@ -667,7 +734,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       logger.info(`[QABot] Found ${curlCommands.length} curl command(s) in thread`);
     }
 
-    const ticket = await parseBugReport(context, event.text, assigneeTeamHints);
+    const ticket = await parseBugReport(context, event.text, assigneeProfiles, assigneeTeamHints);
     logger.info(`[QABot] Parsed: ${ticket.summary} [${ticket.priority}] platform=${ticket.platform}`);
     if (ticket.root_cause_reasoning) {
       logger.info(`[QABot] Root cause: ${ticket.root_cause_reasoning}`);
