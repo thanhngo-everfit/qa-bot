@@ -250,20 +250,49 @@ Coach vs Client (when platform is mobile):
 Valid platforms (one of): Web, API, iOS Client, iOS Coach, Android Client, Android Coach
 
 ====================================================================
+ISSUE TYPE DECISION — Bug vs Task:
+====================================================================
+Decide whether the thread describes a BUG (something broken) or a TASK (a request/change/investigation that isn't fixing broken behavior).
+
+Return "Bug" when:
+- Something is broken, crashing, erroring, or producing wrong output
+- Behavior deviates from what the user/feature expects ("should X but does Y")
+- Data is missing, corrupted, or inconsistent
+- A feature that used to work no longer does
+- Any thread with error logs, stack traces, 4xx/5xx responses, or crash reports
+- The QA is reporting a defect they discovered during testing
+
+Return "Task" when:
+- Request to CHANGE existing behavior that currently works correctly (e.g., "change copy from X to Y", "make button blue instead of green", "increase timeout from 5s to 10s")
+- Request to ADD something new (a field, a config option, a log, a metric)
+- Request for INVESTIGATION or ANALYSIS that isn't tied to a specific defect ("look into how X works", "audit Y")
+- Request to UPDATE data/configuration for a specific account ("enable feature X for coach Y", "reset password for client Z")
+- Refactor / code quality / tech debt
+- Documentation or internal tooling work
+
+Ambiguous case — "investigate why X is slow/failing":
+- If X is clearly malfunctioning (errors, timeouts, wrong data) → Bug
+- If X works but someone wants to understand it better → Task
+
+Default when truly unclear: "Bug" (QA channel usually reports defects).
+
+====================================================================
 OUTPUT — valid JSON only, NO fences, NO explanation, NO thinking outside JSON:
 ====================================================================
 {
-  "summary": "[Platform][Feature] Clear English bug description under 80 chars. No @mentions, no usernames, no 'Nhờ team check'.",
+  "summary": "[Platform][Feature] Clear English description under 80 chars. No @mentions, no usernames, no 'Nhờ team check'.",
+  "type": "Bug" | "Task",
   "priority": "Highest" | "High" | "Medium" | "Low" | "Lowest",
   "platform": "Web" | "API" | "iOS Client" | "iOS Coach" | "Android Client" | "Android Coach",
-  "root_cause_reasoning": "One short sentence explaining WHY you picked this platform. Reference which signal won (team label, explicit text, backend root cause, etc).",
+  "root_cause_reasoning": "One short sentence explaining WHY you picked the platform AND the type (Bug/Task). Reference which signals won.",
   "description": "<see DESCRIPTION FORMAT below — do NOT include any meta text like 'Clean multi-section text' or 'See below' — output only the sections>",
   "assignee_names": ["Full Name of the person the QA tagged to fix. Look for '@X check', 'nhờ @X', '@X fix', '@X coi với'. Empty array if nobody."]
 }
 
 ====================================================================
-DESCRIPTION FORMAT — the value of the "description" field must start DIRECTLY with "Steps to reproduce:" and follow this exact shape, using literal \\n newlines in the JSON string:
+DESCRIPTION FORMAT — the value of the "description" field must start DIRECTLY with the first section header (no preamble). Use literal \\n newlines in the JSON string. Pick the template based on the "type" field:
 
+── IF type = "Bug" ──
 Steps to reproduce:
 1. <step>
 2. <step>
@@ -280,7 +309,19 @@ Environment:
 
 Note: <test account, PROD/STG, extra context, or N/A>
 
-DO NOT prepend any preamble, heading, or instructional phrase before "Steps to reproduce:".
+── IF type = "Task" ──
+Request details:
+- <clear summary of what needs to be done>
+
+Context:
+- <why this is needed, background, related tickets, or N/A>
+
+Acceptance criteria:
+- <what "done" looks like — bullet each criterion>
+
+Note: <affected accounts, test data, environment, or N/A>
+
+DO NOT prepend any preamble, heading, or instructional phrase before the first section header.
 ====================================================================
 
 ====================================================================
@@ -337,6 +378,7 @@ ${threadContext}`
 
   return {
     summary:        parsed.summary        || `[Web][Bug] Bug report from QA`,
+    type:           parsed.type === 'Task' ? 'Task' : 'Bug',
     priority:       parsed.priority       || 'Medium',
     platform:       parsed.platform       || 'Web',
     root_cause_reasoning: parsed.root_cause_reasoning || '',
@@ -346,15 +388,20 @@ ${threadContext}`
 }
 
 // Remove any instructional preamble the model echoed above the real content.
-// Keeps everything from "Steps to reproduce:" onward. Also trims common
-// meta-phrases that might appear before it.
+// Keeps everything from the first real section header onward (Bug: "Steps to
+// reproduce:", Task: "Request details:"). Also trims common meta-phrases.
 function stripLeakyPreamble(desc) {
   if (!desc || typeof desc !== 'string') return desc;
   let s = desc;
 
-  // If "Steps to reproduce:" exists anywhere, cut everything before it.
-  const idx = s.search(/Steps to reproduce\s*:/i);
-  if (idx > 0) s = s.slice(idx);
+  // Find the earliest known first-section header and cut everything before it.
+  const anchors = [/Steps to reproduce\s*:/i, /Request details\s*:/i];
+  let earliest = -1;
+  for (const re of anchors) {
+    const idx = s.search(re);
+    if (idx >= 0 && (earliest === -1 || idx < earliest)) earliest = idx;
+  }
+  if (earliest > 0) s = s.slice(earliest);
 
   // Otherwise, remove lines that are obvious echoes of prompt instructions.
   const leakyLineRegex = /^[ \t]*(clean multi-section text|see description format|multi-section text|see below|as follows)[^\n]*\n+/gi;
@@ -382,6 +429,9 @@ const HEADER_PATTERNS = [
   /^(Steps to reproduce)(:)(.*)$/i,
   /^(Expected behavior)(:)(.*)$/i,
   /^(Actual behavior)(:)(.*)$/i,
+  /^(Request details)(:)(.*)$/i,
+  /^(Context)(:)(.*)$/i,
+  /^(Acceptance criteria)(:)(.*)$/i,
   /^(Environment)(:)(.*)$/i,
   /^(Notes?)(:)(.*)$/i,
   /^(Slack thread)(:)(.*)$/i,
@@ -430,7 +480,7 @@ async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, pa
   const fields = {
     project:     { key: JIRA_PROJECT },
     summary:     ticket.summary,
-    issuetype:   { name: 'Bug' },
+    issuetype:   { name: ticket.type === 'Task' ? 'Task' : 'Bug' },
     priority:    { name: ticket.priority },
     description: buildAdfDescription(ticket.description, curlCommands),
   };
@@ -764,24 +814,42 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
   // ── Command vocabulary ──
   // Bare mention (just "@qa-bot" or "@qa-bot @person") → show help, do nothing.
   // Create intent → proceed with ticket creation below.
+  // Some commands also FORCE the issue type, overriding the AI's decision.
   const createPatterns = [
     'create card', 'create a card', 'create ticket', 'create a ticket',
-    'log bug', 'log this', 'log it', 'report bug', 'file bug',
+    'create bug', 'create a bug', 'create task', 'create a task',
+    'log bug', 'log task', 'log this', 'log it',
+    'report bug', 'file bug',
     'assign to', 'tag as bug', 'make ticket',
   ];
   const hasCreateIntent = createPatterns.some(p => triggerLower.startsWith(p) || triggerLower.includes(` ${p}`));
-  // "Bare" = nothing left after mentions stripped, OR only words that don't imply a command
+
+  // Forced type — command explicitly says "bug" or "task"
+  const forcesBug  = /^(create (a )?bug|log bug|report bug|file bug|tag as bug)\b/i.test(triggerText)
+                  || /\b(create (a )?bug for|log bug|report bug|file bug)\b/i.test(triggerText);
+  const forcesTask = /^(create (a )?task|log task)\b/i.test(triggerText)
+                  || /\b(create (a )?task for|log task)\b/i.test(triggerText);
+  const forcedType = forcesBug ? 'Bug' : (forcesTask ? 'Task' : null);
+
+  // "Bare" = nothing left after mentions stripped
   const isBare = triggerText.length === 0;
 
   try { await client.reactions.add({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }); } catch (_) {}
 
   const helpText =
     `👋 Hi <@${event.user}>! I'm QABot. Here's what I can do:\n\n` +
-    `• \`@qa-bot create card\` — parse this thread and log a bug to Jira\n` +
-    `  _Also: \`create ticket\`, \`log bug\`, \`log this\`, \`report bug\`_\n` +
-    `• \`@qa-bot assign to @person\` — create a card and assign it\n` +
-    `• \`@qa-bot create card PLAN-12345\` — create a card linked to that Epic\n\n` +
-    `⚠️ I only create cards when you give me an explicit command — just tagging me without a keyword won't create anything.`;
+    `*Create a ticket (I'll decide Bug or Task automatically):*\n` +
+    `• \`@qa-bot create card\` — parse this thread and log to Jira\n` +
+    `  _Also: \`create ticket\`, \`log this\`, \`make ticket\`_\n\n` +
+    `*Force the type explicitly:*\n` +
+    `• \`@qa-bot create bug for ...\` — force type = Bug\n` +
+    `  _Also: \`create bug\`, \`log bug\`, \`report bug\`, \`file bug\`_\n` +
+    `• \`@qa-bot create task for ...\` — force type = Task\n` +
+    `  _Also: \`create task\`, \`log task\`_\n\n` +
+    `*Extras:*\n` +
+    `• \`@qa-bot assign to @person\` — create a ticket and assign it\n` +
+    `• \`@qa-bot create card PLAN-12345\` — link to an Epic\n\n` +
+    `⚠️ I only create tickets when you give me an explicit command — just tagging me without a keyword won't create anything.`;
 
   try {
     // ── Bare mention → show help, exit ──
@@ -854,9 +922,15 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     }
 
     const ticket = await parseBugReport(context, event.text, assigneeProfiles, assigneeTeamHints);
-    logger.info(`[QABot] Parsed: ${ticket.summary} [${ticket.priority}] platform=${ticket.platform}`);
+    logger.info(`[QABot] Parsed: ${ticket.summary} [${ticket.priority}] platform=${ticket.platform} type=${ticket.type}`);
     if (ticket.root_cause_reasoning) {
       logger.info(`[QABot] Root cause: ${ticket.root_cause_reasoning}`);
+    }
+
+    // Command-level override: "create bug for..." / "create task for..." wins over AI
+    if (forcedType && ticket.type !== forcedType) {
+      logger.info(`[QABot] Forcing type: AI said "${ticket.type}" but command said "${forcedType}"`);
+      ticket.type = forcedType;
     }
 
     // Finalize assignee list (trigger mentions win; else fall back to names the AI extracted)
@@ -931,14 +1005,17 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     const attachLine = uploaded > 0 ? `\n📎 ${uploaded} attachment${uploaded > 1 ? 's' : ''} uploaded` : '';
 
     // Greet the triggering QA so it's clear whose report was logged
-    const greeting = `Hi <@${event.user}>, Bug logged →`;
+    const isTask = ticket.type === 'Task';
+    const emoji  = isTask ? '📋' : '🐛';
+    const label  = isTask ? 'Task created' : 'Bug logged';
+    const greeting = `Hi <@${event.user}>, ${label} →`;
 
     await client.chat.postMessage({
       channel: event.channel, thread_ts: threadTs, unfurl_links: false,
       text:
-        `🐛 ${greeting} <${jira.url}|${jira.key}>\n` +
+        `${emoji} ${greeting} <${jira.url}|${jira.key}>\n` +
         `*${ticket.summary}*\n` +
-        `Priority: *${ticket.priority}* · Platform: *${ticket.platform}*\n` +
+        `Type: *${ticket.type}* · Priority: *${ticket.priority}* · Platform: *${ticket.platform}*\n` +
         `${assigneeLine}${parentLine}${epicLine}${attachLine}`,
     });
 
