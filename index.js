@@ -463,13 +463,19 @@ async function getActiveSprintId() {
       headers: { Authorization: jiraAuth(), Accept: 'application/json' },
     });
     const board = boardRes.data?.values?.[0];
-    if (!board) return null;
+    if (!board) { console.warn('[QABot] No scrum board found for project', JIRA_PROJECT); return null; }
     const sprintRes = await axios.get(`${JIRA_HOST}/rest/agile/1.0/board/${board.id}/sprint`, {
       params: { state: 'active' },
       headers: { Authorization: jiraAuth(), Accept: 'application/json' },
     });
-    return sprintRes.data?.values?.[0]?.id ?? null;
-  } catch { return null; }
+    const sprint = sprintRes.data?.values?.[0];
+    if (!sprint) { console.warn(`[QABot] No active sprint on board ${board.id}`); return null; }
+    console.log(`[QABot] Active sprint: ${sprint.id} "${sprint.name}"`);
+    return sprint.id;
+  } catch (err) {
+    console.warn('[QABot] getActiveSprintId failed:', err.response?.data ?? err.message);
+    return null;
+  }
 }
 
 async function addIssueToSprint(issueKey, sprintId) {
@@ -478,7 +484,9 @@ async function addIssueToSprint(issueKey, sprintId) {
       { issues: [issueKey] },
       { headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' } }
     );
-  } catch (_) {}
+  } catch (err) {
+    console.warn(`[QABot] Could not add ${issueKey} to sprint ${sprintId}:`, err.response?.data ?? err.message);
+  }
 }
 
 async function findSlackUserByName(client, name) {
@@ -602,8 +610,14 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
 
     const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId);
 
-    const sprintId = '249';
-    if (sprintId) await addIssueToSprint(jira.key, sprintId);
+    // Always use the currently active (open) sprint on the board
+    const sprintId = await getActiveSprintId();
+    if (sprintId) {
+      logger.info(`[QABot] Adding ${jira.key} to active sprint ${sprintId}`);
+      await addIssueToSprint(jira.key, sprintId);
+    } else {
+      logger.warn(`[QABot] No active sprint found — ${jira.key} will stay in backlog`);
+    }
 
     // Upload attachments with per-file logging
     let uploaded = 0;
