@@ -930,10 +930,13 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     const epicLine   = epicKey ? `\nEpic: <${JIRA_HOST}/browse/${epicKey}|${epicKey}>` : '';
     const attachLine = uploaded > 0 ? `\n📎 ${uploaded} attachment${uploaded > 1 ? 's' : ''} uploaded` : '';
 
+    // Greet the triggering QA so it's clear whose report was logged
+    const greeting = `Hi <@${event.user}>, Bug logged →`;
+
     await client.chat.postMessage({
       channel: event.channel, thread_ts: threadTs, unfurl_links: false,
       text:
-        `🐛 *Bug logged!* → <${jira.url}|${jira.key}>\n` +
+        `🐛 ${greeting} <${jira.url}|${jira.key}>\n` +
         `*${ticket.summary}*\n` +
         `Priority: *${ticket.priority}* · Platform: *${ticket.platform}*\n` +
         `${assigneeLine}${parentLine}${epicLine}${attachLine}`,
