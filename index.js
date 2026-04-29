@@ -30,13 +30,17 @@ async function resolveJiraAccountId(slackClient, slackUserId) {
   } catch { return null; }
 }
 
+function buildSlackThreadUrl(channelId, threadTs) {
+  const ts = threadTs.replace('.', '');
+  return `https://everfitt.slack.com/archives/${channelId}/p${ts}`;
+}
+
 // ── Get the Slack user ID of the first (non-bot) message in a thread ──
 async function getThreadReporterSlackId(client, channelId, threadTs) {
   try {
     const result   = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 10 });
     const messages = result.messages || [];
     for (const msg of messages) {
-      // Skip bot messages — find the first real human who posted
       if (msg.bot_id || msg.subtype === 'bot_message') continue;
       if (msg.user) return msg.user;
     }
@@ -45,11 +49,6 @@ async function getThreadReporterSlackId(client, channelId, threadTs) {
     console.warn('[QABot] Could not get thread reporter:', err.message);
     return null;
   }
-}
-
-function buildSlackThreadUrl(channelId, threadTs) {
-  const ts = threadTs.replace('.', '');
-  return `https://everfitt.slack.com/archives/${channelId}/p${ts}`;
 }
 
 async function getThread(client, channelId, threadTs) {  const result   = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 });
@@ -234,24 +233,59 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the f
   };
 }
 
+// ── Section headers that should be bold in Jira description ──
+const BOLD_HEADERS = [
+  'Slack thread:', 'Steps to reproduce:', 'Expected behavior:',
+  'Actual behavior:', 'Environment:', 'Note:', 'Web link:',
+];
+
 function lineToAdfContent(line) {
   const urlRegex = /(https?:\/\/[^\s]+)/g;
-  const parts = []; let last = 0, match;
-  while ((match = urlRegex.exec(line)) !== null) {
-    if (match.index > last) parts.push({ type: 'text', text: line.slice(last, match.index) });
+
+  // Check if line starts with a known header → bold the header portion
+  let boldPrefix = null;
+  let rest = line;
+  for (const header of BOLD_HEADERS) {
+    if (line.startsWith(header)) {
+      boldPrefix = header;
+      rest = line.slice(header.length);
+      break;
+    }
+  }
+
+  const parts = [];
+
+  // Add bold header if found
+  if (boldPrefix) {
+    parts.push({ type: 'text', text: boldPrefix, marks: [{ type: 'strong' }] });
+    if (rest.length === 0) return parts;
+  }
+
+  // Process the remaining text for URLs
+  let last = 0, match;
+  while ((match = urlRegex.exec(rest)) !== null) {
+    if (match.index > last) parts.push({ type: 'text', text: rest.slice(last, match.index) });
     parts.push({ type: 'text', text: match[1], marks: [{ type: 'link', attrs: { href: match[1] } }] });
     last = match.index + match[1].length;
   }
-  if (last < line.length) parts.push({ type: 'text', text: line.slice(last) });
+  if (last < rest.length) parts.push({ type: 'text', text: rest.slice(last) });
+
   return parts.length > 0 ? parts : [{ type: 'text', text: line }];
 }
 
 function buildAdfDescription(text) {
   const lines = (text || '').split('\n');
   const content = [];
+  let lastWasEmpty = false;
   for (const line of lines) {
-    if (line.trim() === '') content.push({ type: 'paragraph', content: [] });
-    else content.push({ type: 'paragraph', content: lineToAdfContent(line) });
+    if (line.trim() === '') {
+      // Only allow one empty paragraph between sections
+      if (!lastWasEmpty) content.push({ type: 'paragraph', content: [] });
+      lastWasEmpty = true;
+    } else {
+      content.push({ type: 'paragraph', content: lineToAdfContent(line) });
+      lastWasEmpty = false;
+    }
   }
   return { type: 'doc', version: 1, content };
 }
@@ -608,7 +642,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
 
     // Resolve reporter: the person who WROTE the bug (first message in thread),
     // NOT the person who triggered the bot. Fall back to trigger user if not found.
-    let reporterSlackId = event.user; // default fallback
+    let reporterSlackId = event.user;
     if (event.thread_ts) {
       const threadAuthor = await getThreadReporterSlackId(client, event.channel, event.thread_ts);
       if (threadAuthor) {
