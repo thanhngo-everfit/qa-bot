@@ -52,6 +52,10 @@ function buildSlackThreadUrl(channelId, threadTs) {
   return `https://everfit.slack.com/archives/${channelId}/p${ts}`;
 }
 
+function buildSlackDeepLink(teamId, channelId, threadTs) {
+  return `slack://channel?team=${teamId}&id=${channelId}&message=${threadTs}`;
+}
+
 async function getThread(client, channelId, threadTs) {  const result   = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 });
   const messages = result.messages || [];
   const lines    = await Promise.all(messages.map(async msg => {
@@ -553,7 +557,9 @@ async function getParentFromChannelCanvas(client, channelId) {
 }
 
 slackApp.event('app_mention', async ({ event, client, logger }) => {
-  const botUserId = (await client.auth.test()).user_id;
+  const authInfo  = await client.auth.test();
+  const botUserId = authInfo.user_id;
+  const teamId    = authInfo.team_id;
   const threadTs  = event.thread_ts || event.ts;
 
   try { await client.reactions.add({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }); } catch (_) {}
@@ -621,7 +627,8 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
 
     // Prepend Slack thread URL to description
     const slackThreadUrl = buildSlackThreadUrl(event.channel, threadTs);
-    ticket.description = `Slack thread: ${slackThreadUrl}\n\n${ticket.description}`;
+    const slackDeepLink  = buildSlackDeepLink(teamId, event.channel, threadTs);
+    ticket.description = `Slack thread: ${slackDeepLink}\nWeb link: ${slackThreadUrl}\n\n${ticket.description}`;
 
     const attachments = await getAllThreadAttachments(client, event.channel, threadTs);
     logger.info(`[QABot] Creating: epic=${epicKey || 'none'} fixVersion=${fixVersionId || 'none'} parent=${parentKey || 'none'} attachments=${attachments.length}`);
