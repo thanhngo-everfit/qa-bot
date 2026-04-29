@@ -49,7 +49,7 @@ async function getThreadReporterSlackId(client, channelId, threadTs) {
 
 function buildSlackThreadUrl(channelId, threadTs) {
   const ts = threadTs.replace('.', '');
-  return `https://everfit.slack.com/archives/${channelId}/p${ts}`;
+  return `https://everfitt.slack.com/archives/${channelId}/p${ts}`;
 }
 
 async function getThread(client, channelId, threadTs) {  const result   = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 });
