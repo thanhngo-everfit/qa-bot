@@ -146,26 +146,45 @@ async function getLatestFixVersionId() {
 async function parseBugReport(context) {
   const res = await anthropic.messages.create({
     model:      'claude-haiku-4-5-20251001',
-    max_tokens: 1500,
+    max_tokens: 3000,
     system: `You are QABot for Everfit. Parse a QA bug report from a Slack thread.
 
 CRITICAL RULES:
-1. Focus ONLY on the FIRST message in the thread — that's the QA's bug report. Ignore everything else.
+1. Read ALL messages in the thread (except bot messages) to collect every bug/issue reported.
 2. Ignore bot messages (lines starting with "[qa-bot]" or "[bug-reporting-tracker]").
 3. Ignore command messages (lines like "@X assign to @Y", "@qa-bot ...", "@bug-reporting-tracker ...").
-4. Extract the actual bug: what is broken, on what platform, steps to reproduce.
+4. Extract every actual bug: what is broken, on what platform, steps to reproduce.
 5. Translate any Vietnamese content to English.
 6. The summary should describe the bug clearly — NOT include "[Thanh Ngo]:" or usernames or "Nhờ team check" boilerplate.
 
-Return ONLY valid JSON (NO markdown fences, NO explanation):
+MULTI-BUG RULES:
+- If the thread reports MULTIPLE RELATED issues on the SAME feature/screen → merge them into ONE ticket. List all issues in the description.
+- If the thread reports UNRELATED issues (different features, different platforms) → create SEPARATE tickets for each.
+- Most threads will have just 1 ticket. Only create multiple when issues are clearly unrelated.
 
-{
-  "summary": "[Platform][Feature] Clear bug description. Platform MUST be one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach. Under 80 chars total. NEVER include @mentions, subteam IDs, or [Thanh Ngo]: prefixes.",
-  "priority": "Highest" or "High" or "Medium" or "Low" or "Lowest",
-  "platform": "one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach",
-  "description": "Clean, well-formatted description in this EXACT structure (use real newlines):\\n\\nSteps to reproduce:\\n1. <clear step>\\n2. <clear step>\\n3. <clear step>\\n\\nExpected behavior:\\n- <what should happen>\\n\\nActual behavior:\\n- <what is happening>\\n\\nEnvironment:\\n- <browser, device, OS, app version if mentioned, else N/A>\\n\\nNote: <any useful context like 'Happen on PROD', test account info, etc. Or N/A>",
-  "assignee_names": ["Full Name of person asked to fix — look for '@X check', 'nhờ @X', '@X fix', '@X coi với'. Empty array [] if no one was tagged for the fix."]
-}
+Return ONLY a valid JSON ARRAY (NO markdown fences, NO explanation):
+
+[
+  {
+    "summary": "[Platform][Feature] Clear bug description. Platform MUST be one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach. Under 80 chars total. NEVER include @mentions, subteam IDs, or [Thanh Ngo]: prefixes.",
+    "priority": "Highest" or "High" or "Medium" or "Low" or "Lowest",
+    "platform": "one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach",
+    "description": "Clean, well-formatted description in this EXACT structure (use real newlines):\\n\\nSteps to reproduce:\\n1. <clear step>\\n2. <clear step>\\n3. <clear step>\\n\\nExpected behavior:\\n- <what should happen>\\n\\nActual behavior:\\n- <what is happening>\\n\\nEnvironment:\\n- <browser, device, OS, app version if mentioned, else N/A>\\n\\nNote: <any useful context like 'Happen on PROD', test account info, etc. Or N/A>",
+    "assignee_names": ["Full Name of person asked to fix — look for '@X check', 'nhờ @X', '@X fix', '@X coi với'. Empty array [] if no one was tagged for the fix."],
+    "acceptance_criteria": ["SHOULD <expected behavior statement>", "SHOULD NOT <negative behavior statement>"]
+  }
+]
+
+ACCEPTANCE CRITERIA RULES:
+- Generate 2-5 clear, testable acceptance criteria for each bug.
+- Each item MUST start with "SHOULD" or "SHOULD NOT".
+- Focus on what the fix must achieve, not how to reproduce.
+- Examples:
+  - Bug: "OTP boxes not cleared after clicking Resend"
+    → ["SHOULD clear all OTP input boxes when user clicks Resend", "SHOULD reset cursor focus to the first OTP box after Resend", "SHOULD NOT retain old OTP digits after Resend is clicked"]
+  - Bug: "App crashes when opening video"
+    → ["SHOULD play video without crashing", "SHOULD show loading indicator while video buffers", "SHOULD NOT crash when video format is unsupported"]
+- If the bug is trivial (typo, spacing) or acceptance criteria is not useful, return empty array [].
 
 PLATFORM DETECTION:
 - Web → dashboard UI issues, desktop browser
@@ -221,16 +240,31 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the f
 
   const raw = res.content[0].text.replace(/```json|```/g, '').trim();
   let parsed;
-  try { parsed = JSON.parse(raw); } catch { parsed = {}; }
+  try { parsed = JSON.parse(raw); } catch { parsed = null; }
 
-  // Defensive defaults — never undefined
-  return {
-    summary:        parsed.summary        || `[Web][Bug] Bug report from QA`,
-    priority:       parsed.priority       || 'Medium',
-    platform:       parsed.platform       || 'Web',
-    description:    parsed.description    || 'Description not parsed. Please update manually.',
-    assignee_names: Array.isArray(parsed.assignee_names) ? parsed.assignee_names : [],
-  };
+  // Normalize to array
+  if (!parsed) {
+    return [{
+      summary:             '[Web][Bug] Bug report from QA',
+      priority:            'Medium',
+      platform:            'Web',
+      description:         'Description not parsed. Please update manually.',
+      assignee_names:      [],
+      acceptance_criteria: [],
+    }];
+  }
+
+  const tickets = Array.isArray(parsed) ? parsed : [parsed];
+
+  // Defensive defaults for each ticket
+  return tickets.map(t => ({
+    summary:             t.summary        || '[Web][Bug] Bug report from QA',
+    priority:            t.priority       || 'Medium',
+    platform:            t.platform       || 'Web',
+    description:         t.description    || 'Description not parsed. Please update manually.',
+    assignee_names:      Array.isArray(t.assignee_names) ? t.assignee_names : [],
+    acceptance_criteria: Array.isArray(t.acceptance_criteria) ? t.acceptance_criteria : [],
+  }));
 }
 
 // ── Section headers that should be bold in Jira description ──
@@ -532,6 +566,38 @@ async function addIssueToSprint(issueKey, sprintId) {
   } catch (_) {}
 }
 
+// ── Add acceptance criteria checklist items to a Jira issue ──
+async function addAcceptanceCriteria(issueKey, items) {
+  if (!items || items.length === 0) return 0;
+  try {
+    await axios.put(
+      `${JIRA_HOST}/rest/checklist-for-jira/1.0/checklist/${issueKey}`,
+      { items: items.map(name => ({ name, checked: false })) },
+      { headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' } }
+    );
+    console.log(`[QABot] Added ${items.length} acceptance criteria to ${issueKey}`);
+    return items.length;
+  } catch (err) {
+    console.warn(`[QABot] Checklist API (plugin) failed for ${issueKey}: ${err.message}`);
+    // Fallback: try Jira standard Edit Issue API with checklist custom field
+    // Common field IDs for Checklist for Jira Cloud: customfield_10101, Acceptance criteria
+    const fallbackFieldIds = ['Acceptance criteria', 'customfield_10101', 'customfield_10102'];
+    for (const fieldId of fallbackFieldIds) {
+      try {
+        await axios.put(
+          `${JIRA_HOST}/rest/api/3/issue/${issueKey}`,
+          { update: { [fieldId]: [{ add: items.map(name => ({ name, checked: false })) }] } },
+          { headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' } }
+        );
+        console.log(`[QABot] Added ${items.length} acceptance criteria via field "${fieldId}" on ${issueKey}`);
+        return items.length;
+      } catch (_) { continue; }
+    }
+    console.warn(`[QABot] Could not add acceptance criteria to ${issueKey} — all methods failed`);
+    return 0;
+  }
+}
+
 async function findSlackUserByName(client, name) {
   try {
     const res   = await client.users.list({ limit: 200 });
@@ -587,8 +653,14 @@ async function getParentFromChannelCanvas(client, channelId) {
 }
 
 slackApp.event('app_mention', async ({ event, client, logger }) => {
-  const botUserId = (await client.auth.test()).user_id;
+  const authRes   = await client.auth.test();
+  const botUserId = authRes.user_id;
+  const botBotId  = authRes.bot_id;
   const threadTs  = event.thread_ts || event.ts;
+
+  // Detect "force log" command
+  const triggerText = event.text.replace(/<@[A-Z0-9]+>/g, '').trim().toLowerCase();
+  const isForceLog  = triggerText.startsWith('force log') || triggerText.startsWith('force');
 
   try { await client.reactions.add({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }); } catch (_) {}
 
@@ -609,39 +681,53 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       return;
     }
 
-    const ticket = await parseBugReport(context);
-    logger.info(`[QABot] Parsed: ${ticket.summary} [${ticket.priority}] platform=${ticket.platform}`);
+    // ── Feature 2: Duplicate detection ──────────
+    // Scan thread for existing QABot tickets
+    const existingKeys = [];
+    const existingSummaries = [];
+    try {
+      const threadResult = await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 50 });
+      for (const msg of (threadResult.messages || [])) {
+        if (msg.bot_id !== botBotId) continue;
+        const keyMatches = (msg.text || '').match(/UP-\d+/g) || [];
+        existingKeys.push(...keyMatches);
+        const summaryMatch = (msg.text || '').match(/\*(.+?)\*/);
+        if (summaryMatch) existingSummaries.push(summaryMatch[1].toLowerCase());
+      }
+    } catch (_) {}
 
-    // Detect assignee
+    // If tickets already exist and NOT force log → notify and ask
+    if (existingKeys.length > 0 && !isForceLog) {
+      const ticketLinks = [...new Set(existingKeys)].map(k => `<${JIRA_HOST}/browse/${k}|${k}>`).join(', ');
+      await client.chat.postMessage({
+        channel: event.channel, thread_ts: threadTs,
+        text:
+          `⚠️ This thread already has logged ticket(s): ${ticketLinks}\n` +
+          `If you still want to create a new ticket, reply with:\n` +
+          `\`@qa-bot force log\``,
+      });
+      await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+      await client.reactions.add({ channel: event.channel, name: 'warning', timestamp: event.ts }).catch(() => {});
+      return;
+    }
+
+    // ── Feature 1: Parse — returns array of tickets ──
+    const tickets = await parseBugReport(context);
+    logger.info(`[QABot] Parsed ${tickets.length} ticket(s)`);
+
+    // Detect assignee from trigger message
     const triggerMentions = (event.text.match(/<@([A-Z0-9]+)>/g) || [])
       .map(m => m.replace(/<@|>/g, ''))
       .filter(id => id !== botUserId);
 
-    let assigneeSlackIds = triggerMentions;
-    if (assigneeSlackIds.length === 0 && ticket.assignee_names.length > 0) {
-      for (const name of ticket.assignee_names) {
-        const id = await findSlackUserByName(client, name);
-        if (id) assigneeSlackIds.push(id);
-      }
-    }
-
-    const jiraIds = (
-      await Promise.all(assigneeSlackIds.map(id => resolveJiraAccountId(client, id)))
-    ).filter(Boolean);
-
-    // Parse Epic from trigger message (PLAN-XXX or UP-XXX) — ignore if it matches an assignee mention
+    // Parse Epic from trigger message (PLAN-XXX or UP-XXX)
     const epicMatch = event.text.match(/\b(PLAN-\d+|UP-\d+)\b/i);
     const epicKey   = epicMatch ? epicMatch[0].toUpperCase() : null;
 
     // Hardcoded fix version = "To be confirmed" (ID 12023)
     const fixVersionId = '12023';
 
-    // Read parent from channel canvas (matched by bug platform)
-    const parentKey = await pickParentFromCanvas(client, event.channel, ticket.platform);
-    logger.info(`[QABot] Parent from canvas: ${parentKey || 'none'}`);
-
-    // Resolve reporter: the person who WROTE the bug (first message in thread),
-    // NOT the person who triggered the bot. Fall back to trigger user if not found.
+    // Resolve reporter: thread's original author
     let reporterSlackId = event.user;
     if (event.thread_ts) {
       const threadAuthor = await getThreadReporterSlackId(client, event.channel, event.thread_ts);
@@ -653,50 +739,84 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     const reporterJiraId = await resolveJiraAccountId(client, reporterSlackId);
     logger.info(`[QABot] Reporter/QA set to: ${reporterSlackId} → Jira ${reporterJiraId || 'not found'}`);
 
-    // Prepend Slack thread URL to description
     const slackThreadUrl = buildSlackThreadUrl(event.channel, threadTs);
-    ticket.description = `Slack thread: ${slackThreadUrl}\n\n${ticket.description}`;
+    const attachments    = await getAllThreadAttachments(client, event.channel, threadTs);
+    const sprintId       = '249';
 
-    const attachments = await getAllThreadAttachments(client, event.channel, threadTs);
-    logger.info(`[QABot] Creating: epic=${epicKey || 'none'} fixVersion=${fixVersionId || 'none'} parent=${parentKey || 'none'} attachments=${attachments.length}`);
+    const createdJiras = [];
 
-    const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId);
+    for (const ticket of tickets) {
+      // Read parent from channel canvas (matched by bug platform)
+      const parentKey = await pickParentFromCanvas(client, event.channel, ticket.platform);
+      logger.info(`[QABot] Parent from canvas: ${parentKey || 'none'} for platform=${ticket.platform}`);
 
-    const sprintId = '249';
-    if (sprintId) await addIssueToSprint(jira.key, sprintId);
-
-    // Upload attachments with per-file logging
-    let uploaded = 0;
-    for (const att of attachments) {
-      const sizeMB = (att.size / 1024 / 1024).toFixed(1);
-      logger.info(`[QABot] Downloading ${att.name} (${sizeMB}MB)...`);
-      try {
-        const buf = await downloadSlackFile(att.url);
-        logger.info(`[QABot] Uploading ${att.name} to ${jira.key}...`);
-        const ok  = await uploadAttachmentToJira(jira.key, att.name, buf, att.mimetype);
-        if (ok) { uploaded++; logger.info(`[QABot] ✓ ${att.name}`); }
-        else     { logger.warn(`[QABot] ✗ ${att.name} failed to upload`); }
-      } catch (err) {
-        logger.warn(`[QABot] ✗ ${att.name}: ${err.message}`);
+      // Resolve assignees
+      let assigneeSlackIds = [...triggerMentions];
+      if (assigneeSlackIds.length === 0 && ticket.assignee_names.length > 0) {
+        for (const name of ticket.assignee_names) {
+          const id = await findSlackUserByName(client, name);
+          if (id) assigneeSlackIds.push(id);
+        }
       }
+
+      const jiraIds = (
+        await Promise.all(assigneeSlackIds.map(id => resolveJiraAccountId(client, id)))
+      ).filter(Boolean);
+
+      // Prepend Slack thread URL to description
+      ticket.description = `Slack thread: ${slackThreadUrl}\n\n${ticket.description}`;
+
+      logger.info(`[QABot] Creating: ${ticket.summary} epic=${epicKey || 'none'} parent=${parentKey || 'none'}`);
+      const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId);
+
+      if (sprintId) await addIssueToSprint(jira.key, sprintId);
+
+      // ── Feature 3: Add acceptance criteria checklist ──
+      let acCount = 0;
+      if (ticket.acceptance_criteria.length > 0) {
+        acCount = await addAcceptanceCriteria(jira.key, ticket.acceptance_criteria);
+      }
+
+      // Upload attachments
+      let uploaded = 0;
+      for (const att of attachments) {
+        const sizeMB = (att.size / 1024 / 1024).toFixed(1);
+        logger.info(`[QABot] Downloading ${att.name} (${sizeMB}MB)...`);
+        try {
+          const buf = await downloadSlackFile(att.url);
+          logger.info(`[QABot] Uploading ${att.name} to ${jira.key}...`);
+          const ok  = await uploadAttachmentToJira(jira.key, att.name, buf, att.mimetype);
+          if (ok) { uploaded++; logger.info(`[QABot] ✓ ${att.name}`); }
+          else     { logger.warn(`[QABot] ✗ ${att.name} failed to upload`); }
+        } catch (err) {
+          logger.warn(`[QABot] ✗ ${att.name}: ${err.message}`);
+        }
+      }
+      logger.info(`[QABot] Uploaded ${uploaded}/${attachments.length} attachments to ${jira.key}`);
+
+      createdJiras.push({ jira, ticket, assigneeSlackIds, uploaded, acCount });
     }
-    logger.info(`[QABot] Uploaded ${uploaded}/${attachments.length} attachments to ${jira.key}`);
 
-    const assigneeLine = assigneeSlackIds.length > 0
-      ? `Assigned to ${assigneeSlackIds.map(id => `<@${id}>`).join(', ')}`
-      : '_No assignee — please assign in Jira_';
-
-    const parentLine = parentKey ? `\nParent: <${JIRA_HOST}/browse/${parentKey}|${parentKey}>` : '';
-    const epicLine   = epicKey ? `\nEpic: <${JIRA_HOST}/browse/${epicKey}|${epicKey}>` : '';
-    const attachLine = uploaded > 0 ? `\n📎 ${uploaded} attachment${uploaded > 1 ? 's' : ''} uploaded` : '';
-
-    await client.chat.postMessage({
-      channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-      text:
+    // ── Build Slack response ──────────────────
+    const lines = createdJiras.map(({ jira, ticket, assigneeSlackIds, uploaded, acCount }) => {
+      const assigneeLine = assigneeSlackIds.length > 0
+        ? `Assigned to ${assigneeSlackIds.map(id => `<@${id}>`).join(', ')}`
+        : '_No assignee — please assign in Jira_';
+      const attachLine = uploaded > 0 ? ` · 📎 ${uploaded}` : '';
+      const acLine     = acCount > 0 ? ` · ✅ ${acCount} AC` : '';
+      return (
         `🐛 *Bug logged!* → <${jira.url}|${jira.key}>\n` +
         `*${ticket.summary}*\n` +
         `Priority: *${ticket.priority}* · Platform: *${ticket.platform}*\n` +
-        `${assigneeLine}${parentLine}${epicLine}${attachLine}`,
+        `${assigneeLine}${attachLine}${acLine}`
+      );
+    });
+
+    const epicLine = epicKey ? `\nEpic: <${JIRA_HOST}/browse/${epicKey}|${epicKey}>` : '';
+
+    await client.chat.postMessage({
+      channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+      text: lines.join('\n\n') + epicLine,
     });
 
     await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
