@@ -142,6 +142,14 @@ async function getLatestFixVersionId() {
   } catch { return null; }
 }
 
+// ── Detect requested issue type from the trigger text ──
+function detectIssueType(triggerText) {
+  const lower = (triggerText || '').toLowerCase();
+  // Match explicit "task" keyword (English or Vietnamese "tạo task")
+  if (/\btask\b/.test(lower)) return 'Task';
+  return 'Bug';
+}
+
 // ── Parse QA bug with Claude (robust) ────────
 async function parseBugReport(context) {
   const res = await anthropic.messages.create({
@@ -267,10 +275,96 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the f
   }));
 }
 
+// ── Parse a TASK request from a Slack thread ─────
+async function parseTaskReport(context) {
+  const res = await anthropic.messages.create({
+    model:      'claude-haiku-4-5-20251001',
+    max_tokens: 3000,
+    system: `You are QABot for Everfit. Parse a TASK request from a Slack thread.
+
+CRITICAL RULES:
+1. Read ALL messages in the thread (except bot messages) to understand what work is being requested.
+2. Ignore bot messages (lines starting with "[qa-bot]" or "[bug-reporting-tracker]").
+3. Ignore command messages (lines like "@X assign to @Y", "@qa-bot create task ...").
+4. Translate any Vietnamese content to English.
+5. The summary should describe the TASK clearly (what to do) — NOT include "[Thanh Ngo]:" or usernames or "Nhờ team check" boilerplate.
+6. A task is work to be done (improvement, new feature, configuration, follow-up). It is NOT a bug report.
+
+MULTI-TASK RULES:
+- If the thread requests MULTIPLE RELATED items on the SAME feature/screen → merge into ONE ticket.
+- If the thread requests UNRELATED items → create SEPARATE tickets.
+- Most threads will produce just 1 ticket.
+
+Return ONLY a valid JSON ARRAY (NO markdown fences, NO explanation):
+
+[
+  {
+    "summary": "[Platform][Task] Clear task description. Platform MUST be one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach. Under 80 chars total. NEVER include @mentions, subteam IDs, or [Name]: prefixes.",
+    "priority": "Highest" or "High" or "Medium" or "Low" or "Lowest",
+    "platform": "one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach",
+    "description": "Clean, well-formatted description in this EXACT structure (use real newlines):\\n\\nGoal:\\n- <what the task should accomplish>\\n\\nRequirements:\\n- <bullet list of what needs to be done>\\n\\nNotes:\\n- <any useful context, links, references. Or N/A>",
+    "assignee_names": ["Full Name of person asked to do this — look for '@X handle', 'nhờ @X', '@X làm', 'assign to @X'. Empty array [] if no one was tagged."],
+    "acceptance_criteria": ["SHOULD <expected outcome>", "SHOULD NOT <negative outcome>"]
+  }
+]
+
+ACCEPTANCE CRITERIA RULES:
+- Generate 2-5 clear, testable acceptance criteria for each task.
+- Each item MUST start with "SHOULD" or "SHOULD NOT".
+- Focus on what the completed task must achieve.
+- If the task is trivial or AC isn't useful, return empty array [].
+
+PLATFORM DETECTION:
+- Web → dashboard UI work, desktop browser
+- API → backend, data, sync, auth
+- iOS Client → iOS app (client-facing)
+- iOS Coach → iOS app (coach-facing)
+- Android Client → Android app (client-facing)
+- Android Coach → Android app (coach-facing)
+
+PRIORITY RUBRIC (for tasks, default to Medium unless thread suggests otherwise):
+- "Highest" — Urgent business blocker, must be done immediately
+- "High" — Important task with a near-term deadline
+- "Medium" — Normal task, default
+- "Low" — Nice-to-have, low urgency
+- "Lowest" — Trivial / cleanup
+
+NEVER return null/undefined/empty. Always make a reasonable guess based on the thread.`,
+    messages: [{ role: 'user', content: `Task request thread:\n\n${context}` }],
+  });
+
+  const raw = res.content[0].text.replace(/```json|```/g, '').trim();
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { parsed = null; }
+
+  if (!parsed) {
+    return [{
+      summary:             '[Web][Task] Task request',
+      priority:            'Medium',
+      platform:            'Web',
+      description:         'Description not parsed. Please update manually.',
+      assignee_names:      [],
+      acceptance_criteria: [],
+    }];
+  }
+
+  const tickets = Array.isArray(parsed) ? parsed : [parsed];
+
+  return tickets.map(t => ({
+    summary:             t.summary        || '[Web][Task] Task request',
+    priority:            t.priority       || 'Medium',
+    platform:            t.platform       || 'Web',
+    description:         t.description    || 'Description not parsed. Please update manually.',
+    assignee_names:      Array.isArray(t.assignee_names) ? t.assignee_names : [],
+    acceptance_criteria: Array.isArray(t.acceptance_criteria) ? t.acceptance_criteria : [],
+  }));
+}
+
 // ── Section headers that should be bold in Jira description ──
 const BOLD_HEADERS = [
   'Slack thread:', 'Steps to reproduce:', 'Expected behavior:',
   'Actual behavior:', 'Environment:', 'Note:', 'Web link:',
+  'Goal:', 'Requirements:', 'Notes:',
 ];
 
 function lineToAdfContent(line) {
@@ -324,11 +418,11 @@ function buildAdfDescription(text) {
   return { type: 'doc', version: 1, content };
 }
 
-async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, parentKey, reporterJiraId) {
+async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, parentKey, reporterJiraId, issueType = 'Bug') {
   const fields = {
     project:     { key: JIRA_PROJECT },
     summary:     ticket.summary,
-    issuetype:   { name: 'Bug' },
+    issuetype:   { name: issueType },
     priority:    { name: ticket.priority },
     description: buildAdfDescription(ticket.description),
   };
@@ -662,6 +756,10 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
   const triggerText = event.text.replace(/<@[A-Z0-9]+>/g, '').trim().toLowerCase();
   const isForceLog  = triggerText.startsWith('force log') || triggerText.startsWith('force');
 
+  // Detect requested issue type — Task (explicit) or Bug (default)
+  const issueType = detectIssueType(triggerText);
+  const isTask    = issueType === 'Task';
+
   try { await client.reactions.add({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }); } catch (_) {}
 
   try {
@@ -675,7 +773,9 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     if (!context || context.trim().length < 10) {
       await client.chat.postMessage({
         channel: event.channel, thread_ts: event.ts,
-        text: '👋 Tag me *inside a QA bug thread* — I\'ll log the bug to Jira automatically!',
+        text: isTask
+          ? '👋 Tag me *inside a thread* with `create task` — I\'ll create a Task in Jira automatically!'
+          : '👋 Tag me *inside a QA bug thread* — I\'ll log the bug to Jira automatically!',
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       return;
@@ -697,7 +797,8 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     } catch (_) {}
 
     // If tickets already exist and NOT force log → notify and ask
-    if (existingKeys.length > 0 && !isForceLog) {
+    // Skip duplicate detection for explicit Task creation — user is intentionally creating a new ticket
+    if (existingKeys.length > 0 && !isForceLog && !isTask) {
       const ticketLinks = [...new Set(existingKeys)].map(k => `<${JIRA_HOST}/browse/${k}|${k}>`).join(', ');
       await client.chat.postMessage({
         channel: event.channel, thread_ts: threadTs,
@@ -712,8 +813,10 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     }
 
     // ── Feature 1: Parse — returns array of tickets ──
-    const tickets = await parseBugReport(context);
-    logger.info(`[QABot] Parsed ${tickets.length} ticket(s)`);
+    const tickets = isTask
+      ? await parseTaskReport(context)
+      : await parseBugReport(context);
+    logger.info(`[QABot] Parsed ${tickets.length} ${issueType.toLowerCase()}(s)`);
 
     // Detect assignee from trigger message
     const triggerMentions = (event.text.match(/<@([A-Z0-9]+)>/g) || [])
@@ -766,8 +869,8 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       // Prepend Slack thread URL to description
       ticket.description = `Slack thread: ${slackThreadUrl}\n\n${ticket.description}`;
 
-      logger.info(`[QABot] Creating: ${ticket.summary} epic=${epicKey || 'none'} parent=${parentKey || 'none'}`);
-      const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId);
+      logger.info(`[QABot] Creating ${issueType}: ${ticket.summary} epic=${epicKey || 'none'} parent=${parentKey || 'none'}`);
+      const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId, issueType);
 
       if (sprintId) await addIssueToSprint(jira.key, sprintId);
 
@@ -798,6 +901,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     }
 
     // ── Build Slack response ──────────────────
+    const headline = isTask ? '📋 *Task created!*' : '🐛 *Bug logged!*';
     const lines = createdJiras.map(({ jira, ticket, assigneeSlackIds, uploaded, acCount }) => {
       const assigneeLine = assigneeSlackIds.length > 0
         ? `Assigned to ${assigneeSlackIds.map(id => `<@${id}>`).join(', ')}`
@@ -805,7 +909,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       const attachLine = uploaded > 0 ? ` · 📎 ${uploaded}` : '';
       const acLine     = acCount > 0 ? ` · ✅ ${acCount} AC` : '';
       return (
-        `🐛 *Bug logged!* → <${jira.url}|${jira.key}>\n` +
+        `${headline} → <${jira.url}|${jira.key}>\n` +
         `*${ticket.summary}*\n` +
         `Priority: *${ticket.priority}* · Platform: *${ticket.platform}*\n` +
         `${assigneeLine}${attachLine}${acLine}`
