@@ -165,10 +165,13 @@ CRITICAL RULES:
 5. Translate any Vietnamese content to English.
 6. The summary should describe the bug clearly — NOT include "[Thanh Ngo]:" or usernames or "Nhờ team check" boilerplate.
 
-MULTI-BUG RULES:
+MULTI-BUG RULES (VERY IMPORTANT — err on the side of ONE ticket):
+- DEFAULT: Create exactly ONE ticket per thread. Most bug reports are a single bug.
 - If the thread reports MULTIPLE RELATED issues on the SAME feature/screen → merge them into ONE ticket. List all issues in the description.
-- If the thread reports UNRELATED issues (different features, different platforms) → create SEPARATE tickets for each.
-- Most threads will have just 1 ticket. Only create multiple when issues are clearly unrelated.
+- ONLY create SEPARATE tickets if bugs are COMPLETELY UNRELATED: different features AND different root causes AND clearly independent (e.g., "login is broken" + "profile page has typo" = 2 tickets).
+- "Different platforms" alone is NOT a reason to split. If the same bug affects Web + API, pick the PRIMARY platform and create ONE ticket.
+- When in doubt, create ONE ticket with all information. QA can manually split later if needed.
+- NEVER create more than 2 tickets from a single thread.
 
 Return ONLY a valid JSON ARRAY (NO markdown fences, NO explanation):
 
@@ -830,15 +833,8 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     // Hardcoded fix version = "To be confirmed" (ID 12023)
     const fixVersionId = '12023';
 
-    // Resolve reporter: thread's original author
-    let reporterSlackId = event.user;
-    if (event.thread_ts) {
-      const threadAuthor = await getThreadReporterSlackId(client, event.channel, event.thread_ts);
-      if (threadAuthor) {
-        reporterSlackId = threadAuthor;
-        logger.info(`[QABot] Thread author: ${threadAuthor} (trigger user: ${event.user})`);
-      }
-    }
+    // Resolve reporter: the person who tagged the bot (NOT the thread author)
+    const reporterSlackId = event.user;
     const reporterJiraId = await resolveJiraAccountId(client, reporterSlackId);
     logger.info(`[QABot] Reporter/QA set to: ${reporterSlackId} → Jira ${reporterJiraId || 'not found'}`);
 
