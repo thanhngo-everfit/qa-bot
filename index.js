@@ -840,7 +840,8 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
 
     const slackThreadUrl = buildSlackThreadUrl(event.channel, threadTs);
     const attachments    = await getAllThreadAttachments(client, event.channel, threadTs);
-    const sprintId       = '249';
+    const sprintId       = await getActiveSprintId();
+    logger.info(`[QABot] Active sprint: ${sprintId || 'none found — ticket will not be added to a sprint'}`);
 
     const createdJiras = [];
 
