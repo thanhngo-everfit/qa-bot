@@ -302,7 +302,7 @@ Return ONLY a valid JSON ARRAY (NO markdown fences, NO explanation):
 
 [
   {
-    "summary": "[Platform][Task] Clear task description. Platform MUST be one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach. Under 80 chars total. NEVER include @mentions, subteam IDs, or [Name]: prefixes.",
+    "summary": "[Platform][Feature] Clear task description. Platform MUST be one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach. Feature is the affected screen/module/area (e.g. 2FA, Workout Builder, Onboarding, Billing, Calendar). NEVER use the literal word 'Task' as the second prefix. Under 80 chars total. NEVER include @mentions, subteam IDs, or [Name]: prefixes.",
     "priority": "Highest" or "High" or "Medium" or "Low" or "Lowest",
     "platform": "one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach",
     "description": "Clean, well-formatted description in this EXACT structure (use real newlines):\\n\\nGoal:\\n- <what the task should accomplish>\\n\\nRequirements:\\n- <bullet list of what needs to be done>\\n\\nNotes:\\n- <any useful context, links, references. Or N/A>",
@@ -342,7 +342,7 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the t
 
   if (!parsed) {
     return [{
-      summary:             '[Web][Task] Task request',
+      summary:             '[Web][General] Task request',
       priority:            'Medium',
       platform:            'Web',
       description:         'Description not parsed. Please update manually.',
@@ -354,7 +354,7 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the t
   const tickets = Array.isArray(parsed) ? parsed : [parsed];
 
   return tickets.map(t => ({
-    summary:             t.summary        || '[Web][Task] Task request',
+    summary:             t.summary        || '[Web][General] Task request',
     priority:            t.priority       || 'Medium',
     platform:            t.platform       || 'Web',
     description:         t.description    || 'Description not parsed. Please update manually.',
@@ -708,6 +708,81 @@ async function findSlackUserByName(client, name) {
   } catch { return null; }
 }
 
+// ── Bucket a platform string into a broad category (api/web/ios/android) ──
+// Used to decide whether the LLM-parsed platform matches the assignee's role.
+function getPlatformBucket(platform) {
+  if (platform === 'API') return 'api';
+  if (platform === 'Web') return 'web';
+  if (platform === 'iOS Coach'     || platform === 'iOS Client')     return 'ios';
+  if (platform === 'Android Coach' || platform === 'Android Client') return 'android';
+  return null;
+}
+
+// ── Infer the bug's platform from the assignee's Slack role (display name + title) ──
+// Rule (from QA team): the [Prefix] in the summary should follow the platform of
+// the person being assigned, not whatever the thread discussion happened to be about.
+// Examples:
+//   - "Hong (BE)"          → API
+//   - "Tien (iOS)"         → iOS Coach   (preserves Coach/Client if LLM already chose it)
+//   - title "Backend Eng"  → API
+// Returns null when the role can't be inferred — the LLM-parsed platform stays.
+async function inferPlatformFromAssignee(client, slackUserId, fallbackPlatform) {
+  try {
+    const info        = await client.users.info({ user: slackUserId });
+    const profile     = info.user?.profile || {};
+    const displayName = (profile.display_name || profile.real_name || '').toLowerCase();
+    const title       = (profile.title || '').toLowerCase();
+    const haystack    = `${displayName} ${title}`;
+
+    let bucket = null;
+
+    // 1) Everfit convention: parenthesized role tag in the display name, e.g. "Hong (BE)"
+    const tagMatch = haystack.match(/\((be|fe|backend|frontend|ios|android|web)\)/i);
+    if (tagMatch) {
+      const tag = tagMatch[1].toLowerCase();
+      if      (tag === 'be' || tag === 'backend')                      bucket = 'api';
+      else if (tag === 'fe' || tag === 'frontend' || tag === 'web')    bucket = 'web';
+      else if (tag === 'ios')                                          bucket = 'ios';
+      else if (tag === 'android')                                      bucket = 'android';
+    }
+
+    // 2) Fall back to job title keywords (only if no tag was found)
+    if (!bucket) {
+      if      (/back[\s-]?end|api engineer|server engineer/.test(title)) bucket = 'api';
+      else if (/front[\s-]?end|web engineer/.test(title))                bucket = 'web';
+      else if (/\bios\b/.test(title))                                    bucket = 'ios';
+      else if (/\bandroid\b/.test(title))                                bucket = 'android';
+    }
+
+    if (!bucket) return null;
+
+    // If the assignee's bucket matches the LLM-parsed platform, keep the LLM platform —
+    // this preserves the Coach vs Client distinction the LLM picked up from the thread.
+    const fallbackBucket = getPlatformBucket(fallbackPlatform);
+    if (bucket === fallbackBucket) return fallbackPlatform;
+
+    // Mismatch → switch to the assignee's bucket. Default to "Coach" for mobile
+    // (most internal threads concern the Coach app; QA can adjust if it's Client).
+    if (bucket === 'api')     return 'API';
+    if (bucket === 'web')     return 'Web';
+    if (bucket === 'ios')     return 'iOS Coach';
+    if (bucket === 'android') return 'Android Coach';
+    return null;
+  } catch (err) {
+    console.warn(`[QABot] Could not infer platform for ${slackUserId}: ${err.message}`);
+    return null;
+  }
+}
+
+// ── Replace the first [Platform] block in a summary with a new platform ──
+// LLM produces summaries like "[Android Coach][2FA] Locked Screen...";
+// we swap the first bracketed block when the assignee's role overrides the platform.
+function rewriteSummaryPrefix(summary, newPlatform) {
+  const prefix = `[${newPlatform}]`;
+  if (summary.startsWith('[')) return summary.replace(/^\[[^\]]+\]/, prefix);
+  return `${prefix}${summary}`;
+}
+
 // ── Read channel canvas and extract parent Jira key ──
 async function getParentFromChannelCanvas(client, channelId) {
   try {
@@ -846,11 +921,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     const createdJiras = [];
 
     for (const ticket of tickets) {
-      // Read parent from channel canvas (matched by bug platform)
-      const parentKey = await pickParentFromCanvas(client, event.channel, ticket.platform);
-      logger.info(`[QABot] Parent from canvas: ${parentKey || 'none'} for platform=${ticket.platform}`);
-
-      // Resolve assignees
+      // Resolve assignees FIRST — platform may depend on the assignee's role.
       let assigneeSlackIds = [...triggerMentions];
       if (assigneeSlackIds.length === 0 && ticket.assignee_names.length > 0) {
         for (const name of ticket.assignee_names) {
@@ -858,6 +929,22 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
           if (id) assigneeSlackIds.push(id);
         }
       }
+
+      // Override platform + summary prefix based on the first assignee's role.
+      // Rule (per QA team): [Prefix] follows the platform of the person being assigned,
+      // not whatever the thread discussion happened to be about.
+      if (assigneeSlackIds.length > 0) {
+        const inferred = await inferPlatformFromAssignee(client, assigneeSlackIds[0], ticket.platform);
+        if (inferred && inferred !== ticket.platform) {
+          logger.info(`[QABot] Platform override: ${ticket.platform} → ${inferred} (assignee role)`);
+          ticket.summary  = rewriteSummaryPrefix(ticket.summary, inferred);
+          ticket.platform = inferred;
+        }
+      }
+
+      // Read parent from channel canvas using the FINAL platform (post-override).
+      const parentKey = await pickParentFromCanvas(client, event.channel, ticket.platform);
+      logger.info(`[QABot] Parent from canvas: ${parentKey || 'none'} for platform=${ticket.platform}`);
 
       const jiraIds = (
         await Promise.all(assigneeSlackIds.map(id => resolveJiraAccountId(client, id)))
