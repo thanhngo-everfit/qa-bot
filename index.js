@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { App } = require('@slack/bolt');
-const Anthropic = require('@anthropic-ai/sdk');
+const OpenAI = require('openai');
 const axios = require('axios');
 const FormData = require('form-data');
 
@@ -11,7 +11,7 @@ const slackApp = new App({
   token:         process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
 });
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 function jiraAuth() {
   return 'Basic ' + Buffer.from(`${process.env.JIRA_EMAIL}:${process.env.JIRA_API_TOKEN}`).toString('base64');
@@ -152,10 +152,11 @@ function detectIssueType(triggerText) {
 
 // ── Parse QA bug with Claude (robust) ────────
 async function parseBugReport(context) {
-  const res = await anthropic.messages.create({
-    model:      'claude-haiku-4-5-20251001',
+  const res = await openai.chat.completions.create({
+    model:      'gpt-4o-mini',
     max_tokens: 3000,
-    system: `You are QABot for Everfit. Parse a QA bug report from a Slack thread.
+    messages: [
+      { role: 'system', content: `You are QABot for Everfit. Parse a QA bug report from a Slack thread.
 
 CRITICAL RULES:
 1. Read ALL messages in the thread (except bot messages) to collect every bug/issue reported.
@@ -245,11 +246,12 @@ Examples:
 - "Client cannot mark workout as complete" → High
 - "App crashes on launch for iOS 17 users" → Highest
 
-NEVER return null/undefined/empty. Always make a reasonable guess based on the first message.`,
-    messages: [{ role: 'user', content: `QA bug report thread:\n\n${context}` }],
+NEVER return null/undefined/empty. Always make a reasonable guess based on the first message.` },
+      { role: 'user', content: `QA bug report thread:\n\n${context}` },
+    ],
   });
 
-  const raw = res.content[0].text.replace(/```json|```/g, '').trim();
+  const raw = res.choices[0].message.content.replace(/```json|```/g, '').trim();
   let parsed;
   try { parsed = JSON.parse(raw); } catch { parsed = null; }
 
@@ -280,10 +282,11 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the f
 
 // ── Parse a TASK request from a Slack thread ─────
 async function parseTaskReport(context) {
-  const res = await anthropic.messages.create({
-    model:      'claude-haiku-4-5-20251001',
+  const res = await openai.chat.completions.create({
+    model:      'gpt-4o-mini',
     max_tokens: 3000,
-    system: `You are QABot for Everfit. Parse a TASK request from a Slack thread.
+    messages: [
+      { role: 'system', content: `You are QABot for Everfit. Parse a TASK request from a Slack thread.
 
 CRITICAL RULES:
 1. Read ALL messages in the thread (except bot messages) to understand what work is being requested.
@@ -332,11 +335,12 @@ PRIORITY RUBRIC (for tasks, default to Medium unless thread suggests otherwise):
 - "Low" — Nice-to-have, low urgency
 - "Lowest" — Trivial / cleanup
 
-NEVER return null/undefined/empty. Always make a reasonable guess based on the thread.`,
-    messages: [{ role: 'user', content: `Task request thread:\n\n${context}` }],
+NEVER return null/undefined/empty. Always make a reasonable guess based on the thread.` },
+      { role: 'user', content: `Task request thread:\n\n${context}` },
+    ],
   });
 
-  const raw = res.content[0].text.replace(/```json|```/g, '').trim();
+  const raw = res.choices[0].message.content.replace(/```json|```/g, '').trim();
   let parsed;
   try { parsed = JSON.parse(raw); } catch { parsed = null; }
 
