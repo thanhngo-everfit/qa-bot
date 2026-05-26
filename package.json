@@ -11,11 +11,11 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0",
     "@slack/bolt": "^3.22.0",
     "axios": "^1.7.9",
     "dotenv": "^16.4.7",
-    "form-data": "^4.0.0"
+    "form-data": "^4.0.0",
+    "openai": "^6.39.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"
