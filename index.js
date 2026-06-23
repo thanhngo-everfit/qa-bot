@@ -302,14 +302,17 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the f
   const tickets = Array.isArray(parsed) ? parsed : [parsed];
 
   // Defensive defaults for each ticket
-  return tickets.map(t => ({
-    summary:             t.summary        || '[Web][Bug] Bug report from QA',
-    priority:            t.priority       || 'Medium',
-    platform:            t.platform       || 'Web',
-    description:         t.description    || 'Description not parsed. Please update manually.',
-    assignee_names:      Array.isArray(t.assignee_names) ? t.assignee_names : [],
-    acceptance_criteria: Array.isArray(t.acceptance_criteria) ? t.acceptance_criteria : [],
-  }));
+  return tickets.map(t => {
+    const platform = t.platform || 'Web';
+    return {
+      summary:             normalizeSummaryPrefix(t.summary || '', platform),
+      priority:            t.priority       || 'Medium',
+      platform,
+      description:         t.description    || 'Description not parsed. Please update manually.',
+      assignee_names:      Array.isArray(t.assignee_names) ? t.assignee_names : [],
+      acceptance_criteria: Array.isArray(t.acceptance_criteria) ? t.acceptance_criteria : [],
+    };
+  });
 }
 
 // ── Parse a TASK request from a Slack thread ─────
@@ -389,14 +392,17 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the t
 
   const tickets = Array.isArray(parsed) ? parsed : [parsed];
 
-  return tickets.map(t => ({
-    summary:             t.summary        || '[Web][General] Task request',
-    priority:            t.priority       || 'Medium',
-    platform:            t.platform       || 'Web',
-    description:         t.description    || 'Description not parsed. Please update manually.',
-    assignee_names:      Array.isArray(t.assignee_names) ? t.assignee_names : [],
-    acceptance_criteria: Array.isArray(t.acceptance_criteria) ? t.acceptance_criteria : [],
-  }));
+  return tickets.map(t => {
+    const platform = t.platform || 'Web';
+    return {
+      summary:             normalizeSummaryPrefix(t.summary || '', platform),
+      priority:            t.priority       || 'Medium',
+      platform,
+      description:         t.description    || 'Description not parsed. Please update manually.',
+      assignee_names:      Array.isArray(t.assignee_names) ? t.assignee_names : [],
+      acceptance_criteria: Array.isArray(t.acceptance_criteria) ? t.acceptance_criteria : [],
+    };
+  });
 }
 
 // ── Section headers that should be bold in Jira description ──
@@ -817,6 +823,30 @@ function rewriteSummaryPrefix(summary, newPlatform) {
   const prefix = `[${newPlatform}]`;
   if (summary.startsWith('[')) return summary.replace(/^\[[^\]]+\]/, prefix);
   return `${prefix}${summary}`;
+}
+
+// ── Ensure summary always has [Platform][Feature] bracket format ──────────
+// Guards against LLM returning plain-text platform, e.g.:
+//   "Web[Video Upload] desc"   → "[Web][Video Upload] desc"
+//   "iOS Client desc"          → "[iOS Client] desc"
+//   "[Web][Video Upload] desc" → unchanged
+//   "[Web] desc"               → unchanged (has platform at minimum)
+function normalizeSummaryPrefix(summary, platform) {
+  if (!summary) return `[${platform}] Bug report`;
+
+  // Already has [Platform][Feature] → nothing to do
+  if (/^\[[^\]]+\]\[[^\]]+\]/.test(summary)) return summary;
+
+  // Already starts with a bracket → keep as-is
+  if (summary.startsWith('[')) return summary;
+
+  // Strip plain-text platform name from the front (e.g. "Web" or "iOS Client")
+  const escaped = platform.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const stripped = summary.replace(new RegExp('^' + escaped + '\\s*', 'i'), '').trim();
+
+  // If remainder starts with [Feature], join without space → [Platform][Feature] desc
+  if (stripped.startsWith('[')) return `[${platform}]${stripped}`;
+  return `[${platform}] ${stripped}`;
 }
 
 // ── Read channel canvas and extract parent Jira key ──
