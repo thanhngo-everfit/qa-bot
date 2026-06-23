@@ -447,12 +447,48 @@ function lineToAdfContent(line) {
 }
 
 function buildAdfDescription(text) {
-  const lines = (text || '').split('\n');
+  const lines = (text || '').split('\n').filter(l => l.trim() !== '');
   const content = [];
-  for (const line of lines) {
-    if (line.trim() === '') continue; // skip blank lines — Jira paragraph spacing is sufficient
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Ordered list: lines starting with "1." "2." etc.
+    if (/^\d+\.\s/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\d+\.\s/.test(lines[i])) {
+        const itemText = lines[i].replace(/^\d+\.\s+/, '');
+        items.push({
+          type: 'listItem',
+          content: [{ type: 'paragraph', content: lineToAdfContent(itemText) }],
+        });
+        i++;
+      }
+      content.push({ type: 'orderedList', content: items });
+      continue;
+    }
+
+    // Bullet list: lines starting with "- "
+    if (/^-\s/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^-\s/.test(lines[i])) {
+        const itemText = lines[i].replace(/^-\s+/, '');
+        items.push({
+          type: 'listItem',
+          content: [{ type: 'paragraph', content: lineToAdfContent(itemText) }],
+        });
+        i++;
+      }
+      content.push({ type: 'bulletList', content: items });
+      continue;
+    }
+
+    // Regular paragraph (bold headers handled inside lineToAdfContent)
     content.push({ type: 'paragraph', content: lineToAdfContent(line) });
+    i++;
   }
+
   return { type: 'doc', version: 1, content };
 }
 
