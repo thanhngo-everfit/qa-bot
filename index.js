@@ -143,10 +143,42 @@ async function getLatestFixVersionId() {
 }
 
 // ── Detect requested issue type from the trigger text ──
-function detectIssueType(triggerText) {
+// ── Classify Bug vs Task from thread content ─────────────────────────────
+// 1. Explicit keyword in trigger → trust it immediately (no AI call).
+// 2. No keyword → ask GPT to decide from the thread so we don't default
+//    every bare trigger (e.g. "assign to @X") to Bug.
+async function classifyIssueType(triggerText, threadContext) {
   const lower = (triggerText || '').toLowerCase();
-  // Match explicit "task" keyword (English or Vietnamese "tạo task")
-  if (/\btask\b/.test(lower)) return 'Task';
+
+  // Explicit task signals (English + Vietnamese)
+  if (/\btask\b|tạo task|create task|log task/.test(lower)) return 'Task';
+
+  // Explicit bug signals
+  if (/\bbug\b|log bug|create bug|report bug|báo lỗi|tạo bug/.test(lower)) return 'Bug';
+
+  // No explicit keyword — classify from thread content via AI
+  try {
+    const res = await openai.chat.completions.create({
+      model:      'gpt-4o-mini',
+      max_tokens: 10,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You classify Slack threads as either Bug or Task.\n' +
+            'Bug = something broken, not working correctly, wrong behaviour, crash, visual defect.\n' +
+            'Task = a work request, improvement, config change, process change, feature, investigation, or action item.\n' +
+            'Reply with exactly one word: Bug or Task.',
+        },
+        { role: 'user', content: threadContext || triggerText },
+      ],
+    });
+    const answer = (res.choices[0].message.content || '').trim();
+    if (answer === 'Task') return 'Task';
+  } catch (err) {
+    console.warn('[QABot] classifyIssueType AI call failed, defaulting to Bug:', err.message);
+  }
+
   return 'Bug';
 }
 
@@ -838,13 +870,10 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
   const triggerText = event.text.replace(/<@[A-Z0-9]+>/g, '').trim().toLowerCase();
   const isForceLog  = triggerText.startsWith('force log') || triggerText.startsWith('force');
 
-  // Detect requested issue type — Task (explicit) or Bug (default)
-  const issueType = detectIssueType(triggerText);
-  const isTask    = issueType === 'Task';
-
   try { await client.reactions.add({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }); } catch (_) {}
 
   try {
+    // Fetch thread context first — needed for AI classification below
     let context;
     if (event.thread_ts) {
       context = await getThread(client, event.channel, event.thread_ts);
@@ -855,13 +884,17 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     if (!context || context.trim().length < 10) {
       await client.chat.postMessage({
         channel: event.channel, thread_ts: event.ts,
-        text: isTask
-          ? '👋 Tag me *inside a thread* with `create task` — I\'ll create a Task in Jira automatically!'
-          : '👋 Tag me *inside a QA bug thread* — I\'ll log the bug to Jira automatically!',
+        text: '👋 Tag me *inside a thread* — I\'ll log the bug or task to Jira automatically!\n' +
+              'Use `create task` to create a Task, or just tag me to auto-detect.',
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       return;
     }
+
+    // Classify Bug vs Task — explicit keyword wins; otherwise AI decides from thread content
+    const issueType = await classifyIssueType(triggerText, context);
+    const isTask    = issueType === 'Task';
+    logger.info(`[QABot] Issue type classified as: ${issueType}`);
 
     // ── Feature 2: Duplicate detection ──────────
     // Scan thread for existing QABot tickets
