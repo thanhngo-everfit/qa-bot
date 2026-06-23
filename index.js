@@ -449,16 +449,9 @@ function lineToAdfContent(line) {
 function buildAdfDescription(text) {
   const lines = (text || '').split('\n');
   const content = [];
-  let lastWasEmpty = false;
   for (const line of lines) {
-    if (line.trim() === '') {
-      // Only allow one empty paragraph between sections
-      if (!lastWasEmpty) content.push({ type: 'paragraph', content: [] });
-      lastWasEmpty = true;
-    } else {
-      content.push({ type: 'paragraph', content: lineToAdfContent(line) });
-      lastWasEmpty = false;
-    }
+    if (line.trim() === '') continue; // skip blank lines — Jira paragraph spacing is sufficient
+    content.push({ type: 'paragraph', content: lineToAdfContent(line) });
   }
   return { type: 'doc', version: 1, content };
 }
