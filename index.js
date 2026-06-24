@@ -405,6 +405,81 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the t
   });
 }
 
+// ── Detect App Icon Update requests from thread content ──────────────────
+function isAppIconRequest(threadContext) {
+  const lower = (threadContext || '').toLowerCase();
+  return /app icon|icon update|update.*icon|change.*icon|new.*icon/.test(lower);
+}
+
+// ── Parse App Icon Update request ────────────────────────────────────────
+async function parseAppIconRequest(context) {
+  const res = await openai.chat.completions.create({
+    model:      'gpt-4o-mini',
+    max_tokens: 500,
+    messages: [
+      {
+        role: 'system',
+        content: `Extract app icon update request details from this Slack thread.
+Return ONLY valid JSON (no markdown fences, no explanation):
+{
+  "workspace_name": "Name of the workspace or client (e.g. 'Anchor Athletics'). Use 'Client' if not found.",
+  "workspace_id": "The workspace/account ID — alphanumeric string like '64ed6ed86d85da001e9d5df8'. Empty string if not found.",
+  "owner_email": "Email of the workspace owner. Empty string if not found.",
+  "intercom_link": "Full Intercom conversation URL if mentioned. Empty string if not found."
+}`,
+      },
+      { role: 'user', content: context },
+    ],
+  });
+
+  let parsed = {};
+  try {
+    parsed = JSON.parse(res.choices[0].message.content.replace(/\`\`\`json|\`\`\`/g, '').trim());
+  } catch (_) {}
+
+  const name         = parsed.workspace_name || 'Client';
+  const wsId         = parsed.workspace_id   || '';
+  const email        = parsed.owner_email    || '';
+  const intercomLink = parsed.intercom_link  || '';
+
+  const summaryId = wsId ? ` (${wsId})` : '';
+  const summary   = `[Client Request][iOS Client][App icon] Process to change App icon for ${name} workspace${summaryId}`;
+
+  // Build description
+  let workspaceInfo = '';
+  if (wsId)   workspaceInfo += `\n- Workspace ID: ${wsId}`;
+  if (email)  workspaceInfo += `\n- Workspace Owner: ${email}`;
+  if (!wsId && !email) workspaceInfo += `\n- _(Please add workspace details manually)_`;
+
+  let refs = '';
+  if (intercomLink) refs += `\n- Intercom thread: ${intercomLink}`;
+  // Slack thread injected automatically by handler
+
+  const description =
+    `## Context\nRequest from CS to update the app icon for ${name}'s workspace${summaryId}. ` +
+    `A $50 charge applies — Payment Ops will handle billing in a separate ticket.` +
+    `\n\n## Workspace Info${workspaceInfo}` +
+    `\n\n## Assets\nOriginal Image (from customer)\nPreview Image (Android + iOS)` +
+    `\n\n## References${refs || ''}`;
+
+  const acceptance_criteria = [
+    'SHOULD update app icon on iOS Client app',
+    'SHOULD update app icon on Android Client app',
+    'SHOULD match the provided asset without distortion',
+    'SHOULD NOT affect any other workspace',
+  ];
+
+  return [{
+    summary,
+    priority:             'Medium',
+    platform:             'iOS Client',
+    description,
+    assignee_names:       [],
+    acceptance_criteria,
+    skipPlatformOverride: true,   // fixed [Client Request] prefix — don't rewrite
+  }];
+}
+
 // ── Section headers that should be bold in Jira description ──
 const BOLD_HEADERS = [
   'Slack thread:', 'Steps to reproduce:', 'Expected behavior:',
@@ -996,9 +1071,12 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     }
 
     // ── Feature 1: Parse — returns array of tickets ──
-    const tickets = isTask
-      ? await parseTaskReport(context)
-      : await parseBugReport(context);
+    // App Icon requests get a specialized parser with a fixed description template
+    const tickets = isTask && isAppIconRequest(context)
+      ? await parseAppIconRequest(context)
+      : isTask
+        ? await parseTaskReport(context)
+        : await parseBugReport(context);
     logger.info(`[QABot] Parsed ${tickets.length} ${issueType.toLowerCase()}(s)`);
 
     // Detect assignee from trigger message
@@ -1036,9 +1114,8 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       }
 
       // Override platform + summary prefix based on the first assignee's role.
-      // Rule (per QA team): [Prefix] follows the platform of the person being assigned,
-      // not whatever the thread discussion happened to be about.
-      if (assigneeSlackIds.length > 0) {
+      // Skip for tickets with fixed prefix (e.g. [Client Request] app icon format).
+      if (assigneeSlackIds.length > 0 && !ticket.skipPlatformOverride) {
         const inferred = await inferPlatformFromAssignee(client, assigneeSlackIds[0], ticket.platform);
         if (inferred && inferred !== ticket.platform) {
           logger.info(`[QABot] Platform override: ${ticket.platform} → ${inferred} (assignee role)`);
