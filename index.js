@@ -437,13 +437,23 @@ Return ONLY valid JSON (no markdown fences, no explanation):
     parsed = JSON.parse(res.choices[0].message.content.replace(/\`\`\`json|\`\`\`/g, '').trim());
   } catch (_) {}
 
-  const name         = parsed.workspace_name || 'Client';
+  const name         = parsed.workspace_name || '';
   const wsId         = parsed.workspace_id   || '';
   const email        = parsed.owner_email    || '';
   const intercomLink = parsed.intercom_link  || '';
 
-  const summaryId = wsId ? ` (${wsId})` : '';
-  const summary   = `[Client Request][iOS Client][App icon] Process to change App icon for ${name} workspace${summaryId}`;
+  // Build summary identifier: prefer workspace name+ID, fall back to email only
+  let identifier;
+  if (name && name !== 'Client') {
+    identifier = wsId ? `${name} workspace (${wsId})` : name;
+  } else if (email) {
+    identifier = email;
+  } else if (wsId) {
+    identifier = wsId;
+  } else {
+    identifier = 'Client workspace';
+  }
+  const summary = `[Client Request][iOS Client][App icon] Process to change App icon for ${identifier}`;
 
   // Build description
   let workspaceInfo = '';
@@ -455,18 +465,25 @@ Return ONLY valid JSON (no markdown fences, no explanation):
   if (intercomLink) refs += `\n- Intercom thread: ${intercomLink}`;
   // Slack thread injected automatically by handler
 
+  const contextLine = name && name !== 'Client'
+    ? `${name}'s workspace${wsId ? ` (${wsId})` : ''}`
+    : email || wsId || 'the client workspace';
+
   const description =
-    `## Context\nRequest from CS to update the app icon for ${name}'s workspace${summaryId}. ` +
+    `## Context\nRequest from CS to update the app icon for ${contextLine}. ` +
     `A $50 charge applies — Payment Ops will handle billing in a separate ticket.` +
     `\n\n## Workspace Info${workspaceInfo}` +
     `\n\n## Assets\nOriginal Image (from customer)\nPreview Image (Android + iOS)` +
     `\n\n## References${refs || ''}`;
 
   const acceptance_criteria = [
-    'SHOULD update app icon on iOS Client app',
-    'SHOULD update app icon on Android Client app',
-    'SHOULD match the provided asset without distortion',
-    'SHOULD NOT affect any other workspace',
+    '[Dev] Update app icon for the workspace in the system',
+    '[Dev] Confirm Payment Ops ticket created for $50 charge',
+    '[QA] Attach original image (from customer) to this ticket',
+    '[QA] Attach preview image (Android + iOS) to this ticket',
+    '[QA] Verify app icon updated correctly on iOS Client',
+    '[QA] Verify app icon updated correctly on Android Client',
+    '[QA] Confirm no other workspaces are affected',
   ];
 
   return [{
