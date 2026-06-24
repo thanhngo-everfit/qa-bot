@@ -213,7 +213,7 @@ Return ONLY a valid JSON ARRAY (NO markdown fences, NO explanation):
     "summary": "[Platform][Feature] Clear bug description. Platform MUST be one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach. Under 80 chars total. NEVER include @mentions, subteam IDs, or [Thanh Ngo]: prefixes.",
     "priority": "Highest" or "High" or "Medium" or "Low" or "Lowest",
     "platform": "one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach",
-    "description": "Clean, well-formatted description in this EXACT structure (use real newlines):\\n\\nSteps to reproduce:\\n1. <clear step>\\n2. <clear step>\\n3. <clear step>\\n\\nExpected behavior:\\n- <what should happen>\\n\\nActual behavior:\\n- <what is happening>\\n\\nEnvironment:\\n- <browser, device, OS, app version if mentioned, else N/A>\\n\\nNote: <any useful context like 'Happen on PROD', test account info, etc. Or N/A>",
+    "description": "Use this EXACT structure with ## section headings (use real newlines and **bold** for emphasis):\n\n## Bug Description\n[1-2 sentence narrative: what is broken and under what conditions]\n\n## Root Cause\n[Technical explanation of WHY this happens. If not explicitly stated, make a reasonable inference from the thread context.]\n\nImpact:\n- [impact on users or system]\n- [add more if multiple impacts]\n\n## Expected Behavior\n- [what should happen]\n\n## Steps to Reproduce\n1. [clear step]\n2. [clear step]\n3. [clear step]\n\n## Environment\n- [browser, device, OS, app version if mentioned, else N/A]\n\n## Reference\n- [related ticket numbers e.g. PAY-XXXX, UP-XXXX if mentioned, else omit this line]",
     "assignee_names": ["Full Name of person asked to fix — look for '@X check', 'nhờ @X', '@X fix', '@X coi với'. Empty array [] if no one was tagged for the fix."],
     "acceptance_criteria": ["SHOULD <expected behavior statement>", "SHOULD NOT <negative behavior statement>"]
   }
@@ -343,7 +343,7 @@ Return ONLY a valid JSON ARRAY (NO markdown fences, NO explanation):
     "summary": "[Platform][Feature] Clear task description. Platform MUST be one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach. Feature is the affected screen/module/area (e.g. 2FA, Workout Builder, Onboarding, Billing, Calendar). NEVER use the literal word 'Task' as the second prefix. Under 80 chars total. NEVER include @mentions, subteam IDs, or [Name]: prefixes.",
     "priority": "Highest" or "High" or "Medium" or "Low" or "Lowest",
     "platform": "one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach",
-    "description": "Clean, well-formatted description in this EXACT structure (use real newlines):\\n\\nGoal:\\n- <what the task should accomplish>\\n\\nRequirements:\\n- <bullet list of what needs to be done>\\n\\nNotes:\\n- <any useful context, links, references. Or N/A>",
+    "description": "Use this EXACT structure with ## section headings (use real newlines and **bold** for emphasis):\n\n## Task Description\n[1-2 sentence description of what needs to be done and why]\n\n## Goal\n[What the completed task should achieve]\n\n## Requirements\n- [requirement 1]\n- [requirement 2]\n\n## Reference\n- [related ticket numbers or context if mentioned, else omit this line]",
     "assignee_names": ["Full Name of person asked to do this — look for '@X handle', 'nhờ @X', '@X làm', 'assign to @X'. Empty array [] if no one was tagged."],
     "acceptance_criteria": ["SHOULD <expected outcome>", "SHOULD NOT <negative outcome>"]
   }
@@ -409,41 +409,39 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the t
 const BOLD_HEADERS = [
   'Slack thread:', 'Steps to reproduce:', 'Expected behavior:',
   'Actual behavior:', 'Environment:', 'Note:', 'Web link:',
-  'Goal:', 'Requirements:', 'Notes:',
+  'Goal:', 'Requirements:', 'Notes:', 'Impact:',
 ];
 
-function lineToAdfContent(line) {
-  const urlRegex = /(https?:\/\/[^\s]+)/g;
+// ── Parse inline tokens: **bold** and URLs ───────────────────────────────
+function parseInlineTokens(text) {
+  const parts = [];
+  const tokenRegex = /\*\*([^*]+)\*\*|(https?:\/\/[^\s]+)/g;
+  let last = 0, match;
+  while ((match = tokenRegex.exec(text)) !== null) {
+    if (match.index > last) parts.push({ type: 'text', text: text.slice(last, match.index) });
+    if (match[1] !== undefined) {
+      parts.push({ type: 'text', text: match[1], marks: [{ type: 'strong' }] });
+    } else {
+      parts.push({ type: 'text', text: match[2], marks: [{ type: 'link', attrs: { href: match[2] } }] });
+    }
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) parts.push({ type: 'text', text: text.slice(last) });
+  return parts.length > 0 ? parts : [{ type: 'text', text }];
+}
 
-  // Check if line starts with a known header → bold the header portion
-  let boldPrefix = null;
-  let rest = line;
+function lineToAdfContent(line) {
+  // Check if line starts with a known bold header
   for (const header of BOLD_HEADERS) {
     if (line.startsWith(header)) {
-      boldPrefix = header;
-      rest = line.slice(header.length);
-      break;
+      const rest = line.slice(header.length);
+      const parts = [{ type: 'text', text: header, marks: [{ type: 'strong' }] }];
+      if (rest.length > 0) parts.push(...parseInlineTokens(rest));
+      return parts;
     }
   }
-
-  const parts = [];
-
-  // Add bold header if found
-  if (boldPrefix) {
-    parts.push({ type: 'text', text: boldPrefix, marks: [{ type: 'strong' }] });
-    if (rest.length === 0) return parts;
-  }
-
-  // Process the remaining text for URLs
-  let last = 0, match;
-  while ((match = urlRegex.exec(rest)) !== null) {
-    if (match.index > last) parts.push({ type: 'text', text: rest.slice(last, match.index) });
-    parts.push({ type: 'text', text: match[1], marks: [{ type: 'link', attrs: { href: match[1] } }] });
-    last = match.index + match[1].length;
-  }
-  if (last < rest.length) parts.push({ type: 'text', text: rest.slice(last) });
-
-  return parts.length > 0 ? parts : [{ type: 'text', text: line }];
+  // Regular line — parse **bold** and URLs inline
+  return parseInlineTokens(line);
 }
 
 function buildAdfDescription(text) {
@@ -484,7 +482,18 @@ function buildAdfDescription(text) {
       continue;
     }
 
-    // Regular paragraph (bold headers handled inside lineToAdfContent)
+    // ## Heading → ADF heading node (level 3)
+    if (line.startsWith('## ')) {
+      content.push({
+        type: 'heading',
+        attrs: { level: 3 },
+        content: [{ type: 'text', text: line.slice(3).trim() }],
+      });
+      i++;
+      continue;
+    }
+
+    // Regular paragraph
     content.push({ type: 'paragraph', content: lineToAdfContent(line) });
     i++;
   }
@@ -1047,7 +1056,15 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       ).filter(Boolean);
 
       // Prepend Slack thread URL to description
-      ticket.description = `Slack thread: ${slackThreadUrl}\n\n${ticket.description}`;
+      // Inject Slack thread URL into ## Reference section (or prepend if not found)
+      if (ticket.description.includes('## Reference')) {
+        ticket.description = ticket.description.replace(
+          /## Reference\n/,
+          `## Reference\n- Slack thread: ${slackThreadUrl}\n`,
+        );
+      } else {
+        ticket.description = `## Reference\n- Slack thread: ${slackThreadUrl}\n\n${ticket.description}`;
+      }
 
       logger.info(`[QABot] Creating ${issueType}: ${ticket.summary} epic=${epicKey || 'none'} parent=${parentKey || 'none'}`);
       const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId, issueType);
