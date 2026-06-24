@@ -213,7 +213,7 @@ Return ONLY a valid JSON ARRAY (NO markdown fences, NO explanation):
     "summary": "[Platform][Feature] Clear bug description. Platform MUST be one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach. Under 80 chars total. NEVER include @mentions, subteam IDs, or [Thanh Ngo]: prefixes.",
     "priority": "Highest" or "High" or "Medium" or "Low" or "Lowest",
     "platform": "one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach",
-    "description": "Use this EXACT structure with ## section headings (use real newlines and **bold** for emphasis):\n\n## Bug Description\n[1-2 sentence narrative: what is broken and under what conditions]\n\n## Root Cause\n[Technical explanation of WHY this happens. If not explicitly stated, make a reasonable inference from the thread context.]\n\nImpact:\n- [impact on users or system]\n- [add more if multiple impacts]\n\n## Expected Behavior\n- [what should happen]\n\n## Steps to Reproduce\n1. [clear step]\n2. [clear step]\n3. [clear step]\n\n## Environment\n- [browser, device, OS, app version if mentioned, else N/A]\n\n## Reference\n- [related ticket numbers e.g. PAY-XXXX, UP-XXXX if mentioned, else omit this line]",
+    "description": "Use this EXACT structure with ## section headings (real newlines, **bold** for key terms):\n\n## Bug Description\n[1-3 sentences: what exactly is broken, under what conditions, and who is affected. Be specific — use details from the thread.]\n\n## Root Cause\n[Why this happens technically. Extract from thread if mentioned. If not stated, write a concise inference based on symptoms. Never write N/A here.]\n\nImpact:\n- [specific user-facing or system impact — e.g. 'Coaches cannot complete checkout', not just 'affects users']\n- [add more bullets if multiple distinct impacts]\n\n## Expected Behavior\n- [specific expected outcome — what SHOULD happen]\n- [add more if needed]\n\n## Steps to Reproduce\n1. [specific step from thread — not generic like 'navigate to page']\n2. [specific step]\n3. [specific step — add more if needed]\n\n## Reference\n- [ONLY list ticket numbers explicitly mentioned in thread, e.g. PAY-1567, UP-XXXX. DO NOT write N/A. If none mentioned, omit this section entirely — the Slack thread will be added automatically.]",
     "assignee_names": ["Full Name of person asked to fix — look for '@X check', 'nhờ @X', '@X fix', '@X coi với'. Empty array [] if no one was tagged for the fix."],
     "acceptance_criteria": ["SHOULD <expected behavior statement>", "SHOULD NOT <negative behavior statement>"]
   }
@@ -343,7 +343,7 @@ Return ONLY a valid JSON ARRAY (NO markdown fences, NO explanation):
     "summary": "[Platform][Feature] Clear task description. Platform MUST be one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach. Feature is the affected screen/module/area (e.g. 2FA, Workout Builder, Onboarding, Billing, Calendar). NEVER use the literal word 'Task' as the second prefix. Under 80 chars total. NEVER include @mentions, subteam IDs, or [Name]: prefixes.",
     "priority": "Highest" or "High" or "Medium" or "Low" or "Lowest",
     "platform": "one of: Web, API, iOS Client, iOS Coach, Android Client, Android Coach",
-    "description": "Use this EXACT structure with ## section headings (use real newlines and **bold** for emphasis):\n\n## Task Description\n[1-2 sentence description of what needs to be done and why]\n\n## Goal\n[What the completed task should achieve]\n\n## Requirements\n- [requirement 1]\n- [requirement 2]\n\n## Reference\n- [related ticket numbers or context if mentioned, else omit this line]",
+    "description": "Use this EXACT structure with ## section headings (real newlines, **bold** for key terms):\n\n## Task Description\n[1-3 sentences: what needs to be done, why, and any important context from the thread.]\n\n## Goal\n[Specific outcome the completed task must achieve. Be concrete.]\n\n## Requirements\n- [specific requirement from thread]\n- [add more bullets if multiple requirements]\n\n## Reference\n- [ONLY list ticket numbers explicitly mentioned in thread, e.g. PAY-XXXX, UP-XXXX. DO NOT write N/A. If none mentioned, omit this section entirely — the Slack thread will be added automatically.]",
     "assignee_names": ["Full Name of person asked to do this — look for '@X handle', 'nhờ @X', '@X làm', 'assign to @X'. Empty array [] if no one was tagged."],
     "acceptance_criteria": ["SHOULD <expected outcome>", "SHOULD NOT <negative outcome>"]
   }
@@ -486,7 +486,7 @@ function buildAdfDescription(text) {
     if (line.startsWith('## ')) {
       content.push({
         type: 'heading',
-        attrs: { level: 3 },
+        attrs: { level: 2 },
         content: [{ type: 'text', text: line.slice(3).trim() }],
       });
       i++;
@@ -1057,13 +1057,18 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
 
       // Prepend Slack thread URL to description
       // Inject Slack thread URL into ## Reference section (or prepend if not found)
+      // Also strip any LLM-generated N/A lines from Reference
+      ticket.description = ticket.description
+        .replace(/^-\s*N\/A\s*$/gim, '')          // remove bare "- N/A" lines anywhere
+        .replace(/\n{3,}/g, '\n\n')               // collapse 3+ blank lines → 2
+        .trim();
       if (ticket.description.includes('## Reference')) {
         ticket.description = ticket.description.replace(
-          /## Reference\n/,
+          /## Reference(?:\n+|$)/,
           `## Reference\n- Slack thread: ${slackThreadUrl}\n`,
         );
       } else {
-        ticket.description = `## Reference\n- Slack thread: ${slackThreadUrl}\n\n${ticket.description}`;
+        ticket.description = `${ticket.description}\n\n## Reference\n- Slack thread: ${slackThreadUrl}`;
       }
 
       logger.info(`[QABot] Creating ${issueType}: ${ticket.summary} epic=${epicKey || 'none'} parent=${parentKey || 'none'}`);
