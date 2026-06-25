@@ -763,7 +763,16 @@ async function pickParentFromCanvas(client, channelId, bugPlatform) {
     return null;
   }
 
-  console.log(`[QABot] Candidates: ${candidates.map(c => `${c.key}="${c.title}"`).join(' | ')}`);
+  // Sort by UP number descending — higher = more recently created = current sprint ticket.
+  // When a canvas has both old and new tickets for the same platform
+  // (e.g. UP-72632 iOS P1.3 and UP-73100 iOS P1.4), the newer one wins.
+  candidates.sort((a, b) => {
+    const numA = parseInt(a.key.replace('UP-', ''), 10) || 0;
+    const numB = parseInt(b.key.replace('UP-', ''), 10) || 0;
+    return numB - numA;
+  });
+
+  console.log(`[QABot] Candidates (newest first): ${candidates.map(c => `${c.key}="${c.title}"`).join(' | ')}`);
 
   // Match a title against a platform prefix (iOS -, iOS |, iOS-, iOS|)
   const matchPrefix = prefix => candidates.find(p => {
