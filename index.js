@@ -148,15 +148,61 @@ async function getLatestFixVersionId() {
 // 2. No keyword → ask GPT to decide from the thread so we don't default
 //    every bare trigger (e.g. "assign to @X") to Bug.
 async function classifyIssueType(triggerText, threadContext) {
-  const lower = (triggerText || '').toLowerCase();
+  const lower          = (triggerText || '').toLowerCase();
+  const threadLower    = (threadContext || '').toLowerCase();
+  const combined       = `${lower} ${threadLower}`;
 
-  // Explicit task signals (English + Vietnamese)
-  if (/\btask\b|tạo task|create task|log task/.test(lower)) return 'Task';
-
-  // Explicit bug signals
+  // ── Fast-path: explicit Bug keywords ──
   if (/\bbug\b|log bug|create bug|report bug|báo lỗi|tạo bug/.test(lower)) return 'Bug';
 
-  // No explicit keyword — classify from thread content via AI
+  // ── Fast-path: explicit Task keywords (trigger text) ──
+  if (/\btask\b|tạo task|create task|log task/.test(lower)) return 'Task';
+
+  // ── Fast-path: clear Task signals in thread content ──
+  // Covers Vietnamese action phrases, design/implement requests, BA/PC-style asks
+  const taskSignals = [
+    /handle\s+luôn/,          // "handle luôn phần này"
+    /anh\s+handle/,           // "anh handle phần này"
+    /em\s+handle/,
+    /nhờ\s+\S+\s+handle/,   // "nhờ @X handle"
+    /làm\s+phần\s+này/,      // "làm phần này"
+    /xử\s+lý\s+phần/,        // "xử lý phần này"
+    /implement\s+/,
+    /thiết\s+kế/,             // design reference
+    /theo\s+design/,          // "theo design"
+    /update\s+design/,
+    /theo\s+figma/,
+    /figma/,
+    /nhờ\s+team\s+process/,  // "nhờ team process"
+    /process\s+như\s+sau/,   // "process như sau"
+    /thêm\s+tính\s+năng/,    // "thêm tính năng"
+    /add\s+(the\s+)?feature/,
+  ];
+  if (taskSignals.some(r => r.test(combined))) {
+    console.log('[QABot] classifyIssueType: fast-path Task (thread signal matched)');
+    return 'Task';
+  }
+
+  // ── Fast-path: clear Bug signals in thread content ──
+  const bugSignals = [
+    /\blỗi\b/,               // Vietnamese "lỗi" = bug/error
+    /bị\s+lỗi/,
+    /bị\s+crash/,
+    /app\s+crash/,
+    /không\s+hoạt\s+động/,   // "không hoạt động" = not working
+    /sai\s+prefix/,
+    /\bnot\s+working\b/,
+    /\bbroken\b/,
+    /\bcrash\b/,
+    /\berror\b/,
+    /\bregression\b/,
+  ];
+  if (bugSignals.some(r => r.test(combined))) {
+    console.log('[QABot] classifyIssueType: fast-path Bug (thread signal matched)');
+    return 'Bug';
+  }
+
+  // ── AI fallback: no clear keyword found ──
   try {
     const res = await openai.chat.completions.create({
       model:      'gpt-4o-mini',
@@ -165,15 +211,25 @@ async function classifyIssueType(triggerText, threadContext) {
         {
           role: 'system',
           content:
-            'You classify Slack threads as either Bug or Task.\n' +
-            'Bug = something broken, not working correctly, wrong behaviour, crash, visual defect.\n' +
-            'Task = a work request, improvement, config change, process change, feature, investigation, or action item.\n' +
-            'Reply with exactly one word: Bug or Task.',
+            'You classify Slack threads as Bug or Task. Reply with exactly one word: Bug or Task.\n\n' +
+            'TASK signals (choose Task when you see these):\n' +
+            '- Request to implement, build, add, or handle something\n' +
+            '- References to a design, Figma, or mockup\n' +
+            '- Vietnamese: "handle luôn", "làm phần này", "xử lý", "nhờ xử lý", "anh/em handle"\n' +
+            '- Request comes from a BA, PC, or Product role\n' +
+            '- No mention of anything being broken\n\n' +
+            'BUG signals (choose Bug when you see these):\n' +
+            '- Something that was working but is now broken\n' +
+            '- Error, crash, wrong data, unexpected behavior\n' +
+            '- Vietnamese: "lỗi", "bị lỗi", "không hoạt động", "sai"\n' +
+            '- QA reporting an issue found during testing\n\n' +
+            'When in doubt and nothing is described as broken → choose Task.',
         },
         { role: 'user', content: threadContext || triggerText },
       ],
     });
     const answer = (res.choices[0].message.content || '').trim();
+    console.log(`[QABot] classifyIssueType: AI answered "${answer}"`);
     if (answer === 'Task') return 'Task';
   } catch (err) {
     console.warn('[QABot] classifyIssueType AI call failed, defaulting to Bug:', err.message);
