@@ -912,7 +912,9 @@ async function inferPlatformFromAssignee(client, slackUserId, fallbackPlatform) 
     const info        = await client.users.info({ user: slackUserId });
     const profile     = info.user?.profile || {};
     const displayName = (profile.display_name || profile.real_name || '').toLowerCase();
-    const title       = (profile.title || '').toLowerCase();
+    // profile.title may need users.profile:read scope — read it defensively
+    let title = '';
+    try { title = (profile.title || '').toLowerCase(); } catch (_) {}
     const haystack    = `${displayName} ${title}`;
 
     let bucket = null;
@@ -1232,6 +1234,22 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
 
   } catch (err) {
+    // Slack missing_scope error — surface exactly which scope is needed
+    if (err.code === 'slack_webapi_platform_error' && err.data?.error === 'missing_scope') {
+      const needed = err.data?.needed || 'unknown';
+      logger.error(`[QABot] Missing Slack scope: ${needed} (provided: ${err.data?.provided})`);
+      await client.chat.postMessage({
+        channel: event.channel, thread_ts: event.thread_ts || event.ts,
+        text:
+          `❌ QABot error: Missing Slack permission scope \`${needed}\`.
+` +
+          `Ask an admin to add this scope at *api.slack.com/apps → OAuth & Permissions → Bot Token Scopes*.`,
+      });
+      await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+      await client.reactions.add({ channel: event.channel, name: 'x', timestamp: event.ts }).catch(() => {});
+      return;
+    }
+
     const jiraErrors = err.response?.data?.errors;
     const jiraMessages = err.response?.data?.errorMessages;
     const errDetail = jiraErrors
