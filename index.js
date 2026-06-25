@@ -690,12 +690,20 @@ async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, pa
 
 // ── Fetch Jira issue title ────────────────────
 async function getJiraIssueTitle(issueKey) {
+  return (await getJiraIssueInfo(issueKey)).title;
+}
+
+// Fetch both summary and status in one call — used by pickParentFromCanvas
+async function getJiraIssueInfo(issueKey) {
   try {
-    const res = await axios.get(`${JIRA_HOST}/rest/api/3/issue/${issueKey}?fields=summary`, {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/issue/${issueKey}?fields=summary,status`, {
       headers: { Authorization: jiraAuth(), Accept: 'application/json' },
     });
-    return res.data?.fields?.summary || null;
-  } catch { return null; }
+    return {
+      title:  res.data?.fields?.summary             || null,
+      status: res.data?.fields?.status?.name        || null,
+    };
+  } catch { return { title: null, status: null }; }
 }
 
 // ── Resolve a PI (PLAN-XXX) to its linked Epics ──
@@ -793,42 +801,59 @@ async function pickParentFromCanvas(client, channelId, bugPlatform) {
   const planKeys = [...new Set((canvasContent.match(/PLAN-\d+/g) || []))];
   console.log(`[QABot] Canvas keys: UP=${upKeys.join(',')} PLAN=${planKeys.join(',')}`);
 
+  // Statuses that mean the epic is closed — don't parent new tickets here
+  const CLOSED_STATUSES = new Set([
+    'qa success', 'done', 'closed', 'released', 'complete',
+    'completed', 'qa passed', "won't fix", 'resolved', 'cancelled',
+  ]);
+
   // Build candidate list: direct UP tickets + Epics linked from PIs
   const candidates = [];
 
   // Direct UP keys from canvas
   for (const key of upKeys) {
-    const title = await getJiraIssueTitle(key);
-    if (title) candidates.push({ key, title });
+    const { title, status } = await getJiraIssueInfo(key);
+    if (!title) continue;
+    if (CLOSED_STATUSES.has((status || '').toLowerCase())) {
+      console.log(`[QABot] Skipping ${key} "${title}" — status: ${status}`);
+      continue;
+    }
+    candidates.push({ key, title, status });
   }
 
   // Expand each PI to its linked Epics
   for (const plan of planKeys) {
     const linked = await getLinkedEpicsFromPI(plan);
     for (const e of linked) {
-      if (!candidates.find(c => c.key === e.key)) {
-        // Fetch title if missing
-        const title = e.title || await getJiraIssueTitle(e.key);
-        if (title) candidates.push({ key: e.key, title });
+      if (candidates.find(c => c.key === e.key)) continue;
+      const { title, status } = e.title
+        ? { title: e.title, status: null }   // will re-fetch for status
+        : await getJiraIssueInfo(e.key);
+      // If we only got title from PI link (no status), fetch status separately
+      const finalStatus = status ?? (await getJiraIssueInfo(e.key)).status;
+      if (!title) continue;
+      if (CLOSED_STATUSES.has((finalStatus || '').toLowerCase())) {
+        console.log(`[QABot] Skipping ${e.key} "${title}" — status: ${finalStatus}`);
+        continue;
       }
+      candidates.push({ key: e.key, title, status: finalStatus });
     }
   }
 
   if (candidates.length === 0) {
-    console.log('[QABot] No candidate parents found');
+    console.log('[QABot] No active (non-closed) candidate parents found');
     return null;
   }
 
   // Sort by UP number descending — higher = more recently created = current sprint ticket.
-  // When a canvas has both old and new tickets for the same platform
-  // (e.g. UP-72632 iOS P1.3 and UP-73100 iOS P1.4), the newer one wins.
+  // Ensures that when canvas has both old and new tickets for the same platform, the newer wins.
   candidates.sort((a, b) => {
     const numA = parseInt(a.key.replace('UP-', ''), 10) || 0;
     const numB = parseInt(b.key.replace('UP-', ''), 10) || 0;
     return numB - numA;
   });
 
-  console.log(`[QABot] Candidates (newest first): ${candidates.map(c => `${c.key}="${c.title}"`).join(' | ')}`);
+  console.log(`[QABot] Active candidates (newest first): ${candidates.map(c => `${c.key}[${c.status}]="${c.title}"`).join(' | ')}`);
 
   // Match a title against a platform prefix (iOS -, iOS |, iOS-, iOS|)
   const matchPrefix = prefix => candidates.find(p => {
