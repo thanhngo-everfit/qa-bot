@@ -1240,6 +1240,67 @@ function normalizeSummaryPrefix(summary, platform) {
   return `[${platform}] ${stripped}`;
 }
 
+// ── Extract topic keywords from a Slack channel name ─────────────────────
+// "assign-video-workouts" → ["video", "workouts"]
+// "platform-capability-squad" → ["platform", "capability", "squad"]
+function extractChannelKeywords(channelName) {
+  return (channelName || '')
+    .replace(/^(assign|qa|dev|bug|fix|report|channel|general|squad)-?/i, '')
+    .split(/[-_]/)
+    .map(w => w.trim().toLowerCase())
+    .filter(w => w.length > 2 && !['the','and','for','with','from'].includes(w));
+}
+
+// ── Find the best parent epic in the ACTIVE SPRINT ──────────────────────
+// More reliable than canvas reading: always queries live Jira data.
+// Filters by platform prefix, then ranks by keyword overlap with channel name.
+async function findSprintParent(activeSprintId, platform, channelName) {
+  if (!activeSprintId) return null;
+  try {
+    const platformPrefix = {
+      'API':             'API',
+      'Web':             'Web',
+      'iOS Client':      'iOS',
+      'iOS Coach':       'iOS',
+      'Android Client':  'Android',
+      'Android Coach':   'Android',
+    }[platform] || platform.split(' ')[0];
+
+    const jql =
+      `project = UP AND issuetype = Epic AND sprint = ${activeSprintId} ORDER BY key DESC`;
+
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
+      params: { jql, maxResults: 60, fields: 'summary,status' },
+      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+    });
+
+    const CLOSED = new Set(['qa success','done','closed','released','complete','completed','qa passed',"won't fix",'resolved','cancelled']);
+    const issues = (res.data.issues || []).filter(i => {
+      const t = (i.fields.summary || '').toLowerCase().trim();
+      const st = (i.fields.status?.name || '').toLowerCase();
+      return t.startsWith(platformPrefix.toLowerCase()) && !CLOSED.has(st);
+    });
+
+    if (issues.length === 0) return null;
+    if (issues.length === 1) return issues[0].key;
+
+    // Multiple candidates — rank by keyword overlap with channel name
+    const keywords = extractChannelKeywords(channelName);
+    let best = null, bestScore = -1;
+    for (const issue of issues) {
+      const titleWords = issue.fields.summary.toLowerCase().split(/[\s|\-]+/);
+      const score = keywords.filter(k => titleWords.some(w => w.includes(k))).length;
+      if (score > bestScore) { bestScore = score; best = issue.key; }
+    }
+    const result = best || issues[0].key;
+    console.log(`[QABot] Sprint parent found: ${result} (score=${bestScore}, platform=${platform}, channel=${channelName})`);
+    return result;
+  } catch (err) {
+    console.warn('[QABot] findSprintParent failed:', err.message);
+    return null;
+  }
+}
+
 // ── Read channel canvas and extract parent Jira key ──
 async function getParentFromChannelCanvas(client, channelId) {
   try {
@@ -1444,9 +1505,25 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
         }
       }
 
-      // Read parent from channel canvas using the FINAL platform (post-override).
-      const parentKey = await pickParentFromCanvas(client, event.channel, ticket.platform);
-      logger.info(`[QABot] Parent from canvas: ${parentKey || 'none'} for platform=${ticket.platform}`);
+      // ── Parent lookup: sprint-based (live Jira) takes priority over canvas ──
+      // Canvas content can be stale when epics are created mid-sprint and not
+      // yet added to the canvas. Querying the active sprint directly is reliable.
+      let parentKey = null;
+      try {
+        const channelInfo = await client.conversations.info({ channel: event.channel });
+        const channelName = channelInfo.channel?.name || '';
+        parentKey = await findSprintParent(sprintId, ticket.platform, channelName);
+        if (parentKey) {
+          logger.info(`[QABot] Parent from active sprint: ${parentKey} (channel: ${channelName})`);
+        }
+      } catch (e) {
+        console.warn('[QABot] Sprint parent lookup failed:', e.message);
+      }
+      // Fall back to canvas-based lookup if sprint search found nothing
+      if (!parentKey) {
+        parentKey = await pickParentFromCanvas(client, event.channel, ticket.platform);
+        logger.info(`[QABot] Parent from canvas: ${parentKey || 'none'} for platform=${ticket.platform}`);
+      }
 
       const jiraIds = (
         await Promise.all(assigneeSlackIds.map(id => resolveJiraAccountId(client, id)))
