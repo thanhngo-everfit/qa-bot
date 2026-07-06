@@ -387,10 +387,13 @@ CRITICAL RULES:
 5. The summary should describe the TASK clearly (what to do) — NOT include "[Thanh Ngo]:" or usernames or "Nhờ team check" boilerplate.
 6. A task is work to be done (improvement, new feature, configuration, follow-up). It is NOT a bug report.
 
-MULTI-TASK RULES:
-- If the thread requests MULTIPLE RELATED items on the SAME feature/screen → merge into ONE ticket.
-- If the thread requests UNRELATED items → create SEPARATE tickets.
-- Most threads will produce just 1 ticket.
+MULTI-TASK RULES (VERY IMPORTANT — err on the side of ONE ticket):
+- DEFAULT: Return exactly ONE ticket. Almost every task thread is a single task.
+- A task described MULTIPLE TIMES in different words is still ONE task — NEVER create duplicate tickets for rephrased versions of the same request.
+- If the thread requests MULTIPLE RELATED items on the SAME feature/screen → merge into ONE ticket with all requirements listed.
+- ONLY create SEPARATE tickets when requests are COMPLETELY UNRELATED: different features AND independently deliverable (e.g., "update login page copy" + "add export button to reports" = 2 tickets).
+- Discussion, clarification, agreement, or restating the request are NOT new tasks.
+- When in doubt, return ONE ticket.
 
 Return ONLY a valid JSON ARRAY (NO markdown fences, NO explanation):
 
@@ -551,6 +554,55 @@ Return ONLY valid JSON (no markdown fences, no explanation):
     acceptance_criteria,
     skipPlatformOverride: true,   // fixed [Client Request] prefix — don't rewrite
   }];
+}
+
+// ── Merge near-duplicate parsed tickets ──────────────────────────────────
+// The LLM sometimes returns 2-3 tickets for the same request when a thread
+// rephrases one ask multiple times. Compare normalized summaries by token
+// overlap (Jaccard) and drop duplicates, keeping the higher-priority one.
+const PRIORITY_RANK = { Highest: 5, High: 4, Medium: 3, Low: 2, Lowest: 1 };
+
+function dedupeTickets(tickets) {
+  if (tickets.length <= 1) return tickets;
+
+  const tokenize = s => new Set(
+    (s || '')
+      .toLowerCase()
+      .replace(/\[[^\]]*\]/g, ' ')   // strip [Platform][Feature] prefixes
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter(w => w.length > 2)
+  );
+
+  // Two similarity measures:
+  // - Jaccard (intersection/union) catches near-identical summaries
+  // - Overlap coefficient (intersection/smaller set) catches rephrased duplicates
+  //   like "Enable continuous carousel looping" vs "Implement continuous looping for carousel"
+  const isSimilar = (a, b) => {
+    if (a.size === 0 || b.size === 0) return false;
+    let inter = 0;
+    for (const w of a) if (b.has(w)) inter++;
+    const jaccard = inter / (a.size + b.size - inter);
+    const overlap = inter / Math.min(a.size, b.size);
+    return jaccard >= 0.5 || overlap >= 0.6;
+  };
+
+  const kept = [];
+  for (const t of tickets) {
+    const tTokens = tokenize(t.summary);
+    const dupIdx = kept.findIndex(k => isSimilar(tokenize(k.summary), tTokens));
+    if (dupIdx === -1) {
+      kept.push(t);
+    } else {
+      // Duplicate — keep whichever has higher priority
+      const existing = kept[dupIdx];
+      if ((PRIORITY_RANK[t.priority] || 0) > (PRIORITY_RANK[existing.priority] || 0)) {
+        kept[dupIdx] = t;
+      }
+      console.log(`[QABot] Deduped near-duplicate ticket: "${t.summary}"`);
+    }
+  }
+  return kept;
 }
 
 // ── Section headers that should be bold in Jira description ──
@@ -980,6 +1032,99 @@ function getPlatformBucket(platform) {
   return null;
 }
 
+const SQUAD_ROSTER = {
+  'anh mai': 'qa',
+  'anh phan': 'web',
+  'bich thuy': 'qa',
+  'canh tran': 'ios',
+  'chien nguyen': 'api',
+  'chieu hoang': 'qa',
+  'chung ngo': 'qa',
+  'danh truong': 'android',
+  'dao nguyen': 'qa',
+  'dat phan': 'api',
+  'dong truong': 'fullstack',
+  'dong vo': 'api',
+  'duc trinh': 'api',
+  'duy le': 'api',
+  'duy nguyen': 'android',
+  'ha duong': 'web',
+  'ha nguyen': 'fullstack',
+  'hang tran': 'qa',
+  'hanh le': 'qa',
+  'hanh tran': 'web',
+  'hieu le': 'web',
+  'hoai ho': 'android',
+  'hoang nguyen': 'web',
+  'hong tu': 'api',
+  'hung nguyen': 'api',
+  'huy be': 'api',
+  'huy tran': 'web',
+  'khai truong': 'qa',
+  'khoa huynh': 'android',
+  'lam bui': 'android',
+  'lam nguyen': 'qa',
+  'lanh ngo': 'qa',
+  'le quoc hung': 'qa',
+  'linh nguyen': 'api',
+  'loc le': 'fullstack',
+  'long nguyen hoang': 'api',
+  'long phan': 'android',
+  'long thai': 'api',
+  'ly nguyen': 'qa',
+  'nhan huynh': 'web',
+  'nhat huy': 'api',
+  'quy hoang': 'api',
+  'tan huynh': 'ios',
+  'thai bui': 'web',
+  'thanh nguyen': 'web',
+  'thanh tran': 'ios',
+  'thao dinh': 'fullstack',
+  'thao nguyen': 'qa',
+  'thinh huynh': 'web',
+  'thinh le': 'ios',
+  'thu duong': 'qa',
+  'thuong huynh': 'api',
+  'toan tran': 'web',
+  'tran nguyen': 'qa',
+  'tran thanh nam': 'qa',
+  'trang ngo': 'qa',
+  'trung huynh': 'api',
+  'trung nguyen': 'web',
+  'tuan nguyen': 'api',
+  'tuyen tran': 'ios',
+  'uyen thao': 'qa',
+  'van nguyen': 'qa',
+  'viet mai': 'api',
+  'viet phung': 'api',
+  'vinh tran': 'web',
+};
+
+// ── Normalize a name for roster lookup: strip diacritics, lowercase ──
+function normalizeName(s) {
+  return (s || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd').replace(/Đ/g, 'D')
+    .replace(/\s*\([^)]*\)\s*/g, ' ')  // strip role tags like (BE)
+    .replace(/\s+/g, ' ')
+    .trim().toLowerCase();
+}
+
+// ── Look up a member's platform bucket in the squad roster ──
+// Tries exact match first, then subset match (all roster-name words appear in the
+// user name) to handle name-order differences and extra middle names.
+function getRosterBucket(userName) {
+  const n = normalizeName(userName);
+  if (!n) return null;
+  if (SQUAD_ROSTER[n]) return SQUAD_ROSTER[n];
+  const userWords = new Set(n.split(' '));
+  for (const [rosterName, bucket] of Object.entries(SQUAD_ROSTER)) {
+    const rosterWords = rosterName.split(' ');
+    if (rosterWords.every(w => userWords.has(w))) return bucket;
+  }
+  return null;
+}
+
 // ── Infer the bug's platform from the assignee's Slack role (display name + title) ──
 // Rule (from QA team): the [Prefix] in the summary should follow the platform of
 // the person being assigned, not whatever the thread discussion happened to be about.
@@ -1000,8 +1145,13 @@ async function inferPlatformFromAssignee(client, slackUserId, fallbackPlatform) 
 
     let bucket = null;
 
+    // 0) Squad roster is the authoritative source — check both display and real name
+    bucket = getRosterBucket(profile.display_name) || getRosterBucket(profile.real_name);
+    if (bucket === 'fullstack' || bucket === 'qa') bucket = null; // keep LLM platform for these roles
+    if (bucket) console.log(`[QABot] Roster match: ${profile.real_name || profile.display_name} → ${bucket}`);
+
     // 1) Everfit convention: parenthesized role tag in the display name, e.g. "Hong (BE)"
-    const tagMatch = haystack.match(/\((be|fe|backend|frontend|ios|android|web)\)/i);
+    const tagMatch = bucket ? null : haystack.match(/\((be|fe|backend|frontend|ios|android|web)\)/i);
     if (tagMatch) {
       const tag = tagMatch[1].toLowerCase();
       if      (tag === 'be' || tag === 'backend')                      bucket = 'api';
@@ -1186,12 +1336,29 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       : isTask
         ? await parseTaskReport(context)
         : await parseBugReport(context);
+    const beforeDedup = tickets.length;
+    const dedupedTickets = dedupeTickets(tickets);
+    if (dedupedTickets.length < beforeDedup) {
+      logger.info(`[QABot] Deduped ${beforeDedup} → ${dedupedTickets.length} ticket(s)`);
+    }
+    tickets.length = 0;
+    tickets.push(...dedupedTickets);
     logger.info(`[QABot] Parsed ${tickets.length} ${issueType.toLowerCase()}(s)`);
 
-    // Detect assignee from trigger message
-    const triggerMentions = (event.text.match(/<@([A-Z0-9]+)>/g) || [])
+    // Detect assignees from trigger message.
+    // Mentions after "cc" or "fyi" are informational only — NOT assignees.
+    // e.g. "assign to @A cc @B"  → assignee A only
+    //      "assign to @A, @B"    → assignees A and B (one card each)
+    const ccMatch = event.text.match(/\b(?:cc|fyi)\b/i);
+    const assignPortion = ccMatch
+      ? event.text.slice(0, ccMatch.index)
+      : event.text;
+    const triggerMentions = (assignPortion.match(/<@([A-Z0-9]+)>/g) || [])
       .map(m => m.replace(/<@|>/g, ''))
       .filter(id => id !== botUserId);
+    if (ccMatch) {
+      logger.info(`[QABot] cc/fyi detected — assignees limited to mentions before "${ccMatch[0]}"`);
+    }
 
     // Parse Epic from trigger message (PLAN-XXX or UP-XXX)
     const epicMatch = event.text.match(/\b(PLAN-\d+|UP-\d+)\b/i);
@@ -1212,15 +1379,27 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
 
     const createdJiras = [];
 
+    // ── Expand: Jira assignee is a single picker, so N assignees → N cards ──
+    const expandedTickets = [];
     for (const ticket of tickets) {
-      // Resolve assignees FIRST — platform may depend on the assignee's role.
-      let assigneeSlackIds = [...triggerMentions];
-      if (assigneeSlackIds.length === 0 && ticket.assignee_names.length > 0) {
+      let ids = [...triggerMentions];
+      if (ids.length === 0 && ticket.assignee_names.length > 0) {
         for (const name of ticket.assignee_names) {
           const id = await findSlackUserByName(client, name);
-          if (id) assigneeSlackIds.push(id);
+          if (id) ids.push(id);
         }
       }
+      ids = [...new Set(ids)]; // dedupe
+      if (ids.length <= 1) {
+        expandedTickets.push({ ...ticket, _assigneeIds: ids });
+      } else {
+        logger.info(`[QABot] ${ids.length} assignees → creating ${ids.length} cards (one per assignee)`);
+        for (const id of ids) expandedTickets.push({ ...ticket, _assigneeIds: [id] });
+      }
+    }
+
+    for (const ticket of expandedTickets) {
+      const assigneeSlackIds = ticket._assigneeIds;
 
       // Override platform + summary prefix based on the first assignee's role.
       // Skip for tickets with fixed prefix (e.g. [Client Request] app icon format).
