@@ -249,10 +249,14 @@ async function parseBugReport(context) {
 CRITICAL RULES:
 1. Read ALL messages in the thread (except bot messages) to collect every bug/issue reported.
 2. Ignore bot messages (lines starting with "[qa-bot]" or "[bug-reporting-tracker]").
-3. Ignore command messages (lines like "@X assign to @Y", "@qa-bot ...", "@bug-reporting-tracker ...").
+3. Ignore ONLY pure bot-command lines — messages that contain NOTHING BUT @mentions + assignment keywords, e.g.:
+   - "@QA Bot (AI) assign to @X" — ignore
+   - "@qa-bot create task" — ignore
+   Messages that DESCRIBE A BUG while also mentioning "assign" or "nhờ" (e.g. "nhờ mn assign dev fix issue white space at bottom [iOS Client][Screen]") are BUG REPORTS — NEVER ignore these.
 4. Extract every actual bug: what is broken, on what platform, steps to reproduce.
 5. Translate any Vietnamese content to English.
 6. The summary should describe the bug clearly — NOT include "[Thanh Ngo]:" or usernames or "Nhờ team check" boilerplate.
+7. NEVER return an empty array. If the thread contains ANY bug description (even just a screen name + symptom), return at least one ticket. A short, vague description is still a valid bug — do your best.
 
 MULTI-BUG RULES (VERY IMPORTANT — err on the side of ONE ticket):
 - DEFAULT: Create exactly ONE ticket per thread. Most bug reports are a single bug.
@@ -382,10 +386,14 @@ async function parseTaskReport(context) {
 CRITICAL RULES:
 1. Read ALL messages in the thread (except bot messages) to understand what work is being requested.
 2. Ignore bot messages (lines starting with "[qa-bot]" or "[bug-reporting-tracker]").
-3. Ignore command messages (lines like "@X assign to @Y", "@qa-bot create task ...").
+3. Ignore ONLY pure bot-command lines — messages that contain NOTHING BUT @mentions + assignment keywords, e.g.:
+   - "@QA Bot (AI) assign to @X" — ignore
+   - "@qa-bot create task" — ignore
+   Messages that DESCRIBE A TASK while mentioning "assign" or "nhờ" are TASK DESCRIPTIONS — NEVER ignore these.
 4. Translate any Vietnamese content to English.
 5. The summary should describe the TASK clearly (what to do) — NOT include "[Thanh Ngo]:" or usernames or "Nhờ team check" boilerplate.
 6. A task is work to be done (improvement, new feature, configuration, follow-up). It is NOT a bug report.
+7. NEVER return an empty array. If the thread describes ANY task or request, return at least one ticket.
 
 MULTI-TASK RULES (VERY IMPORTANT — err on the side of ONE ticket):
 - DEFAULT: Return exactly ONE ticket. Almost every task thread is a single task.
