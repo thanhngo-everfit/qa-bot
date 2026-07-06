@@ -51,17 +51,22 @@ async function getThreadReporterSlackId(client, channelId, threadTs) {
   }
 }
 
-async function getThread(client, channelId, threadTs) {  const result   = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 });
+async function getThread(client, channelId, threadTs) {
+  const result   = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 200 });
   const messages = result.messages || [];
-  const lines    = await Promise.all(messages.map(async msg => {
+  const lines    = [];
+  for (const msg of messages) {
+    // Skip bot messages — bot error/success replies from previous attempts
+    // poison the context and cause GPT to return empty results
+    if (msg.bot_id || msg.subtype === 'bot_message') continue;
     let name = msg.username || msg.user || 'user';
     try {
       const info = await client.users.info({ user: msg.user });
       name = info.user?.real_name || name;
     } catch (_) {}
     const text = (msg.text || '').replace(/<@([A-Z0-9]+)>/g, (_, uid) => `@${uid}`);
-    return `[${name}]: ${text}`;
-  }));
+    lines.push(`[${name}]: ${text}`);
+  }
   return lines.join('\n');
 }
 
