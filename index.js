@@ -1345,6 +1345,19 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     tickets.push(...dedupedTickets);
     logger.info(`[QABot] Parsed ${tickets.length} ${issueType.toLowerCase()}(s)`);
 
+    // Guard: LLM returned an empty array — nothing to create
+    if (tickets.length === 0) {
+      await client.chat.postMessage({
+        channel: event.channel, thread_ts: threadTs,
+        text:
+          `⚠️ I couldn't extract a ${issueType.toLowerCase()} from this thread. ` +
+          `Please make sure the thread describes the issue or request (not just assign commands), then tag me again.`,
+      });
+      await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+      await client.reactions.add({ channel: event.channel, name: 'warning', timestamp: event.ts }).catch(() => {});
+      return;
+    }
+
     // Detect assignees from trigger message.
     // Mentions after "cc" or "fyi" are informational only — NOT assignees.
     // e.g. "assign to @A cc @B"  → assignee A only
@@ -1485,9 +1498,10 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
 
     const epicLine = epicKey ? `\nEpic: <${JIRA_HOST}/browse/${epicKey}|${epicKey}>` : '';
 
+    const responseText = lines.join('\n\n') + epicLine;
     await client.chat.postMessage({
       channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-      text: lines.join('\n\n') + epicLine,
+      text: responseText || '⚠️ No tickets were created — check Railway logs for details.',
     });
 
     await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
