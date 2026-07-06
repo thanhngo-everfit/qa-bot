@@ -201,6 +201,13 @@ async function classifyIssueType(triggerText, threadContext) {
     /\bcrash\b/,
     /\berror\b/,
     /\bregression\b/,
+    /nhờ\s+\S+\s+fix/,      // "nhờ mn fix", "nhờ anh fix issue"
+    /nhờ\s+\S+\s+assign.*fix/, // "nhờ mn assign dev fix issue"
+    /\bfix\s+issue\b/,
+    /\bfix\s+bug\b/,
+    /\bwhite\s+space\b/,    // common UI bug term
+    /\bblack\s+screen\b/,
+    /should\s+(?:not|remove|fix)/i,  // "[iOS][X] SHOULD remove the white space"
   ];
   if (bugSignals.some(r => r.test(combined))) {
     console.log('[QABot] classifyIssueType: fast-path Bug (thread signal matched)');
@@ -353,21 +360,21 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the f
   try { parsed = JSON.parse(raw); } catch { parsed = null; }
 
   // Normalize to array
-  if (!parsed) {
+  // Treat both null AND empty array as a failed parse — return a fallback ticket
+  const ticketsRaw = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
+  if (ticketsRaw.length === 0) {
     return [{
-      summary:             '[Web][Bug] Bug report from QA',
+      summary:             '[iOS Client][Bug] Bug report from QA — please update summary',
       priority:            'Medium',
-      platform:            'Web',
-      description:         'Description not parsed. Please update manually.',
+      platform:            'iOS Client',
+      description:         'Description not parsed automatically. Please update manually.',
       assignee_names:      [],
       acceptance_criteria: [],
     }];
   }
 
-  const tickets = Array.isArray(parsed) ? parsed : [parsed];
-
   // Defensive defaults for each ticket
-  return tickets.map(t => {
+  return ticketsRaw.map(t => {
     const platform = t.platform || 'Web';
     return {
       summary:             normalizeSummaryPrefix(t.summary || '', platform),
@@ -451,20 +458,19 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the t
   let parsed;
   try { parsed = JSON.parse(raw); } catch { parsed = null; }
 
-  if (!parsed) {
+  const ticketsRaw = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
+  if (ticketsRaw.length === 0) {
     return [{
-      summary:             '[Web][General] Task request',
+      summary:             '[Web][General] Task request — please update summary',
       priority:            'Medium',
       platform:            'Web',
-      description:         'Description not parsed. Please update manually.',
+      description:         'Description not parsed automatically. Please update manually.',
       assignee_names:      [],
       acceptance_criteria: [],
     }];
   }
 
-  const tickets = Array.isArray(parsed) ? parsed : [parsed];
-
-  return tickets.map(t => {
+  return ticketsRaw.map(t => {
     const platform = t.platform || 'Web';
     return {
       summary:             normalizeSummaryPrefix(t.summary || '', platform),
