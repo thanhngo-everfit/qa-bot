@@ -64,7 +64,21 @@ async function getThread(client, channelId, threadTs) {
       const info = await client.users.info({ user: msg.user });
       name = info.user?.real_name || name;
     } catch (_) {}
-    const text = (msg.text || '').replace(/<@([A-Z0-9]+)>/g, (_, uid) => `@${uid}`);
+    const text = (msg.text || '')
+      // User mentions <@USERID> → @name
+      .replace(/<@([A-Z0-9]+)>/g, (_, uid) => `@${uid}`)
+      // User-group / subteam mentions <!subteam^ID|display> or <!subteam^ID>
+      .replace(/<!subteam\^[A-Z0-9]+\|([^>]+)>/g, '@$1')
+      .replace(/<!subteam\^[A-Z0-9]+>/g, '')
+      // Channel-wide mentions
+      .replace(/<!channel>/g, '@channel')
+      .replace(/<!here>/g, '@here')
+      // Channel links <#CID|name>
+      .replace(/<#[A-Z0-9]+\|([^>]+)>/g, '#$1')
+      // Any remaining < > encoded tokens
+      .replace(/<[^>]+>/g, '')
+      .trim();
+    if (!text) continue;  // skip empty messages after cleaning
     lines.push(`[${name}]: ${text}`);
   }
   return lines.join('\n');
