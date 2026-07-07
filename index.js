@@ -596,7 +596,7 @@ Return ONLY valid JSON (no markdown fences, no explanation):
 const PRIORITY_RANK = { Highest: 5, High: 4, Medium: 3, Low: 2, Lowest: 1 };
 
 function dedupeTickets(tickets) {
-  if (tickets.length <= 1) return tickets;
+  if (tickets.length <= 1) return [...tickets]; // return a copy — caller mutates the original
 
   const tokenize = s => new Set(
     (s || '')
