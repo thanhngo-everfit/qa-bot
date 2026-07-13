@@ -265,6 +265,34 @@ async function classifyIssueType(triggerText, threadContext) {
 }
 
 // ── Parse QA bug with Claude (robust) ────────
+// ── Extract a meaningful summary from thread when GPT fails ─────────────
+// Looks for [Platform][Feature] prefix pattern already present in the thread
+// (e.g. "[API][Check-In Form][Notification]") and uses it directly.
+function buildFallbackSummary(context, platform) {
+  const text = (context || '');
+
+  // Find [Bracket][Bracket]... pattern — Everfit teams often prefix threads this way
+  const prefixMatch = text.match(/\[([A-Za-z][A-Za-z\s/0-9-]*)\]((?:\[[^\]]+\])+)/);
+  if (prefixMatch) {
+    const featurePart = prefixMatch[2]; // e.g. "[Check-In Form][Notification][Reminder]"
+    // Try to find an "Actual" line for the bug detail
+    const actualMatch = text.match(/(?:\*?Actual\*?|Step\s*\(\d+\))[:\s]+([^\n•*`]{5,60})/i);
+    const detail = actualMatch ? ' — ' + actualMatch[1].trim() : '';
+    const summary = `[${platform}]${featurePart}${detail}`.slice(0, 120);
+    return summary;
+  }
+
+  // Fall back to first non-command line with at least 8 chars
+  for (const line of text.split('\n')) {
+    const stripped = line.replace(/^\[[^\]]+\]:\s*/, '').trim();
+    if (stripped.length >= 8 && !/^assign to|^@|^cc |^fyi /i.test(stripped)) {
+      return `[${platform}][Bug] ${stripped.slice(0, 80)}`;
+    }
+  }
+
+  return `[${platform}][Bug] Bug report from QA — please update summary`;
+}
+
 async function parseBugReport(context) {
   const res = await openai.chat.completions.create({
     model:      'gpt-4o-mini',
@@ -283,6 +311,8 @@ CRITICAL RULES:
 5. Translate any Vietnamese content to English.
 6. The summary should describe the bug clearly — NOT include "[Thanh Ngo]:" or usernames or "Nhờ team check" boilerplate.
 7. NEVER return an empty array. If the thread contains ANY bug description (even just a screen name + symptom), return at least one ticket. A short, vague description is still a valid bug — do your best.
+8. IMPORTANT — Structured Vietnamese bug reports: threads formatted as "[Platform][Feature][SubFeature]\nNhờ... check\n*Step:*\n1...\n*Actual*:\n...\n*Expected*:\n..." ARE bug reports. Parse the [Platform][Feature] as the prefix, the Actual section as the bug description, and the Expected section as expected behavior. Never return [] for these even if the message asks someone to "check" (nhờ check = "please check/verify this bug").
+
 
 MULTI-BUG RULES (VERY IMPORTANT — err on the side of ONE ticket):
 - DEFAULT: Create exactly ONE ticket per thread. Most bug reports are a single bug.
@@ -377,10 +407,11 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the f
   // Treat both null AND empty array as a failed parse — return a fallback ticket
   const ticketsRaw = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
   if (ticketsRaw.length === 0) {
+    const fallbackPlatform = 'iOS Client';
     return [{
-      summary:             '[iOS Client][Bug] Bug report from QA — please update summary',
+      summary:             buildFallbackSummary(context, fallbackPlatform),
       priority:            'Medium',
-      platform:            'iOS Client',
+      platform:            fallbackPlatform,
       description:         'Description not parsed automatically. Please update manually.',
       assignee_names:      [],
       acceptance_criteria: [],
