@@ -597,7 +597,7 @@ Return ONLY valid JSON (no markdown fences, no explanation):
     `A $50 charge applies — Payment Ops will handle billing in a separate ticket.` +
     `\n\n## Workspace Info${workspaceInfo}` +
     `\n\n## Assets\nOriginal Image (from customer)\nPreview Image (Android + iOS)` +
-    `\n\n## References${refs || ''}`;
+    `\n\n## Reference${refs || ''}`;  // 'Reference' (no s) matches injection regex
 
   const acceptance_criteria = [
     '[Dev] Update app icon for the workspace in the system',
@@ -1582,8 +1582,9 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
         .replace(/\n{3,}/g, '\n\n')               // collapse 3+ blank lines → 2
         .trim();
       if (ticket.description.includes('## Reference')) {
+        // Match both '## Reference' and '## References' (with or without trailing s)
         ticket.description = ticket.description.replace(
-          /## Reference(?:\n+|$)/,
+          /## References?(?:\n+|$)/,
           `## Reference\n- Slack thread: ${slackThreadUrl}\n`,
         );
       } else {
