@@ -21,24 +21,34 @@ function jiraAuth() {
 // working instead of erroring at the user.
 let _openaiClient = null;
 function getOpenAI() {
-  if (!_openaiClient) _openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  if (!_openaiClient) {
+    _openaiClient = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+      // Point at any OpenAI-compatible gateway (internal LB, LiteLLM, Azure
+      // proxy...) by setting OPENAI_BASE_URL, e.g. https://codex-lb.internal/v1
+      ...(process.env.OPENAI_BASE_URL ? { baseURL: process.env.OPENAI_BASE_URL } : {}),
+    });
+  }
   return _openaiClient;
 }
-const SMART_MODEL = process.env.OPENAI_SMART_MODEL || 'gpt-4o';
+const SMART_MODEL    = process.env.OPENAI_SMART_MODEL    || 'gpt-4o';
+const FALLBACK_MODEL = process.env.OPENAI_FALLBACK_MODEL || 'gpt-4o-mini';
 let _smartModelBroken = false;
 
 async function aiComplete(params) {
   const openai = getOpenAI();
-  let model = params.model === 'gpt-4o' ? SMART_MODEL : params.model;
-  if (_smartModelBroken && model !== 'gpt-4o-mini') model = 'gpt-4o-mini';
+  let model = params.model === 'gpt-4o' ? SMART_MODEL
+            : params.model === 'gpt-4o-mini' ? FALLBACK_MODEL
+            : params.model;
+  if (_smartModelBroken && model !== FALLBACK_MODEL) model = FALLBACK_MODEL;
   try {
     return await openai.chat.completions.create({ ...params, model });
   } catch (err) {
     const msg = `${err?.message || ''}`;
-    if (model !== 'gpt-4o-mini' && (err?.status === 403 || /does not have access to model/i.test(msg))) {
-      if (!_smartModelBroken) console.warn(`[AI] Model "${model}" not enabled on this OpenAI project — falling back to gpt-4o-mini for all smart calls. Enable it in the OpenAI dashboard or set OPENAI_SMART_MODEL.`);
+    if (model !== FALLBACK_MODEL && (err?.status === 403 || err?.status === 404 || /does not have access to model|model.*not found/i.test(msg))) {
+      if (!_smartModelBroken) console.warn(`[AI] Model "${model}" unavailable on this endpoint — falling back to "${FALLBACK_MODEL}" for all smart calls. Fix model access or set OPENAI_SMART_MODEL / OPENAI_FALLBACK_MODEL.`);
       _smartModelBroken = true;
-      return await getOpenAI().chat.completions.create({ ...params, model: 'gpt-4o-mini' });
+      return await getOpenAI().chat.completions.create({ ...params, model: FALLBACK_MODEL });
     }
     throw err;
   }
