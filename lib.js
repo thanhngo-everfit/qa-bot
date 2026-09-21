@@ -145,8 +145,74 @@ async function resolveInlineMentions(client, text) {
   return out;
 }
 
+// ── Channel-scope context: recent threads + live Jira statuses ───────
+// For requests like "review all critical issues in this channel last 2
+// weeks" the current thread is not enough — gather the channel's recent
+// threads into one transcript, plus live status for every ticket found.
+const CHANNEL_SCOPE_RE = /\b(this channel|the channel|all threads?|threads? in|channel history|last\s+\d+\s+(?:days?|weeks?)|past\s+(?:week|\d+\s+weeks?)|recent threads?|c\u1ea3 k\u00eanh|k\u00eanh n\u00e0y|tu\u1ea7n (?:n\u00e0y|tr\u01b0\u1edbc|qua)|2 tu\u1ea7n)\b/i;
+
+function detectChannelScope(text) {
+  return CHANNEL_SCOPE_RE.test(text || '');
+}
+
+function parseWindowDays(text) {
+  let m = (text || '').match(/(?:last|past)\s+(\d+)\s*weeks?/i);
+  if (m) return Math.min(parseInt(m[1], 10) * 7, 30);
+  m = (text || '').match(/(?:last|past)\s+(\d+)\s*days?/i);
+  if (m) return Math.min(parseInt(m[1], 10), 30);
+  if (/\b(?:last|past)\s+week\b|tu\u1ea7n tr\u01b0\u1edbc|tu\u1ea7n qua/i.test(text || '')) return 7;
+  return 14;
+}
+
+async function gatherChannelContext(client, channelId, { days = 14, maxThreads = 30 } = {}) {
+  const oldest = String((Date.now() - days * 24 * 3600 * 1000) / 1000);
+  const blocks = [];
+  const ticketKeys = new Set();
+  try {
+    const history = await client.conversations.history({ channel: channelId, oldest, limit: 200 });
+    const parents = (history.messages || [])
+      .filter(m => !m.bot_id || m.reply_count)          // humans, or bot threads with replies
+      .sort((a, b) => parseFloat(b.ts) - parseFloat(a.ts))
+      .slice(0, maxThreads);
+
+    for (const parent of parents.reverse()) {            // oldest → newest
+      const lines = [];
+      const date = new Date(parseFloat(parent.ts) * 1000).toISOString().substring(0, 10);
+      const push = async (m) => {
+        const who = m.user ? await resolveUserName(client, m.user) : (m.bot_id ? 'QA Agent' : 'unknown');
+        const txt = (await resolveInlineMentions(client, m.text || '')).replace(/\s+/g, ' ').substring(0, 400);
+        if (txt) lines.push(`[${who}]: ${txt}`);
+        for (const k of (m.text || '').match(/UP-\d+/g) || []) ticketKeys.add(k);
+      };
+      await push(parent);
+      if (parent.reply_count) {
+        try {
+          const replies = await client.conversations.replies({ channel: channelId, ts: parent.ts, limit: 40 });
+          for (const r of (replies.messages || []).slice(1)) await push(r);
+        } catch (_) {}
+      }
+      blocks.push(`── Thread (${date}) ──\n${lines.join('\n').substring(0, 1600)}`);
+    }
+  } catch (err) {
+    console.warn('[ChannelScope] history read failed:', err.data?.error || err.message);
+    return { context: '', note: `I couldn't read this channel's history (${err.data?.error || err.message}) — I may be missing the groups:history scope for private channels.` };
+  }
+
+  // Live Jira status for every ticket referenced in the window
+  const statuses = [];
+  for (const key of [...ticketKeys].slice(0, 25)) {
+    const snap = await getIssueSnapshot(key);
+    if (snap) statuses.push(`${key} — ${snap.status}${snap.assignee ? ` — ${snap.assignee}` : ''} — ${snap.summary.substring(0, 90)}`);
+  }
+
+  const context =
+    blocks.join('\n\n') +
+    (statuses.length ? `\n\n── LIVE JIRA STATUS (current, from Jira) ──\n${statuses.join('\n')}` : '');
+  return { context: context.substring(0, 30000), note: null };
+}
+
 // ── General task worker: QA Agent does ANY requested knowledge work ──
-async function qaTaskWork(context, userText) {
+async function qaTaskWork(context, userText, maxChars = 12000) {
   try {
     const res = await aiComplete({
       model: SMART_MODEL, max_tokens: 1800,
@@ -160,7 +226,7 @@ Rules:
 - Be complete but not padded — deliver the work product itself, no preamble like "Here is the summary"
 - If the thread doesn't contain enough information, deliver the best partial result and state clearly what is missing
 - Never invent ticket numbers, links, or facts not present in the thread` },
-        { role: 'user', content: `Thread transcript:\n${(context || '(no thread)').substring(0, 12000)}\n\nRequest: ${userText}` },
+        { role: 'user', content: `Transcript (may contain MULTIPLE threads from the channel, plus a LIVE JIRA STATUS section — treat that section as the current source of truth for ticket status):\n${(context || '(no thread)').substring(0, maxChars)}\n\nRequest: ${userText}` },
       ],
     });
     return res.choices[0].message.content?.trim() || null;
@@ -172,4 +238,5 @@ module.exports = {
   SMART_MODEL, aiComplete, aiCall,
   agentStatus, getActiveSprintId, getIssueSnapshot,
   resolveUserName, resolveInlineMentions, qaTaskWork,
+  detectChannelScope, parseWindowDays, gatherChannelContext,
 };
