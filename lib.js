@@ -162,6 +162,13 @@ async function getProjectIssueTypes() {
 async function createJiraIssueResilient(fields) {
   const notes = [];
   let lastErr = null;
+  // "Epic Link" (legacy customfield_10014) and "parent" are two names for
+  // the SAME relationship in Jira. Swapping between them is an internal
+  // mechanism choice — done silently. Notes are only for GENUINE losses
+  // the user should know about (a field omitted, a parent that failed
+  // both ways).
+  let triedEpicField = !!fields.customfield_10014;
+  let triedParent = !!fields.parent;
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
       const res = await axios.post(`${JIRA_HOST}/rest/api/3/issue`, { fields }, {
@@ -179,16 +186,24 @@ async function createJiraIssueResilient(fields) {
         if (bad === 'customfield_10014' && fields.customfield_10014) {
           const key = fields.customfield_10014;
           delete fields.customfield_10014;
-          if (!fields.parent) {
+          if (!fields.parent && !triedParent) {
             fields.parent = { key };
-            notes.push(`Epic Link isn't supported on this issue type — attached via parent ${key} instead`);
+            triedParent = true;
+            console.log(`[Jira] Epic Link field rejected — retrying via parent ${key} (same relationship)`);
           } else {
-            notes.push('Epic Link not supported on this issue type — omitted');
+            notes.push(`couldn't attach to ${key} — please link it in Jira`);
           }
           fixed = true;
         } else if (bad === 'parent' && fields.parent) {
-          notes.push(`couldn't attach to parent ${fields.parent.key} (${fieldErrors[bad]})`);
+          const key = fields.parent.key;
           delete fields.parent;
+          if (!fields.customfield_10014 && !triedEpicField) {
+            fields.customfield_10014 = key;
+            triedEpicField = true;
+            console.log(`[Jira] parent field rejected — retrying via Epic Link ${key} (same relationship)`);
+          } else {
+            notes.push(`couldn't attach to ${key} (${fieldErrors[bad]}) — please link it in Jira`);
+          }
           fixed = true;
         } else if (fields[bad] !== undefined) {
           notes.push(`${bad} isn't supported on this issue type — omitted`);
