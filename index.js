@@ -332,10 +332,10 @@ function buildFallbackSummary(context, platform) {
   return `[${platform}][Bug] Bug report from QA — please update summary`;
 }
 
-async function parseBugReport(context) {
+async function parseBugReport(context, userDirective = '') {
   const res = await aiComplete({
-    model:      'gpt-4o-mini',
-    max_tokens: 3000,
+    model:      userDirective ? SMART_MODEL : 'gpt-4o-mini',
+    max_tokens: userDirective ? 6000 : 3000,
     messages: [
       { role: 'system', content: `You are QABot for Everfit. Parse a QA bug report from a Slack thread.
 
@@ -354,7 +354,8 @@ CRITICAL RULES:
 
 
 MULTI-BUG RULES (VERY IMPORTANT — err on the side of ONE ticket):
-- DEFAULT: Create exactly ONE ticket per thread. Most bug reports are a single bug.
+- REQUESTER DIRECTIVE OVERRIDES EVERYTHING BELOW: if the requester's directive asks for a specific number of tickets or one per issue ("create 3 tickets for 3 issues", "tách card từng lỗi", "one card per bug"), you MUST enumerate the distinct issues in the thread and return exactly one ticket per issue (up to 6) — the merge-into-one default does NOT apply.
+- DEFAULT (no directive): Create exactly ONE ticket per thread. Most bug reports are a single bug.
 - If the thread reports MULTIPLE RELATED issues on the SAME feature/screen → merge them into ONE ticket. List all issues in the description.
 - ONLY create SEPARATE tickets if bugs are COMPLETELY UNRELATED: different features AND different root causes AND clearly independent (e.g., "login is broken" + "profile page has typo" = 2 tickets).
 - "Different platforms" alone is NOT a reason to split. If the same bug affects Web + API, pick the PRIMARY platform and create ONE ticket.
@@ -434,7 +435,7 @@ Examples:
 - "App crashes on launch for iOS 17 users" → Highest
 
 NEVER return null/undefined/empty. Always make a reasonable guess based on the first message.` },
-      { role: 'user', content: `QA bug report thread:\n\n${context}` },
+      { role: 'user', content: `${userDirective ? `REQUESTER DIRECTIVE (obey this): ${userDirective}\n\n` : ''}QA bug report thread:\n\n${context}` },
     ],
   });
 
@@ -472,10 +473,10 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the f
 }
 
 // ── Parse a TASK request from a Slack thread ─────
-async function parseTaskReport(context) {
+async function parseTaskReport(context, userDirective = '') {
   const res = await aiComplete({
-    model:      'gpt-4o-mini',
-    max_tokens: 3000,
+    model:      userDirective ? SMART_MODEL : 'gpt-4o-mini',
+    max_tokens: userDirective ? 6000 : 3000,
     messages: [
       { role: 'system', content: `You are QABot for Everfit. Parse a TASK request from a Slack thread.
 
@@ -493,6 +494,7 @@ CRITICAL RULES:
 
 MULTI-TASK RULES (VERY IMPORTANT — err on the side of ONE ticket):
 - DEFAULT: Return exactly ONE ticket. Almost every task thread is a single task.
+- REQUESTER DIRECTIVE OVERRIDE: if the requester's directive asks for a specific number of tickets or one per item, enumerate the distinct requests and return one ticket per request (up to 6).
 - A task described MULTIPLE TIMES in different words is still ONE task — NEVER create duplicate tickets for rephrased versions of the same request.
 - If the thread requests MULTIPLE RELATED items on the SAME feature/screen → merge into ONE ticket with all requirements listed.
 - ONLY create SEPARATE tickets when requests are COMPLETELY UNRELATED: different features AND independently deliverable (e.g., "update login page copy" + "add export button to reports" = 2 tickets).
@@ -534,7 +536,7 @@ PRIORITY RUBRIC (for tasks, default to Medium unless thread suggests otherwise):
 - "Lowest" — Trivial / cleanup
 
 NEVER return null/undefined/empty. Always make a reasonable guess based on the thread.` },
-      { role: 'user', content: `Task request thread:\n\n${context}` },
+      { role: 'user', content: `${userDirective ? `REQUESTER DIRECTIVE (obey this): ${userDirective}\n\n` : ''}Task request thread:\n\n${context}` },
     ],
   });
 
@@ -1742,11 +1744,12 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
 
     // ── Feature 1: Parse — returns array of tickets ──
     // App Icon requests get a specialized parser with a fixed description template
+    const userDirective = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
     const tickets = isTask && isAppIconRequest(context)
       ? await parseAppIconRequest(context)
       : isTask
-        ? await parseTaskReport(context)
-        : await parseBugReport(context);
+        ? await parseTaskReport(context, userDirective)
+        : await parseBugReport(context, userDirective);
     const beforeDedup = tickets.length;
     const dedupedTickets = dedupeTickets(tickets);
     if (dedupedTickets.length < beforeDedup) {
