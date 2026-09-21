@@ -687,7 +687,7 @@ async function analyzeThread(context, slackThreadUrl) {
 
   const squadList = Object.keys(SQUAD_ROSTER).join('\n  - ');
 
-  const systemPrompt = `You are QA Bot, the internal issue-triage assistant for Everfit — a B2B fitness coaching SaaS platform.
+  const systemPrompt = `You are QA Agent, the internal issue-triage assistant for Everfit — a B2B fitness coaching SaaS platform.
 
 Your job: read a Slack support/bug thread and return a single structured JSON object that drives both a Slack auto-reply and Jira ticket creation.
 
@@ -1256,7 +1256,7 @@ async function assessThreadBeforeFollowUp(threadContext, jiraKey, jiraStatus, as
     : `Assignee last replied ${Math.round(hoursSinceAssigneeReply / 24)} days ago — this is considered STALE.`;
 
   const raw = (await aiCall(
-    `You are QA Bot for Everfit. Decide whether to ping the dev assignee.
+    `You are QA Agent for Everfit. Decide whether to ping the dev assignee.
 
 Jira ticket: ${jiraKey}
 Jira status: ${jiraStatus}
@@ -1498,7 +1498,7 @@ async function interpretCommand(rawText) {
   const cleaned = rawText.replace(/<@[A-Z0-9]+>/g, '@member').trim().substring(0, 400);
   try {
     const raw = (await aiCall(
-      `You route messages for QA Bot, a Slack bot in Everfit bug-report channels. Users write in English or Vietnamese.
+      `You route messages for QA Agent in Everfit bug-report channels. Users write in English or Vietnamese.
 Classify the message into exactly ONE action. Return ONLY JSON: {"action":"<action>"}
 
 Actions:
@@ -1568,7 +1568,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       let reply = null;
       try {
         reply = (await aiCall(
-          `You are QA Bot, Everfit's bug-triage assistant living in Slack bug-report channels. You can: analyze issues, create Jira cards, assign devs, check ticket status, run weekly reports, give CS troubleshooting steps, and stop follow-up tracking — teammates trigger these by telling you naturally (e.g. "log this and assign to @Huy", "status?").
+          `You are QA Agent, Everfit's autonomous bug-triage assistant living in Slack bug-report channels. Speak in first person, like a capable colleague — never refer to yourself as a bot. You can: analyze issues, create Jira cards, assign devs, check ticket status, run weekly reports, give CS troubleshooting steps, and stop follow-up tracking — teammates trigger these by telling you naturally (e.g. "log this and assign to @Huy", "status?").
 
 Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 sentences. Ground your answer in the thread context when relevant (you may reference what people said, suggest which squad/platform the issue belongs to, or give a technical opinion). If they greet you or ask what you can do, respond warmly and summarize your abilities in one line. If they ask something you truly cannot help with, say so briefly. Never invent ticket numbers or statuses.`,
           `Thread context:\n${(threadCtx || '(no thread — mentioned directly in channel)').substring(0, 3000)}\n\nUser message: ${question}`,
@@ -1639,7 +1639,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
     if (doCancel) {
       const tracked = await findOrRegisterTracked(client, event.channel, threadTs, botBotId, botUserId);
       if (!tracked) {
-        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: '⚠️ No active follow-up found for this thread.' });
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: "I'm not tracking anything in this thread yet — say _\"create card\"_ or _\"follow up\"_ on a ticket and I'll start." });
       } else {
         tracked.done = true;
         await client.chat.postMessage({
@@ -1660,7 +1660,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
         .map(m => m.replace(/<@|>/g, '')).filter(id => id !== botUserId && !ASSIGNEE_BLOCKLIST.has(id));
 
       if (!mentionedUsers.length) {
-        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: `⚠️ Please mention the new assignee: \`@QA Bot reassign to @person\`` });
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: `Who should take it? Mention them — e.g. _"reassign to @person"_ — and I'll update the ticket.` });
         await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
         return;
       }
@@ -1676,14 +1676,14 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
       }
 
       if (!threadKeys.length) {
-        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: '⚠️ No tickets found in this thread.' });
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: "I couldn't find any Jira ticket in this thread to reassign. Create one first with _\"create card\"_." });
         await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
         return;
       }
 
       if (threadKeys.length > 1 && !specificKey) {
-        const list = threadKeys.map(k => `• \`@QA Bot reassign to @person ${k}\` → <${JIRA_HOST}/browse/${k}|${k}>`).join('\n');
-        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: `📋 Multiple tickets in this thread — which one?\n\n${list}` });
+        const list = threadKeys.map(k => `• <${JIRA_HOST}/browse/${k}|${k}>`).join('\n');
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: `This thread has several tickets — which one should I reassign?\n${list}\nTell me like: _"reassign to @person ${threadKeys[0]}"_` });
         await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
         return;
       }
@@ -1691,7 +1691,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
       const targetKey = (specificKey && threadKeys.includes(specificKey)) ? specificKey : threadKeys[0];
       const newJiraId = await resolveJiraAccountId(client, mentionedUsers[0]);
       if (!newJiraId) {
-        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: `⚠️ Could not find Jira account for <@${mentionedUsers[0]}>. Please assign manually.` });
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: `I couldn't match <@${mentionedUsers[0]}> to a Jira account, so I've left the assignee unchanged — please set it in Jira, or give me someone else.` });
       } else {
         await axios.put(`${JIRA_HOST}/rest/api/3/issue/${targetKey}/assignee`, { accountId: newJiraId }, {
           headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -1729,7 +1729,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
           text:
             `📋 No Jira ticket has been created for this thread yet.\n` +
             `${smPcMention} — please review this issue and either:\n` +
-            `• Create a ticket: \`@QA Bot create card\`\n` +
+            `• Create a ticket: just say \`create card\`\n` +
             `• Or assign directly to a dev member once created`,
         });
         await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
@@ -1857,7 +1857,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
     if (doTrouble) {
       await agentSt.start('⏳ _QA Agent is preparing troubleshooting steps…_');
       const reply = await aiCall(
-        `You are QA Bot for Everfit. Provide practical troubleshooting steps for the CS team to try BEFORE escalating to dev. CS are non-technical — steps must be clear and specific.
+        `You are QA Agent for Everfit. Provide practical troubleshooting steps for the CS team to try BEFORE escalating to dev. CS are non-technical — steps must be clear and specific.
 
 Format:
 🔍 *Troubleshooting suggestions* — [Platform detected]
@@ -1938,10 +1938,10 @@ Max 8 steps total. Plain English only.`,
           });
           await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, unfurl_links: false, text: `✅ <${JIRA_HOST}/browse/${targetKey}|${targetKey}> reassigned to <@${triggerAssignees[0]}>.` });
         } catch (err) {
-          await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, unfurl_links: false, text: `⚠️ Could not update <${JIRA_HOST}/browse/${targetKey}|${targetKey}> (${err.response?.status || err.message}). Please assign manually in Jira.` });
+          await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, unfurl_links: false, text: `I tried to update <${JIRA_HOST}/browse/${targetKey}|${targetKey}> but Jira refused (${err.response?.status || err.message}). Please assign manually while I keep tracking it.` });
         }
       } else {
-        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: `⚠️ Could not find Jira account for <@${triggerAssignees[0]}>. Please assign manually.` });
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: `I couldn't match <@${triggerAssignees[0]}> to a Jira account — the card is created but unassigned. Please set the assignee in Jira, or tell me someone else.` });
       }
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
@@ -1961,7 +1961,7 @@ Max 8 steps total. Plain English only.`,
     if (!newTickets.length) {
       await client.chat.postMessage({
         channel: event.channel, thread_ts: threadTs,
-        text: `⚠️ Similar tickets already exist: ${liveKeys.map(k => `<${JIRA_HOST}/browse/${k}|${k}>`).join(', ')}`,
+        text: `I held off — this thread already has ${liveKeys.map(k => `<${JIRA_HOST}/browse/${k}|${k}>`).join(', ')}. Say _"follow up"_ to track it, or _"force log"_ if you need a separate ticket.`,
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       return;
@@ -2049,7 +2049,7 @@ Max 8 steps total. Plain English only.`,
     logger.error('[Bot] Unhandled error:', err.response?.data ?? err.message);
     await client.chat.postMessage({
       channel: event.channel, thread_ts: event.thread_ts || event.ts,
-      text: `❌ Client Report Bot error: \`${err.message}\``,
+      text: `I hit an error and couldn't finish: \`${err.message}\`\nTry again in a moment — my logs have the details.`,
     });
     await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
     await client.reactions.add({ channel: event.channel, name: 'x', timestamp: event.ts }).catch(() => {});

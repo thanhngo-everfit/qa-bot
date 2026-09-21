@@ -1475,7 +1475,7 @@ async function qaChatReply(context, userText) {
     const res = await openai.chat.completions.create({
       model: 'gpt-4o', max_tokens: 350,
       messages: [
-        { role: 'system', content: `You are QA Bot, Everfit's Jira assistant living in Slack.\n${QA_CAPABILITIES}\n\nAnswer the user conversationally and helpfully in ENGLISH only, 1-4 sentences. If they greet you or ask what you can do, summarize your abilities naturally (not as a bullet dump). Ground answers in the thread context when relevant. Never invent ticket numbers or statuses.` },
+        { role: 'system', content: `You are QA Agent, Everfit's autonomous QA assistant living in Slack. Speak in first person, like a capable colleague — never refer to yourself as a bot.\n${QA_CAPABILITIES}\n\nAnswer the user conversationally and helpfully in ENGLISH only, 1-4 sentences. If they greet you or ask what you can do, summarize your abilities naturally (not as a bullet dump). Ground answers in the thread context when relevant. Never invent ticket numbers or statuses.` },
         { role: 'user', content: `Thread context:\n${(context || '(no thread)').substring(0, 2500)}\n\nUser message: ${userText}` },
       ],
     });
@@ -1511,7 +1511,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       const reply = await qaChatReply('', event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
       await client.chat.postMessage({
         channel: event.channel, thread_ts: event.ts, unfurl_links: false,
-        text: reply || '👋 Tag me inside a bug/task thread and I\'ll log it to Jira — Bug or Task auto-detected, with Epic, Fix Version and Active Sprint set. Or just tell me what you need.',
+        text: reply || "👋 I'm QA Agent — drop me into any bug or task thread and I'll take it from there: log it to Jira with the right Epic, Fix Version and Active Sprint, follow up on existing tickets, or answer questions. What do you need?",
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       await client.reactions.add({ channel: event.channel, name: 'speech_balloon', timestamp: event.ts }).catch(() => {});
@@ -1604,9 +1604,8 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       await client.chat.postMessage({
         channel: event.channel, thread_ts: threadTs,
         text:
-          `⚠️ This thread already has logged ticket(s): ${ticketLinks}\n` +
-          `If you still want to create a new ticket, reply with:\n` +
-          `\`@qa-bot force log\``,
+          `I checked this thread first — it already has ${ticketLinks}, so I didn't create a duplicate.\n` +
+          `Say _"follow up"_ and I'll track the existing ticket, or _"force log"_ if you really need a separate one.`,
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       await client.reactions.add({ channel: event.channel, name: 'warning', timestamp: event.ts }).catch(() => {});
@@ -1634,8 +1633,8 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       await client.chat.postMessage({
         channel: event.channel, thread_ts: threadTs,
         text:
-          `⚠️ I couldn't extract a ${issueType.toLowerCase()} from this thread. ` +
-          `Please make sure the thread describes the issue or request (not just assign commands), then tag me again.`,
+          `I read through the thread but couldn't find a clear ${issueType.toLowerCase()} to log — it looks like mostly discussion. ` +
+          `Add a message describing the issue or request, then tag me again and I'll take it from there.`,
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       await client.reactions.add({ channel: event.channel, name: 'warning', timestamp: event.ts }).catch(() => {});
@@ -1785,18 +1784,18 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     }
 
     // ── Build Slack response ──────────────────
-    const headline = isTask ? '📋 *Task created!*' : '🐛 *Bug logged!*';
+    const headline = isTask ? "📋 Done — I've created a Task" : "🐛 Done — I've logged this bug";
     const lines = createdJiras.map(({ jira, ticket, assigneeSlackIds, uploaded, acCount }) => {
       const assigneeLine = assigneeSlackIds.length > 0
-        ? `Assigned to ${assigneeSlackIds.map(id => `<@${id}>`).join(', ')}`
-        : '_No assignee — please assign in Jira_';
+        ? `assigned to ${assigneeSlackIds.map(id => `<@${id}>`).join(', ')}`
+        : "_I couldn't match an assignee — please assign in Jira_";
       const attachLine = uploaded > 0 ? ` · 📎 ${uploaded}` : '';
       const acLine     = acCount > 0 ? ` · ✅ ${acCount} AC` : '';
       return (
         `${headline} → <${jira.url}|${jira.key}>\n` +
         `*${ticket.summary}*\n` +
-        `Priority: *${ticket.priority}* · Platform: *${ticket.platform}*\n` +
-        `${assigneeLine}${attachLine}${acLine}`
+        `*${ticket.priority}* priority · *${ticket.platform}* · ${assigneeLine}${attachLine}${acLine}\n` +
+        `_Epic, Fix Version and Active Sprint are set. Tag me anytime to follow up._`
       );
     });
 
@@ -1805,7 +1804,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     const responseText = lines.join('\n\n') + epicLine;
     await client.chat.postMessage({
       channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-      text: responseText || '⚠️ No tickets were created — check Railway logs for details.',
+      text: responseText || "Something went wrong on my side — I wasn't able to create the ticket this time. Try tagging me again in a moment.",
     });
 
     await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
@@ -1819,9 +1818,8 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       await client.chat.postMessage({
         channel: event.channel, thread_ts: event.thread_ts || event.ts,
         text:
-          `❌ QABot error: Missing Slack permission scope \`${needed}\`.
-` +
-          `Ask an admin to add this scope at *api.slack.com/apps → OAuth & Permissions → Bot Token Scopes*.`,
+          `I couldn't finish — I'm missing the Slack permission \`${needed}\`. ` +
+          `An admin can add it at *api.slack.com/apps → OAuth & Permissions → Bot Token Scopes* and reinstall me, then I'll be able to do this.`,
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       await client.reactions.add({ channel: event.channel, name: 'x', timestamp: event.ts }).catch(() => {});
@@ -1836,7 +1834,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     logger.error('[QABot]', err.response?.data ?? err.message);
     await client.chat.postMessage({
       channel: event.channel, thread_ts: event.thread_ts || event.ts,
-      text: `❌ QABot error: \`${errDetail}\``,
+      text: `I hit an error while working on this and couldn't finish: \`${errDetail}\`\nGive it another try in a moment — if it keeps failing, my logs have the details.`,
     });
     await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
     await client.reactions.add({ channel: event.channel, name: 'x', timestamp: event.ts }).catch(() => {});
