@@ -235,7 +235,12 @@ async function getThread(client, channelId, threadTs) {
   const lines  = await Promise.all((result.messages || []).map(async msg => {
     let name = msg.username || msg.user || 'user';
     try { name = (await client.users.info({ user: msg.user })).user?.real_name || name; } catch (_) {}
-    const text = (msg.text || '').replace(/<@([A-Z0-9]+)>/g, (_, uid) => `@${uid}`);
+    let text = msg.text || '';
+    for (const uid of [...new Set([...text.matchAll(/<@([A-Z0-9]+)>/g)].map(m => m[1]))]) {
+      let uname = uid;
+      try { uname = (await client.users.info({ user: uid })).user?.real_name || uid; } catch (_) {}
+      text = text.split(`<@${uid}>`).join(`@${uname}`);
+    }
     // Include relative time so Claude knows how old each message is
     const msgMs   = parseFloat(msg.ts) * 1000;
     const hoursAgo = Math.round((nowMs - msgMs) / (60 * 60 * 1000));
@@ -1510,13 +1515,14 @@ Actions:
 - "troubleshoot": ask for CS troubleshooting steps ("how to fix", "hướng dẫn xử lý", "steps to try")
 - "cancel": stop follow-up pings ("stop reminding", "đừng ping nữa", "cancel tracking", "done tracking")
 - "weekly_report": generate the weekly summary ("weekly report", "báo cáo tuần", "run report")
+- "task": substantive work on this thread that is NONE of the above — summarize, extract/list items, draft a message/reply/announcement, translate, compare, review, write documentation ("tóm tắt thread", "summary all items", "draft a reply to the coach", "translate this for CS")
 - "unknown": greetings, thanks, or anything else
 
 JSON only, no other text.`,
       cleaned, 50, true, 'gpt-4o'
     )).trim();
     const parsed = JSON.parse(raw.substring(raw.indexOf('{'), raw.lastIndexOf('}') + 1));
-    const valid = ['analyze', 'create_card', 'assign', 'reassign', 'followup', 'troubleshoot', 'cancel', 'weekly_report'];
+    const valid = ['analyze', 'create_card', 'assign', 'reassign', 'followup', 'troubleshoot', 'cancel', 'weekly_report', 'task'];
     return valid.includes(parsed.action) ? parsed.action : 'unknown';
   } catch { return 'unknown'; }
 }
@@ -1559,6 +1565,29 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     const doCancel   = isCancel         || aiAction === 'cancel';
     const doReassign = isChangeAssignee || aiAction === 'reassign';
     const aiWantsAssign = aiAction === 'assign' || triggerText.startsWith('assign to');
+
+    if (aiAction === 'task') {
+      const taskSt = agentStatus(client, event.channel, event.thread_ts || event.ts);
+      await taskSt.start('⏳ _QA Agent is working on it…_');
+      const threadCtx = event.thread_ts ? await getThread(client, event.channel, event.thread_ts).catch(() => '') : '';
+      let result = null;
+      try {
+        result = (await aiCall(
+          `You are QA Agent, Everfit's autonomous QA assistant in Slack bug-report channels. A teammate tagged you with a work request. Do the work fully and directly — summarize, extract/list items, draft messages or replies, translate, compare, review, analyze — whatever they asked.
+Rules: Output in ENGLISH only. Use Slack formatting (*bold*, • bullets), no markdown headers. Refer to people by the names in the transcript — NEVER raw Slack IDs. Deliver the work product itself with no preamble. If the thread lacks information, give the best partial result and state what's missing. Never invent ticket numbers, links, or facts.`,
+          `Thread transcript:\n${(threadCtx || '(no thread)').substring(0, 12000)}\n\nRequest: ${event.text.replace(/<@[A-Z0-9]+>/g, '').trim()}`,
+          1800, false, 'gpt-4o'
+        )).trim();
+      } catch (err) { logger.warn('[Bot] Task work failed:', err.message); }
+      await taskSt.done();
+      await client.chat.postMessage({
+        channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false,
+        text: result || "I couldn't complete that from what's in this thread — give me a bit more detail on what you need.",
+      });
+      await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+      await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
+      return;
+    }
 
     if (!doAnalyze && !doWeekly && !doCreate && !doFollowup && !doTrouble && !doCancel && !doReassign) {
       // Conversational fallback — answer directly like an assistant instead
