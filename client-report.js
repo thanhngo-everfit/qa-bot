@@ -1117,6 +1117,65 @@ function registerFollowUp({ channelId, threadTs, jiraKey, jiraUrl, squad }) {
   console.log(`[FollowUp] Registered ${jiraKey} (squad: ${squad || 'unknown'})`);
 }
 
+// ── Rebuild follow-up state from Jira (authoritative, any age) ────
+// Every bot-created client-report ticket has its Slack thread link in
+// the description. Query ALL open client-report tickets from Jira and
+// re-register each one — works for tickets of any age, fully automatic,
+// no thread re-tagging ever needed.
+function extractTextAndLinks(adfNode, out) {
+  if (!adfNode) return;
+  if (adfNode.text) out.push(adfNode.text);
+  if (adfNode.marks) for (const m of adfNode.marks) if (m.type === 'link' && m.attrs?.href) out.push(m.attrs.href);
+  if (adfNode.attrs?.href) out.push(adfNode.attrs.href);
+  if (Array.isArray(adfNode.content)) for (const c of adfNode.content) extractTextAndLinks(c, out);
+}
+
+async function rebuildFollowUpsFromJira() {
+  const DONE_STATUSES = ['qa success', 'done', 'released', 'closed'];
+  let restored = 0, startAt = 0;
+  try {
+    for (let page = 0; page < 4; page++) {           // up to 400 tickets
+      const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
+        params: {
+          jql: `project = ${JIRA_PROJECT} AND fixVersion = 27643 AND statusCategory != Done ORDER BY created DESC`,
+          maxResults: 100, startAt,
+          fields: 'summary,status,description',
+        },
+        headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+      });
+      const issues = res.data?.issues || [];
+      for (const issue of issues) {
+        const jiraKey = issue.key;
+        if (followUpStore.has(jiraKey)) continue;
+        const status = (issue.fields?.status?.name || '').toLowerCase();
+        if (DONE_STATUSES.includes(status)) continue;
+
+        const parts = [];
+        extractTextAndLinks(issue.fields?.description, parts);
+        const blob = parts.join(' ');
+        // Slack archives URL → channel + thread ts (p1783947962832559 → 1783947962.832559)
+        const m = blob.match(/slack\.com\/archives\/(C[A-Z0-9]+)\/p(\d{10})(\d{6})/);
+        if (!m || !MONITORED_CHANNELS[m[1]]) continue;
+
+        const squad = detectSquadFromKeywords(`${issue.fields?.summary || ''} ${blob}`);
+        registerFollowUp({
+          channelId: m[1],
+          threadTs:  `${m[2]}.${m[3]}`,
+          jiraKey,
+          jiraUrl:   `${JIRA_HOST}/browse/${jiraKey}`,
+          squad,
+        });
+        restored++;
+      }
+      startAt += issues.length;
+      if (issues.length < 100) break;
+    }
+    console.log(`[FollowUp] Jira rebuild: re-registered ${restored} open client-report ticket(s)`);
+  } catch (err) {
+    console.warn('[FollowUp] Jira rebuild failed:', err.response?.status || err.message);
+  }
+}
+
 // ── Rebuild follow-up state from channel history ─────────────────
 // Follow-up state is in-memory: it is empty after every deploy, and
 // tickets tracked by the retired Client Report Bot are unknown to this
@@ -2383,7 +2442,9 @@ function register(realApp, realOpenai) {
   openai = realOpenai;
   loadKnowledgeBase();
   hydrateRosterIds(realApp.client).catch(() => {});
-  rebuildFollowUpsFromHistory(realApp.client).catch(err => console.warn('[FollowUp] Rebuild error:', err.message));
+  rebuildFollowUpsFromJira()
+    .then(() => rebuildFollowUpsFromHistory(realApp.client))
+    .catch(err => console.warn('[FollowUp] Rebuild error:', err.message));
   for (const [name, handler] of _registrations) realApp.event(name, handler);
   startFollowUpScheduler(realApp.client);
   startWeeklyReportScheduler(realApp.client);
