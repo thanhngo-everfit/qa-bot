@@ -684,7 +684,7 @@ async function createJiraIssue(ticket, jiraAccountIds) {
 // CORE AI ANALYSIS  ─  single Sonnet 4 call
 // ─────────────────────────────────────────────
 
-async function analyzeThread(context, slackThreadUrl) {
+async function analyzeThread(context, slackThreadUrl, userDirective = '') {
   // Trim KB to avoid hitting token limits while keeping the most useful sections
   const kbSection = KNOWLEDGE_BASE
     ? `\n\n---\n📚 KNOWLEDGE BASE — use patterns below to determine severity and resolution steps:\n${KNOWLEDGE_BASE.substring(0, 7000)}\n---\n`
@@ -787,10 +787,20 @@ TICKET CLASSIFICATION:
   - Bug: something broken, crashing, not working as designed
   - Task: account/data change, feature request, configuration, access request
 
-TWO-TICKET RULE — create 2 tickets ONLY when BOTH are true:
-  1. An immediate data/account fix is needed right now (type=Task)
-  2. A code/root-cause fix is also needed (type=Bug or Task)
-  Otherwise: 1 ticket only.
+TICKET COUNT — decide from the thread content:
+  - Default for a single reported problem: 1 ticket.
+  - MULTIPLE DISTINCT ISSUES → MULTIPLE TICKETS: if the thread identifies
+    several distinct issues (numbered sections like "1./2./3." or "####",
+    separate root causes, different features/screens/symptoms), create ONE
+    TICKET PER DISTINCT ISSUE — up to 6. Each ticket gets its own accurate
+    title, platform, and description built from that issue's own details.
+    NEVER collapse distinct diagnosed issues into one generic ticket like
+    "app experiencing random issues".
+  - Data-fix + root-cause pattern → 2 tickets (Task for the immediate fix,
+    Bug for the code fix).
+  - If the REQUESTER DIRECTIVE asks for a ticket per issue ("create tickets
+    for each issue", "log 5 cards", "tách card từng lỗi"), one ticket per
+    issue is MANDATORY, not optional.
 
 TITLE PREFIX FORMAT (required, never leave the description after brackets empty):
   Bug from client/coach    → [Client Report][Platform][Feature] Short description
@@ -877,7 +887,12 @@ DESCRIPTION TEMPLATE (Task / Data fix) — use this EXACT structure with ## sect
 ISSUE TYPE RULE: broken/incorrect behavior → Bug. Data fix, config change, account/email update, enable feature, export request, or any "please do X" → Task. Pick per ticket.
 Do NOT include the Slack thread link in the description — it is appended automatically as a Reference section.`;
 
-  const rawResponse = await aiCall(systemPrompt, `Slack thread:\n\n${context}`, 3500, true); // jsonMode
+  const userContent = userDirective
+    ? `REQUESTER DIRECTIVE (obey this): ${userDirective}\n\nSlack thread:\n\n${context}`
+    : `Slack thread:\n\n${context}`;
+  // Explicit user commands get the stronger model and a larger budget so
+  // multi-ticket outputs (5-6 full descriptions) never truncate mid-JSON.
+  const rawResponse = await aiCall(systemPrompt, userContent, userDirective ? 6000 : 3500, true, userDirective ? 'gpt-4o' : 'gpt-4o-mini'); // jsonMode
 
   // Robust JSON extraction: strip fences, then take first { … last }
   let raw = rawResponse.replace(/```json|```/g, '').trim();
@@ -1105,13 +1120,14 @@ async function resolveEmailToSlackId(client, email, displayName = null) {
 
 // ── Register a thread+ticket for follow-up ────
 // Called after create card, or when scanning a thread with any UP-XXXXX
-function registerFollowUp({ channelId, threadTs, jiraKey, jiraUrl, squad }) {
+function registerFollowUp({ channelId, threadTs, jiraKey, jiraUrl, squad, assigneeSlackHint = null }) {
   if (followUpStore.has(jiraKey)) return; // already tracked
   followUpStore.set(jiraKey, {
     channelId,
     threadTs,
     jiraKey,
     jiraUrl,
+    assigneeSlackHint,   // Slack ID we assigned at creation — exact, no name-search ambiguity
     squad:           squad || null,
     lastStatus:      null,
     lastStatusAt:    Date.now(),
@@ -1330,8 +1346,12 @@ function startFollowUpScheduler(client) {
           item.lastStatusAt = Date.now();
         }
 
-        // ── 2. Resolve assignee Slack ID fresh from Jira ──
-        const assigneeSlackId = await resolveEmailToSlackId(client, assigneeEmail, assigneeDisplay);
+        // ── 2. Resolve assignee Slack ID: email (exact) → creation hint → name search ──
+        // Name search is last resort only: ambiguous names (two "Thanh Tran"s)
+        // have pinged the wrong person before.
+        let assigneeSlackId = assigneeEmail ? await resolveEmailToSlackId(client, assigneeEmail, null) : null;
+        if (!assigneeSlackId && item.assigneeSlackHint) assigneeSlackId = item.assigneeSlackHint;
+        if (!assigneeSlackId && assigneeDisplay) assigneeSlackId = await resolveEmailToSlackId(client, null, assigneeDisplay);
         const assigneeMention = assigneeSlackId
           ? `<@${assigneeSlackId}>`
           : assigneeDisplay ? `*${assigneeDisplay}*` : '_unassigned_';
@@ -1934,8 +1954,8 @@ Max 8 steps total. Plain English only.`,
     // Run analysis to get ticket details
     logger.info('[Bot] Create card — analyzing thread...');
     await agentSt.start('⏳ _Dispatching to QA Agent — reading the thread…_');
-    await agentSt.update('🧠 _QA Agent is analyzing and drafting the ticket…_');
-    const analysis = await analyzeThread(context, slackThreadUrl);
+    await agentSt.update('🧠 _QA Agent is analyzing and drafting the ticket(s)…_');
+    const analysis = await analyzeThread(context, slackThreadUrl, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
     await agentSt.update('🎫 _QA Agent is creating the Jira card…_');
     logger.info(`[Bot] Severity=${analysis.severity} · tickets=${analysis.tickets.length}`);
 
@@ -2060,6 +2080,7 @@ Max 8 steps total. Plain English only.`,
         jiraKey: jira.key,
         jiraUrl: jira.url,
         squad:   ticket.squad || squad,
+        assigneeSlackHint: assigneeSlackId || null,
       });
 
       createdJiras.push({ jira, ticket, assigneeSlackIds: assigneeSlackId ? [assigneeSlackId] : [], uploadedCount });
