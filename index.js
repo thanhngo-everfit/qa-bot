@@ -15,6 +15,28 @@ const slackApp = new App({
 });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// ── Model access fallback ────────────────────────────────────────────
+// The OpenAI project key may not have every model enabled (403 "does not
+// have access to model"). Preferred smart model is configurable via env;
+// any model-access failure falls back to gpt-4o-mini so the agent keeps
+// working instead of erroring at the user.
+const SMART_MODEL = process.env.OPENAI_SMART_MODEL || 'gpt-4o';
+let _smartModelBroken = false;
+async function aiComplete(params) {
+  const wanted = _smartModelBroken && params.model !== 'gpt-4o-mini' ? 'gpt-4o-mini' : params.model;
+  try {
+    return await openai.chat.completions.create({ ...params, model: wanted });
+  } catch (err) {
+    const msg = `${err?.message || ''}`;
+    if (wanted !== 'gpt-4o-mini' && (err?.status === 403 || /does not have access to model/i.test(msg))) {
+      if (!_smartModelBroken) console.warn(`[AI] Model "${wanted}" not enabled on this OpenAI project — falling back to gpt-4o-mini for all smart calls. Enable it in the OpenAI dashboard or set OPENAI_SMART_MODEL.`);
+      _smartModelBroken = true;
+      return await openai.chat.completions.create({ ...params, model: 'gpt-4o-mini' });
+    }
+    throw err;
+  }
+}
+
 function jiraAuth() {
   return 'Basic ' + Buffer.from(`${process.env.JIRA_EMAIL}:${process.env.JIRA_API_TOKEN}`).toString('base64');
 }
@@ -247,7 +269,7 @@ async function classifyIssueType(triggerText, threadContext) {
 
   // ── AI fallback: no clear keyword found ──
   try {
-    const res = await openai.chat.completions.create({
+    const res = await aiComplete({
       model:      'gpt-4o-mini',
       max_tokens: 10,
       messages: [
@@ -311,7 +333,7 @@ function buildFallbackSummary(context, platform) {
 }
 
 async function parseBugReport(context) {
-  const res = await openai.chat.completions.create({
+  const res = await aiComplete({
     model:      'gpt-4o-mini',
     max_tokens: 3000,
     messages: [
@@ -451,7 +473,7 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the f
 
 // ── Parse a TASK request from a Slack thread ─────
 async function parseTaskReport(context) {
-  const res = await openai.chat.completions.create({
+  const res = await aiComplete({
     model:      'gpt-4o-mini',
     max_tokens: 3000,
     messages: [
@@ -553,7 +575,7 @@ function isAppIconRequest(threadContext) {
 
 // ── Parse App Icon Update request ────────────────────────────────────────
 async function parseAppIconRequest(context) {
-  const res = await openai.chat.completions.create({
+  const res = await aiComplete({
     model:      'gpt-4o-mini',
     max_tokens: 500,
     messages: [
@@ -1463,8 +1485,8 @@ async function getIssueSnapshot(issueKey) {
 
 async function agentRoute(userText, context, existingKeys) {
   try {
-    const res = await openai.chat.completions.create({
-      model: 'gpt-4o', max_tokens: 60,
+    const res = await aiComplete({
+      model: SMART_MODEL, max_tokens: 60,
       response_format: { type: 'json_object' },
       messages: [
         { role: 'system', content: `You are the decision core of QA Agent, a Jira assistant in Slack. Users write English or Vietnamese. Decide ONE action for the user's mention. Return ONLY JSON: {"action":"log_ticket"|"follow_up"|"task"|"answer"}
@@ -1490,8 +1512,8 @@ A bare tag (empty message) with existing tickets \u2192 "follow_up". A bare tag 
 // ── General task worker: QA Agent does ANY requested knowledge work ──
 async function qaTaskWork(context, userText) {
   try {
-    const res = await openai.chat.completions.create({
-      model: 'gpt-4o', max_tokens: 1800,
+    const res = await aiComplete({
+      model: SMART_MODEL, max_tokens: 1800,
       messages: [
         { role: 'system', content: `You are QA Agent, Everfit's autonomous QA assistant in Slack. A teammate tagged you in a thread with a work request. Do the work fully and directly — summarize, extract/list items, draft messages or announcements, translate, compare, plan tests, review, analyze — whatever they asked.
 
@@ -1511,8 +1533,8 @@ Rules:
 
 async function qaChatReply(context, userText) {
   try {
-    const res = await openai.chat.completions.create({
-      model: 'gpt-4o', max_tokens: 350,
+    const res = await aiComplete({
+      model: SMART_MODEL, max_tokens: 350,
       messages: [
         { role: 'system', content: `You are QA Agent, Everfit's autonomous QA assistant living in Slack. Speak in first person, like a capable colleague — never refer to yourself as a bot.\n${QA_CAPABILITIES}\n\nAnswer the user conversationally and helpfully in ENGLISH only, 1-4 sentences. If they greet you or ask what you can do, summarize your abilities naturally (not as a bullet dump). Ground answers in the thread context when relevant. Never invent ticket numbers or statuses.` },
         { role: 'user', content: `Thread context:\n${(context || '(no thread)').substring(0, 2500)}\n\nUser message: ${userText}` },

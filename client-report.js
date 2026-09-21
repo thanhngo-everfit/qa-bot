@@ -172,8 +172,27 @@ const _registrations = [];
 const slackApp = { event: (name, handler) => _registrations.push([name, handler]) };
 
 // ── OpenAI wrapper ──
+// Model-access fallback: 403 "does not have access to model" → gpt-4o-mini
+async function openaiCreateWithFallback(params) {
+  try {
+    return await openai.chat.completions.create(params);
+  } catch (err) {
+    const msg = `${err?.message || ''}`;
+    if (params.model !== 'gpt-4o-mini' && (err?.status === 403 || /does not have access to model/i.test(msg))) {
+      if (!_smartModelBroken) console.warn(`[AI] Model "${params.model}" not enabled on this OpenAI project — falling back to gpt-4o-mini for all smart calls. Enable it in the OpenAI dashboard or set OPENAI_SMART_MODEL.`);
+      _smartModelBroken = true;
+      return await openai.chat.completions.create({ ...params, model: 'gpt-4o-mini' });
+    }
+    throw err;
+  }
+}
+
+const SMART_MODEL = process.env.OPENAI_SMART_MODEL || 'gpt-4o';
+let _smartModelBroken = false;
 async function aiCall(system, userContent, maxTokens = 1000, jsonMode = false, model = 'gpt-4o-mini') {
-  const res = await openai.chat.completions.create({
+  if (model === 'gpt-4o') model = SMART_MODEL;          // env-configurable smart model
+  if (_smartModelBroken && model !== 'gpt-4o-mini') model = 'gpt-4o-mini';
+  const res = await openaiCreateWithFallback({
     model,
     max_tokens: maxTokens,
     ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
