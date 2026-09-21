@@ -1446,7 +1446,7 @@ async function qaChatReply(context, userText) {
         { role: 'user', content: `Thread context:\n${(context || '(no thread)').substring(0, 2500)}\n\nUser message: ${userText}` },
       ],
     });
-    return res.choices[0].message.content?.trim() || null;
+    return lib.slackify(res.choices[0].message.content?.trim()) || null;
   } catch { return null; }
 }
 

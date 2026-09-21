@@ -1595,6 +1595,7 @@ Rules: Output in ENGLISH only. Use Slack formatting (*bold*, • bullets), no ma
           1800, false, 'gpt-4o'
         )).trim();
       } catch (err) { logger.warn('[Bot] Task work failed:', err.message); }
+      result = require('./lib').slackify(result);
       await taskSt.done();
       await agentSt.done();
       await client.chat.postMessage({

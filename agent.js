@@ -11,7 +11,7 @@ const axios = require('axios');
 const {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   aiComplete, getActiveSprintId, getIssueSnapshot,
-  resolveInlineMentions, resolveUserName, gatherChannelContext,
+  resolveInlineMentions, resolveUserName, gatherChannelContext, slackify,
 } = require('./lib');
 
 // ── Tool schemas the model sees ──────────────────────────────────────
@@ -283,7 +283,7 @@ Rules:
     messages.push(msg);
 
     if (!msg.tool_calls || !msg.tool_calls.length) {
-      return msg.content?.trim() || "I couldn't produce a result for that — try rephrasing.";
+      return slackify(msg.content?.trim()) || "I couldn't produce a result for that — try rephrasing.";
     }
 
     for (const tc of msg.tool_calls) {

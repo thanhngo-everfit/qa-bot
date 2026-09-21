@@ -211,6 +211,21 @@ async function gatherChannelContext(client, channelId, { days = 14, maxThreads =
   return { context: context.substring(0, 30000), note: null };
 }
 
+// ── slackify: normalize AI output for Slack ──────────────────────────
+// Models (especially gpt-4o-mini) leak markdown: **bold**, ### headers,
+// [text](url). Slack needs *bold* and <url|text>. Also auto-link every
+// bare Jira key so UP-78287 is always clickable.
+function slackify(text) {
+  if (!text) return text;
+  let out = text;
+  out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<$2|$1>');   // [t](url) → <url|t>
+  out = out.replace(/^#{1,4}\s+(.+)$/gm, '*$1*');                          // headers → bold
+  out = out.replace(/\*\*([^*\n]+)\*\*/g, '*$1*');                        // **b** → *b*
+  out = out.replace(/(<[^>]*>)|\b(UP|PLAN)-(\d+)\b/g, (m, link, proj, num) =>
+    link ? link : `<${JIRA_HOST}/browse/${proj}-${num}|${proj}-${num}>`);  // bare keys → links
+  return out;
+}
+
 // ── General task worker: QA Agent does ANY requested knowledge work ──
 async function qaTaskWork(context, userText, maxChars = 12000) {
   try {
@@ -229,7 +244,7 @@ Rules:
         { role: 'user', content: `Transcript (may contain MULTIPLE threads from the channel, plus a LIVE JIRA STATUS section — treat that section as the current source of truth for ticket status):\n${(context || '(no thread)').substring(0, maxChars)}\n\nRequest: ${userText}` },
       ],
     });
-    return res.choices[0].message.content?.trim() || null;
+    return slackify(res.choices[0].message.content?.trim()) || null;
   } catch { return null; }
 }
 
@@ -239,4 +254,5 @@ module.exports = {
   agentStatus, getActiveSprintId, getIssueSnapshot,
   resolveUserName, resolveInlineMentions, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
+  slackify,
 };
