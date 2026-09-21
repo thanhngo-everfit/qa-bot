@@ -1417,19 +1417,57 @@ const QA_CAPABILITIES = `Your abilities:
 • "create task" forces a Task · "force log" logs even when the thread already has a ticket · including an epic key (UP-xxxx / PLAN-xxxx) parents the ticket to it
 • In the client-report channels (bug_reporting-internal, enterprise_bug_reporting_internal, customer-request-discussion) you additionally auto-analyze every new report, create & assign cards from natural language ("assign to @dev", "giao cho @dev"), run follow-up tracking, and post weekly reports`;
 
-async function classifyQaMentionIntent(triggerText) {
+// ── Agent router: gather context → AI decides the action ──
+async function scanThreadTicketKeys(client, channelId, threadTs) {
+  const keys = [];
+  try {
+    const replies = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 100 });
+    const textOf = (m) => {
+      const parts = [m.text || ''];
+      for (const att of m.attachments || []) parts.push(att.title || '', att.text || '', att.fallback || '', att.title_link || '', att.from_url || '');
+      const walk = (blocks) => { for (const b of blocks || []) { if (b.text && b.text.text) parts.push(b.text.text); if (b.url) parts.push(b.url); if (b.elements) walk(b.elements); if (b.fields) for (const f of b.fields) parts.push(f.text || ''); } };
+      walk(m.blocks);
+      return parts.join(' ');
+    };
+    for (const m of replies.messages || []) {
+      for (const k of textOf(m).match(/UP-\d+/g) || []) if (!keys.includes(k)) keys.push(k);
+    }
+  } catch (_) {}
+  return keys;
+}
+
+async function getIssueSnapshot(issueKey) {
+  try {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/issue/${issueKey}?fields=status,assignee,summary`, {
+      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+    });
+    const f = res.data?.fields || {};
+    return { key: issueKey, status: f.status?.name || 'Unknown', assignee: f.assignee?.displayName || null, summary: f.summary || '' };
+  } catch { return null; }
+}
+
+async function agentRoute(userText, context, existingKeys) {
   try {
     const res = await openai.chat.completions.create({
-      model: 'gpt-4o', max_tokens: 20,
+      model: 'gpt-4o', max_tokens: 60,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: 'A user tagged a Jira-logging Slack bot. Decide if they want the bot to LOG/CREATE a Jira ticket from the thread ("log") or are just chatting/greeting/asking a question ("chat"). Vietnamese and English both occur. Requests like "log this", "tạo ticket", "lên card", "create bug" → log. Greetings, thanks, "what can you do", opinion/status questions → chat. Return ONLY JSON: {"intent":"log"} or {"intent":"chat"}' },
-        { role: 'user', content: triggerText.substring(0, 300) },
+        { role: 'system', content: `You are the decision core of QA Agent, a Jira assistant in Slack. Users write English or Vietnamese. Decide ONE action for the user's mention. Return ONLY JSON: {"action":"log_ticket"|"follow_up"|"answer"}
+
+Actions:
+- "log_ticket": user wants a NEW Jira ticket created from this thread ("log this", "t\u1ea1o ticket", "l\u00ean card", or a bare tag in a thread with NO existing ticket)
+- "follow_up": user wants status/progress/tracking of the EXISTING ticket(s) in this thread ("follow up on this", "theo d\u00f5i", "status?", "track this", "any update", "check ti\u1ebfn \u0111\u1ed9", "nh\u1eafc dev gi\u00fap")
+- "answer": greeting, question, opinion, summary request, anything conversational
+
+CRITICAL RULE: Existing tickets in thread: ${existingKeys.length ? existingKeys.join(', ') : 'NONE'}.
+If tickets already exist, "log_ticket" is almost never right \u2014 requests mentioning the issue, tracking, or checking route to "follow_up". Only choose "log_ticket" despite existing tickets if the user EXPLICITLY asks for a new/additional/separate ticket.
+A bare tag (empty message) with existing tickets \u2192 "follow_up". A bare tag with none \u2192 "log_ticket".` },
+        { role: 'user', content: `User message: ${userText || '(bare tag, no text)'}\n\nThread (truncated):\n${(context || '').substring(0, 2000)}` },
       ],
     });
     const parsed = JSON.parse(res.choices[0].message.content || '{}');
-    return parsed.intent === 'chat' ? 'chat' : 'log';
-  } catch { return 'log'; } // on any failure, preserve original behavior
+    return ['log_ticket', 'follow_up', 'answer'].includes(parsed.action) ? parsed.action : 'log_ticket';
+  } catch { return 'log_ticket'; } // on failure, original behavior
 }
 
 async function qaChatReply(context, userText) {
@@ -1480,22 +1518,59 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       return;
     }
 
-    // Conversational mentions must not create tickets: if the trigger text
-    // is present and isn't an explicit log/task command, ask AI whether the
-    // user wants a ticket or is just talking. Bare tags keep logging as before.
-    if (triggerText && !isForceLog && !/^create\s?(task|ticket)/.test(triggerText)) {
-      const mentionIntent = await classifyQaMentionIntent(triggerText);
-      if (mentionIntent === 'chat') {
-        logger.info(`[QABot] Chat intent: "${triggerText.substring(0, 50)}"`);
+    // ── Agent decision: what does the user actually want? ──
+    // Explicit commands skip the router: force log / create task always log.
+    if (!isForceLog && !/^create\s?(task|ticket)/.test(triggerText)) {
+      const existingKeys = await scanThreadTicketKeys(client, event.channel, threadTs);
+      const action = await agentRoute(triggerText, context, existingKeys);
+      logger.info(`[QAAgent] route="${action}" existing=[${existingKeys.join(',')}] msg="${triggerText.substring(0, 50)}"`);
+
+      if (action === 'answer') {
         const reply = await qaChatReply(context, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
         await client.chat.postMessage({
           channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-          text: reply || 'Just tell me what you need — e.g. tag me in a bug thread to log it, or say "create task".',
+          text: reply || 'Just tell me what you need \u2014 log a ticket, follow up on one, or ask me anything about this thread.',
         });
         await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
         await client.reactions.add({ channel: event.channel, name: 'speech_balloon', timestamp: event.ts }).catch(() => {});
         return;
       }
+
+      if (action === 'follow_up') {
+        if (!existingKeys.length) {
+          await client.chat.postMessage({
+            channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+            text: `I don't see any Jira ticket in this thread yet \u2014 say _"log this"_ and I'll create one first.`,
+          });
+        } else {
+          const lines = [];
+          for (const key of existingKeys.slice(0, 5)) {
+            const snap = await getIssueSnapshot(key);
+            if (!snap) continue;
+            const done = ['qa success', 'done', 'released', 'closed'].includes(snap.status.toLowerCase());
+            lines.push(`${done ? '\u2705' : '\ud83d\udd0e'} <${JIRA_HOST}/browse/${key}|${key}> \u2014 *${snap.status}*${snap.assignee ? ` \u00b7 ${snap.assignee}` : ''}`);
+            if (!done) {
+              clientReport.registerFollowUp({
+                channelId: event.channel, threadTs, jiraKey: key,
+                jiraUrl: `${JIRA_HOST}/browse/${key}`, squad: null,
+              });
+            }
+          }
+          const anyOpen = lines.some(l => l.startsWith('\ud83d\udd0e'));
+          lines.push('');
+          lines.push(anyOpen
+            ? `_I'm tracking this \u2014 I'll follow up with the assignee every 2 business days until it's closed._`
+            : `_All tickets here are already closed \u2014 nothing to track._`);
+          await client.chat.postMessage({
+            channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+            text: lines.join('\n'),
+          });
+        }
+        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+        await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
+        return;
+      }
+      // action === 'log_ticket' falls through to the creation pipeline below
     }
 
     const agentSt = agentStatus(client, event.channel, threadTs);

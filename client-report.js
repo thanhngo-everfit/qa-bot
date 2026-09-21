@@ -2491,4 +2491,4 @@ function register(realApp, realOpenai) {
   console.log('✅ [ClientReport] module active (gpt-4o-mini) — monitoring:', Object.values(MONITORED_CHANNELS).join(', '));
 }
 
-module.exports = { register, MONITORED_CHANNELS };
+module.exports = { register, MONITORED_CHANNELS, registerFollowUp };
