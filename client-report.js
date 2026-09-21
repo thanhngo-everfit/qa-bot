@@ -1915,17 +1915,38 @@ async function enrichThread(client, channelId, msg, botUserId) {
   let englishSummary = null, inThreadAssigneeId = null, inThreadAssigneeName = null;
 
   try {
-    const replies = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 });
+    const replies = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 100 });
     const allText = [];
     const assignRe = /nhờ|help|check|assign|làm|fix|giúp|xem|handle/i;
 
-    for (const reply of replies.messages || []) {
-      const text = reply.text || '';
-      allText.push(text);
+    // Extract ALL searchable text from a message: body + attachments + blocks.
+    // QA members often paste Jira links that Slack renders as unfurl
+    // attachments — the UP-xxx key then lives OUTSIDE reply.text.
+    const fullTextOf = (reply) => {
+      const parts = [reply.text || ''];
+      for (const att of reply.attachments || []) {
+        parts.push(att.title || '', att.text || '', att.fallback || '', att.title_link || '', att.from_url || '');
+      }
+      const walkBlocks = (blocks) => {
+        for (const b of blocks || []) {
+          if (b.text?.text) parts.push(b.text.text);
+          if (b.url) parts.push(b.url);
+          if (b.elements) walkBlocks(b.elements);
+          if (b.fields) for (const f of b.fields) parts.push(f.text || '');
+        }
+      };
+      walkBlocks(reply.blocks);
+      return parts.join(' ');
+    };
 
-      // Find first Jira ticket
+    for (const reply of replies.messages || []) {
+      const text     = reply.text || '';
+      const fullText = fullTextOf(reply);
+      allText.push(fullText);
+
+      // Find first Jira ticket — anywhere in the message incl. unfurls
       if (!jiraKey) {
-        const match = text.match(/UP-\d+/);
+        const match = fullText.match(/UP-\d+/);
         if (match) { jiraKey = match[0]; jiraUrl = `${JIRA_HOST}/browse/${jiraKey}`; }
       }
 
@@ -2036,17 +2057,33 @@ function buildChannelWeeklyReport(channelName, channelId, threads, weekLabel) {
   const WEEKLY_MAIN = `<@U0142GU335F> <@U0445EQS1ED> <@UQZ2PNPN3>`;
   const WEEKLY_CC   = `cc <@U04PN2RHT4K> <@U08J7SGJGNM> <@U06401J6QR4> <@U08R7JP31CZ>`;
 
+  // Clean truncation at word boundary — never cut mid-word
+  const clip = (s, max = 110) => {
+    if (!s) return '';
+    s = s.replace(/\s+/g, ' ').trim();
+    if (s.length <= max) return s;
+    const cut = s.substring(0, max);
+    return cut.substring(0, Math.max(cut.lastIndexOf(' '), 60)).replace(/[,.;:—-]$/, '') + '…';
+  };
+  const cleanName = (n) => (n || '').replace(/\s*\(\s*/g, ' (').replace(/\s*\)/g, ')').trim();
+
+  const done        = threads.filter(t => workStage(t) === 'DONE').length;
+  const dev         = threads.filter(t => workStage(t) === 'IN DEVELOPMENT').length;
+  const invest      = threads.filter(t => workStage(t) === 'IN INVESTIGATION').length;
+  const needsReview = threads.filter(t => !t.jiraKey && !t.inThreadAssigneeId).length;
+
   const lines = [];
   lines.push(WEEKLY_MAIN);
   lines.push(WEEKLY_CC);
   lines.push(`📊 *Weekly Report — #${channelName} — ${weekLabel}*`);
-  lines.push(`*${threads.length} report(s) this week*`);
 
   if (threads.length === 0) {
-    lines.push('');
     lines.push('_No reports last week._');
     return lines.join('\n');
   }
+
+  // Headline: totals FIRST so leaders see status at a glance
+  lines.push(`*${threads.length} reports* · ✅ ${done} done · 🔨 ${dev} in dev · 🔍 ${invest} investigating${needsReview ? ` · ⚠️ *${needsReview} need SM/PC review*` : ''}`);
 
   // Group by squad
   const bySquad = new Map();
@@ -2066,64 +2103,48 @@ function buildChannelWeeklyReport(channelName, channelId, threads, weekLabel) {
     'AI Features',
     'Other',
   ];
-
-  const STAGES = [
-    { key: 'DONE',              emoji: '✅', label: 'DONE' },
-    { key: 'IN DEVELOPMENT',    emoji: '🔨', label: 'IN DEVELOPMENT' },
-    { key: 'IN INVESTIGATION',  emoji: '🔍', label: 'IN INVESTIGATION' },
-  ];
-
   const sortedSquads = [...bySquad.keys()].sort((a, b) => {
     const ai = SQUAD_ORDER.indexOf(a), bi = SQUAD_ORDER.indexOf(b);
     return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
   });
 
+  const STAGES = [
+    { key: 'DONE',             emoji: '✅' },
+    { key: 'IN DEVELOPMENT',   emoji: '🔨' },
+    { key: 'IN INVESTIGATION', emoji: '🔍' },
+  ];
+
   let idx = 0;
   for (const squadName of sortedSquads) {
     const squadThreads = bySquad.get(squadName);
+    const shortSquad   = squadName.replace(/^Core Product - /, '');
     lines.push('');
-    lines.push(`*━━ ${squadName} (${squadThreads.length}) ━━*`);
+    lines.push(`*${shortSquad}* (${squadThreads.length})`);
 
-    // Group by stage within each squad
     const byStage = { 'DONE': [], 'IN DEVELOPMENT': [], 'IN INVESTIGATION': [] };
     for (const t of squadThreads) byStage[workStage(t)].push(t);
 
-    for (const { key, emoji, label } of STAGES) {
-      const stageThreads = byStage[key];
-      if (!stageThreads.length) continue;
-
-      lines.push(`${emoji} *${label}* (${stageThreads.length})`);
-      for (const t of stageThreads) {
+    for (const { key, emoji } of STAGES) {
+      for (const t of byStage[key]) {
         idx++;
         const threadUrl = buildSlackThreadUrl(channelId, t.threadTs);
-        const text      = t.englishSummary || t.preview;
+        const text      = clip(t.englishSummary || t.preview);
 
-        let statusLine;
+        let head;
         if (t.jiraKey) {
-          const assignee = t.jiraAssignee ? ` · ${t.jiraAssignee}` : '';
-          statusLine = `<${t.jiraUrl}|${t.jiraKey}> — _${t.jiraStatus || 'unknown'}_${assignee}`;
+          const assignee = t.jiraAssignee ? ` · ${cleanName(t.jiraAssignee)}` : '';
+          head = `${emoji} <${t.jiraUrl}|${t.jiraKey}> _${(t.jiraStatus || 'unknown').toLowerCase()}_${assignee}`;
         } else if (t.inThreadAssigneeName || t.inThreadAssigneeId) {
-          const who = t.inThreadAssigneeName || 'a dev';
-          statusLine = `_No card yet_ — *${who}* asked in thread to handle`;
+          head = `${emoji} ⏳ _No card_ — *${cleanName(t.inThreadAssigneeName) || 'a dev'}* handling in thread`;
         } else {
-          statusLine = `⚠️ _Needs SM/PC review — no ticket, no assignee_`;
+          head = `⚠️ *No card, no assignee — SM/PC please review*`;
         }
 
-        lines.push(`   ${idx}. ${statusLine}`);
-        lines.push(`      ${text} · <${threadUrl}|View thread>`);
+        lines.push(`${idx}. ${head}`);
+        lines.push(`    ${text} · <${threadUrl}|thread>`);
       }
     }
   }
-
-  // Summary
-  lines.push('');
-  const done        = threads.filter(t => workStage(t) === 'DONE').length;
-  const dev         = threads.filter(t => workStage(t) === 'IN DEVELOPMENT').length;
-  const invest      = threads.filter(t => workStage(t) === 'IN INVESTIGATION').length;
-  const needsReview = threads.filter(t => !t.jiraKey && !t.inThreadAssigneeId).length;
-
-  lines.push(`*Summary:* ✅ ${done} done · 🔨 ${dev} in development · 🔍 ${invest} in investigation · ⚠️ ${needsReview} need SM/PC review`);
-  lines.push(`_Tag \`@QA Bot followup\` in any thread to check status._`);
 
   return lines.join('\n');
 }
