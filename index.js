@@ -4,8 +4,13 @@ const OpenAI = require('openai');
 const axios = require('axios');
 const FormData = require('form-data');
 
-const JIRA_HOST    = 'https://everfit.atlassian.net';
-const JIRA_PROJECT = 'UP';
+const lib = require('./lib');
+const {
+  JIRA_HOST, JIRA_PROJECT, jiraAuth,
+  SMART_MODEL, aiComplete,
+  agentStatus, getActiveSprintId, getIssueSnapshot,
+  resolveUserName, resolveInlineMentions, qaTaskWork,
+} = lib;
 
 const clientReport = require('./client-report');
 
@@ -15,31 +20,6 @@ const slackApp = new App({
 });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ── Model access fallback ────────────────────────────────────────────
-// The OpenAI project key may not have every model enabled (403 "does not
-// have access to model"). Preferred smart model is configurable via env;
-// any model-access failure falls back to gpt-4o-mini so the agent keeps
-// working instead of erroring at the user.
-const SMART_MODEL = process.env.OPENAI_SMART_MODEL || 'gpt-4o';
-let _smartModelBroken = false;
-async function aiComplete(params) {
-  const wanted = _smartModelBroken && params.model !== 'gpt-4o-mini' ? 'gpt-4o-mini' : params.model;
-  try {
-    return await openai.chat.completions.create({ ...params, model: wanted });
-  } catch (err) {
-    const msg = `${err?.message || ''}`;
-    if (wanted !== 'gpt-4o-mini' && (err?.status === 403 || /does not have access to model/i.test(msg))) {
-      if (!_smartModelBroken) console.warn(`[AI] Model "${wanted}" not enabled on this OpenAI project — falling back to gpt-4o-mini for all smart calls. Enable it in the OpenAI dashboard or set OPENAI_SMART_MODEL.`);
-      _smartModelBroken = true;
-      return await openai.chat.completions.create({ ...params, model: 'gpt-4o-mini' });
-    }
-    throw err;
-  }
-}
-
-function jiraAuth() {
-  return 'Basic ' + Buffer.from(`${process.env.JIRA_EMAIL}:${process.env.JIRA_API_TOKEN}`).toString('base64');
-}
 
 async function resolveJiraAccountId(slackClient, slackUserId) {
   try {
@@ -73,23 +53,6 @@ async function getThreadReporterSlackId(client, channelId, threadTs) {
     console.warn('[QABot] Could not get thread reporter:', err.message);
     return null;
   }
-}
-
-// Resolve inline <@UID> mentions to real names (cached) — raw Slack IDs
-// must never leak into AI context or replies.
-const _userNameCache = new Map();
-async function resolveUserName(client, uid) {
-  if (_userNameCache.has(uid)) return _userNameCache.get(uid);
-  let name = uid;
-  try { name = (await client.users.info({ user: uid })).user?.real_name || uid; } catch (_) {}
-  _userNameCache.set(uid, name);
-  return name;
-}
-async function resolveInlineMentions(client, text) {
-  const uids = [...new Set([...(text || '').matchAll(/<@([A-Z0-9]+)>/g)].map(m => m[1]))];
-  let out = text || '';
-  for (const uid of uids) out = out.split(`<@${uid}>`).join(`@${await resolveUserName(client, uid)}`);
-  return out;
 }
 
 async function getThread(client, channelId, threadTs) {
@@ -1057,29 +1020,6 @@ async function pickParentFromCanvas(client, channelId, bugPlatform) {
   return null;
 }
 
-async function getActiveSprintId() {
-  try {
-    const boardRes = await axios.get(`${JIRA_HOST}/rest/agile/1.0/board`, {
-      params: { projectKeyOrId: JIRA_PROJECT, type: 'scrum' },
-      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
-    });
-    const board = boardRes.data?.values?.[0];
-    if (!board) return null;
-    const sprintRes = await axios.get(`${JIRA_HOST}/rest/agile/1.0/board/${board.id}/sprint`, {
-      params: { state: 'active' },
-      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
-    });
-    const sprints = sprintRes.data?.values || [];
-    // Multiple sprints can be active at once (dev sprint + "SM Review").
-    // Tickets must ALWAYS go to the real Active Sprint — never SM Review.
-    const eligible = sprints.filter(s => !/sm\s*review/i.test(s.name || ''));
-    if (!eligible.length) return null;
-    eligible.sort((a, b) => new Date(b.startDate || 0) - new Date(a.startDate || 0));
-    console.log(`[Sprint] Selected active sprint: ${eligible[0].name} (${eligible[0].id})`);
-    return eligible[0].id;
-  } catch { return null; }
-}
-
 async function addIssueToSprint(issueKey, sprintId) {
   try {
     await axios.post(`${JIRA_HOST}/rest/agile/1.0/sprint/${sprintId}/issue`,
@@ -1436,40 +1376,6 @@ async function getParentFromChannelCanvas(client, channelId) {
 }
 
 // ── Agent status: live progress message (agent-working feel) ──
-function agentStatus(client, channel, threadTs) {
-  let ts = null, base = '', dots = 0, timer = null, killer = null;
-  const render = () => dots ? `${base} ${'·'.repeat(dots)}` : base;
-  const stopTimers = () => { if (timer) clearInterval(timer); if (killer) clearTimeout(killer); timer = killer = null; };
-  const del = async () => {
-    stopTimers();
-    if (!ts) return;
-    const t = ts; ts = null;
-    try { await client.chat.delete({ channel, ts: t }); } catch (_) {}
-  };
-  return {
-    async start(text) {
-      base = text; dots = 0;
-      try {
-        const r = await client.chat.postMessage({ channel, thread_ts: threadTs, unfurl_links: false, text: render() });
-        ts = r.ts;
-        // Animated working dots — edits the status every 2.5s so it feels alive
-        timer = setInterval(async () => {
-          if (!ts) return;
-          dots = (dots + 1) % 4;
-          try { await client.chat.update({ channel, ts, text: render() }); } catch (_) {}
-        }, 2500);
-        killer = setTimeout(del, 4 * 60 * 1000);   // safety net: a status can never orphan
-      } catch (_) {}
-    },
-    async update(text) {
-      base = text; dots = 0;
-      if (!ts) return;
-      try { await client.chat.update({ channel, ts, text: render() }); } catch (_) {}
-    },
-    async done() { await del(); },
-  };
-}
-
 // ── Conversational intelligence for QA Bot mentions ─────────────────
 // Distinguishes "log this" from greetings/questions, and answers the
 // latter like an assistant instead of dumping boilerplate (or worse,
@@ -1496,16 +1402,6 @@ async function scanThreadTicketKeys(client, channelId, threadTs) {
     }
   } catch (_) {}
   return keys;
-}
-
-async function getIssueSnapshot(issueKey) {
-  try {
-    const res = await axios.get(`${JIRA_HOST}/rest/api/3/issue/${issueKey}?fields=status,assignee,summary`, {
-      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
-    });
-    const f = res.data?.fields || {};
-    return { key: issueKey, status: f.status?.name || 'Unknown', assignee: f.assignee?.displayName || null, summary: f.summary || '' };
-  } catch { return null; }
 }
 
 async function agentRoute(userText, context, existingKeys) {
@@ -1536,27 +1432,6 @@ A bare tag (empty message) with existing tickets \u2192 "follow_up". A bare tag 
 
 
 // ── General task worker: QA Agent does ANY requested knowledge work ──
-async function qaTaskWork(context, userText) {
-  try {
-    const res = await aiComplete({
-      model: SMART_MODEL, max_tokens: 1800,
-      messages: [
-        { role: 'system', content: `You are QA Agent, Everfit's autonomous QA assistant in Slack. A teammate tagged you in a thread with a work request. Do the work fully and directly — summarize, extract/list items, draft messages or announcements, translate, compare, plan tests, review, analyze — whatever they asked.
-
-Rules:
-- Output in ENGLISH only, regardless of the thread's language
-- Use Slack formatting: *bold* for emphasis and section names, \u2022 for bullets; NO markdown headers (#)
-- Refer to people by the names in the transcript. NEVER output raw Slack IDs like U07ABCDEF
-- Be complete but not padded — deliver the work product itself, no preamble like "Here is the summary"
-- If the thread doesn't contain enough information, deliver the best partial result and state clearly what is missing
-- Never invent ticket numbers, links, or facts not present in the thread` },
-        { role: 'user', content: `Thread transcript:\n${(context || '(no thread)').substring(0, 12000)}\n\nRequest: ${userText}` },
-      ],
-    });
-    return res.choices[0].message.content?.trim() || null;
-  } catch { return null; }
-}
-
 async function qaChatReply(context, userText) {
   try {
     const res = await aiComplete({

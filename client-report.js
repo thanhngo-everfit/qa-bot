@@ -8,13 +8,16 @@ const axios = require('axios');
 const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
+const {
+  JIRA_HOST, JIRA_PROJECT, jiraAuth,
+  SMART_MODEL, aiCall,
+  agentStatus, getActiveSprintId,
+  resolveInlineMentions, qaTaskWork,
+} = require('./lib');
 
 // ─────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────
-
-const JIRA_HOST    = 'https://everfit.atlassian.net';
-const JIRA_PROJECT = 'UP';
 
 // ── Channels the bot auto-analyzes (replace IDs with real Slack channel IDs)
 // How to find: Channel → right-click → View channel details → Channel ID at bottom
@@ -172,38 +175,6 @@ const _registrations = [];
 const slackApp = { event: (name, handler) => _registrations.push([name, handler]) };
 
 // ── OpenAI wrapper ──
-// Model-access fallback: 403 "does not have access to model" → gpt-4o-mini
-async function openaiCreateWithFallback(params) {
-  try {
-    return await openai.chat.completions.create(params);
-  } catch (err) {
-    const msg = `${err?.message || ''}`;
-    if (params.model !== 'gpt-4o-mini' && (err?.status === 403 || /does not have access to model/i.test(msg))) {
-      if (!_smartModelBroken) console.warn(`[AI] Model "${params.model}" not enabled on this OpenAI project — falling back to gpt-4o-mini for all smart calls. Enable it in the OpenAI dashboard or set OPENAI_SMART_MODEL.`);
-      _smartModelBroken = true;
-      return await openai.chat.completions.create({ ...params, model: 'gpt-4o-mini' });
-    }
-    throw err;
-  }
-}
-
-const SMART_MODEL = process.env.OPENAI_SMART_MODEL || 'gpt-4o';
-let _smartModelBroken = false;
-async function aiCall(system, userContent, maxTokens = 1000, jsonMode = false, model = 'gpt-4o-mini') {
-  if (model === 'gpt-4o') model = SMART_MODEL;          // env-configurable smart model
-  if (_smartModelBroken && model !== 'gpt-4o-mini') model = 'gpt-4o-mini';
-  const res = await openaiCreateWithFallback({
-    model,
-    max_tokens: maxTokens,
-    ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user',   content: userContent },
-    ],
-  });
-  return res.choices[0].message.content || '';
-}
-
 const followUpStore = new Map(); // in-memory follow-up tracker
 
 // ── Knowledge base (loaded at startup, reloaded on SIGHUP) ──
@@ -231,10 +202,6 @@ function isWorkingHours() { const h = nowVN().getUTCHours(); return h >= 9 && h 
 // HELPERS
 // ─────────────────────────────────────────────
 
-function jiraAuth() {
-  return 'Basic ' + Buffer.from(`${process.env.JIRA_EMAIL}:${process.env.JIRA_API_TOKEN}`).toString('base64');
-}
-
 async function resolveJiraAccountId(slackClient, slackUserId) {
   try {
     const info = await slackClient.users.info({ user: slackUserId });
@@ -254,12 +221,7 @@ async function getThread(client, channelId, threadTs) {
   const lines  = await Promise.all((result.messages || []).map(async msg => {
     let name = msg.username || msg.user || 'user';
     try { name = (await client.users.info({ user: msg.user })).user?.real_name || name; } catch (_) {}
-    let text = msg.text || '';
-    for (const uid of [...new Set([...text.matchAll(/<@([A-Z0-9]+)>/g)].map(m => m[1]))]) {
-      let uname = uid;
-      try { uname = (await client.users.info({ user: uid })).user?.real_name || uid; } catch (_) {}
-      text = text.split(`<@${uid}>`).join(`@${uname}`);
-    }
+    const text = await resolveInlineMentions(client, msg.text || '');
     // Include relative time so Claude knows how old each message is
     const msgMs   = parseFloat(msg.ts) * 1000;
     const hoursAgo = Math.round((nowMs - msgMs) / (60 * 60 * 1000));
@@ -570,29 +532,6 @@ async function uploadAttachmentToJira(issueKey, filename, fileBuffer, mimetype) 
 // JIRA
 // ─────────────────────────────────────────────
 
-
-async function getActiveSprintId() {
-  try {
-    const boardRes = await axios.get(`${JIRA_HOST}/rest/agile/1.0/board`, {
-      params: { projectKeyOrId: JIRA_PROJECT, type: 'scrum' },
-      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
-    });
-    const board = boardRes.data?.values?.[0];
-    if (!board) return null;
-    const sprintRes = await axios.get(`${JIRA_HOST}/rest/agile/1.0/board/${board.id}/sprint`, {
-      params: { state: 'active' },
-      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
-    });
-    const sprints = sprintRes.data?.values || [];
-    // Multiple sprints can be active at once (dev sprint + "SM Review").
-    // Tickets must ALWAYS go to the real Active Sprint — never SM Review.
-    const eligible = sprints.filter(s => !/sm\s*review/i.test(s.name || ''));
-    if (!eligible.length) return null;
-    eligible.sort((a, b) => new Date(b.startDate || 0) - new Date(a.startDate || 0));
-    console.log(`[Sprint] Selected active sprint: ${eligible[0].name} (${eligible[0].id})`);
-    return eligible[0].id;
-  } catch { return null; }
-}
 
 async function addIssueToSprint(issueKey, sprintId) {
   try {
@@ -1527,40 +1466,6 @@ async function findOrRegisterTracked(client, channelId, threadTs, botBotId, botU
 // ── Agent status: live progress message that updates through phases ──
 // Gives the "an agent is working" feel: one message posted immediately,
 // edited as work progresses, deleted when the real reply lands.
-function agentStatus(client, channel, threadTs) {
-  let ts = null, base = '', dots = 0, timer = null, killer = null;
-  const render = () => dots ? `${base} ${'·'.repeat(dots)}` : base;
-  const stopTimers = () => { if (timer) clearInterval(timer); if (killer) clearTimeout(killer); timer = killer = null; };
-  const del = async () => {
-    stopTimers();
-    if (!ts) return;
-    const t = ts; ts = null;
-    try { await client.chat.delete({ channel, ts: t }); } catch (_) {}
-  };
-  return {
-    async start(text) {
-      base = text; dots = 0;
-      try {
-        const r = await client.chat.postMessage({ channel, thread_ts: threadTs, unfurl_links: false, text: render() });
-        ts = r.ts;
-        // Animated working dots — edits the status every 2.5s so it feels alive
-        timer = setInterval(async () => {
-          if (!ts) return;
-          dots = (dots + 1) % 4;
-          try { await client.chat.update({ channel, ts, text: render() }); } catch (_) {}
-        }, 2500);
-        killer = setTimeout(del, 4 * 60 * 1000);   // safety net: a status can never orphan
-      } catch (_) {}
-    },
-    async update(text) {
-      base = text; dots = 0;
-      if (!ts) return;
-      try { await client.chat.update({ channel, ts, text: render() }); } catch (_) {}
-    },
-    async done() { await del(); },
-  };
-}
-
 // ── AI intent router: understand natural language commands ──
 // Lets people talk to the bot naturally in English or Vietnamese instead
 // of memorizing exact command prefixes.
