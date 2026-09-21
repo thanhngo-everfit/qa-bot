@@ -172,7 +172,10 @@ const SEVERITY_META = {
 
 let openai = null; // injected by register()
 const _registrations = [];
-const slackApp = { event: (name, handler) => _registrations.push([name, handler]) };
+const slackApp = {
+  event:  (name, handler) => _registrations.push(['event',  name, handler]),
+  action: (name, handler) => _registrations.push(['action', name, handler]),
+};
 
 // ── OpenAI wrapper ──
 const followUpStore = new Map(); // in-memory follow-up tracker
@@ -1498,7 +1501,7 @@ JSON only, no other text.`,
   } catch { return 'unknown'; }
 }
 
-slackApp.event('app_mention', async ({ event, client, logger }) => {
+const crMentionHandler = async ({ event, client, logger }) => {
   if (!MONITORED_CHANNELS[event.channel]) return;
 
   const { user_id: botUserId, bot_id: botBotId } = await client.auth.test();
@@ -1507,7 +1510,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
   // Fast path: exact command prefixes (no AI cost, instant)
   const isAnalyze        = /^(analyze|analysis|phân tích|phan tich)/.test(triggerText);
   const isWeeklyReport   = /^(weekly report|weekly|báo cáo tuần)/.test(triggerText);
-  const isCreateCard     = /^(create\s?(card|ticket)|log\s?(bug|this)|assign\s?to)/.test(triggerText);
+  const isCreateCard     = /^(force\s?log|create\s?(card|ticket)|log\s?(bug|this)|assign\s?to)/.test(triggerText);
   const isFollowup       = /^(followup|follow[- ]up|check\s?status|update)/.test(triggerText);
   const isTroubleshoot   = /^(troubleshoot|trouble\s?shoot|debug|how\s?to\s?fix)/.test(triggerText);
   const isCancel         = /^(cancel|stop|close)/.test(triggerText);
@@ -2007,8 +2010,9 @@ Max 8 steps total. Plain English only.`,
       return;
     }
 
-    // Dedup
-    const newTickets = analysis.tickets.filter(ticket => {
+    // Dedup — skipped entirely on "force log" (user explicitly wants new tickets)
+    const isForce = /\bforce\s?log\b/i.test(event.text);
+    const newTickets = isForce ? analysis.tickets : analysis.tickets.filter(ticket => {
       const isDupe = existingSummaries.some(existing => {
         const existingWords = new Set(existing.split(/\s+/).filter(w => w.length > 4));
         return ticket.summary.toLowerCase().split(/\s+/).filter(w => w.length > 4).filter(w => existingWords.has(w)).length >= 3;
@@ -2019,9 +2023,25 @@ Max 8 steps total. Plain English only.`,
 
     if (!newTickets.length) {
       await agentSt.done();
+      const guardKeys = dedupKeys.length ? dedupKeys : liveKeys;
+      const keyLinks  = guardKeys.map(k => `<${JIRA_HOST}/browse/${k}|${k}>`).join(', ');
+      const value     = JSON.stringify({ c: event.channel, t: threadTs, x: event.text.substring(0, 1100) });
       await client.chat.postMessage({
-        channel: event.channel, thread_ts: threadTs,
-        text: `I held off — this thread already has ${(dedupKeys.length ? dedupKeys : liveKeys).map(k => `<${JIRA_HOST}/browse/${k}|${k}>`).join(', ')}. Say _"follow up"_ to track it, or _"force log"_ if you need a separate ticket.`,
+        channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+        text: `This thread already has ${keyLinks} — what should I do?`,
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: `This thread already has ${keyLinks}.\nThreads often cover several issues — tell me how to proceed:` } },
+          { type: 'actions', elements: [
+            { type: 'button', style: 'primary', action_id: 'qa_cr_dup_remaining', value,
+              text: { type: 'plain_text', text: '🧩 Cover remaining issues', emoji: true } },
+            { type: 'button', action_id: 'qa_cr_dup_force', value,
+              text: { type: 'plain_text', text: '🆕 Log new ticket anyway', emoji: true } },
+            { type: 'button', action_id: 'qa_cr_dup_follow', value,
+              text: { type: 'plain_text', text: '🔍 Follow up on existing', emoji: true } },
+            { type: 'button', style: 'danger', action_id: 'qa_cr_dup_cancel', value,
+              text: { type: 'plain_text', text: '✖️ Cancel', emoji: true } },
+          ] },
+        ],
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       return;
@@ -2117,6 +2137,80 @@ Max 8 steps total. Plain English only.`,
     await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
     await client.reactions.add({ channel: event.channel, name: 'x', timestamp: event.ts }).catch(() => {});
   }
+};
+slackApp.event('app_mention', crMentionHandler);
+
+// ── Duplicate-guard button actions ───────────────────────────────────
+// Buttons re-invoke the full mention pipeline with a synthetic event, so
+// every capability (multi-ticket, assignment, status animation) applies.
+async function crRunSynthetic(client, logger, payload, text, clickerId) {
+  const syntheticEvent = { channel: payload.c, thread_ts: payload.t, ts: payload.t, user: clickerId, text };
+  await crMentionHandler({ event: syntheticEvent, client, logger });
+}
+
+function dupPayload(body) {
+  try { return JSON.parse(body.actions[0].value); } catch { return null; }
+}
+
+async function markChoice(client, body, line) {
+  try {
+    await client.chat.update({
+      channel: body.channel.id, ts: body.message.ts,
+      text: line, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: line } }],
+    });
+  } catch (_) {}
+}
+
+slackApp.action('qa_cr_dup_force', async ({ ack, body, client, logger }) => {
+  await ack();
+  const p = dupPayload(body); if (!p) return;
+  await markChoice(client, body, `🆕 <@${body.user.id}> chose *log a new ticket anyway* — on it.`);
+  await crRunSynthetic(client, logger, p, `force log ${p.x}`, body.user.id);
+});
+
+slackApp.action('qa_cr_dup_remaining', async ({ ack, body, client, logger }) => {
+  await ack();
+  const p = dupPayload(body); if (!p) return;
+  await markChoice(client, body, `🧩 <@${body.user.id}> chose *cover remaining issues* — checking what's already ticketed.`);
+  const covered = [];
+  try {
+    const found = await scanThreadForTickets(client, p.c, p.t);
+    for (const key of (found || []).slice(0, 8)) {
+      const d = await getJiraIssueDetails(key);
+      if (d) covered.push(`${key} — ${d.summary || ''}`.trim());
+    }
+  } catch (_) {}
+  const directive =
+    `force log ${p.x}\n` +
+    `IMPORTANT: Create tickets ONLY for issues discussed in this thread that are NOT already covered by an existing ticket. ` +
+    `Already covered (do NOT recreate these): ${covered.length ? covered.join(' | ') : 'unknown — compare against ticket titles found in the thread'}. ` +
+    `If every issue is already covered, return an empty tickets array.`;
+  await crRunSynthetic(client, logger, p, directive, body.user.id);
+});
+
+slackApp.action('qa_cr_dup_follow', async ({ ack, body, client, logger }) => {
+  await ack();
+  const p = dupPayload(body); if (!p) return;
+  const lines = [];
+  try {
+    const found = await scanThreadForTickets(client, p.c, p.t);
+    for (const key of (found || []).slice(0, 8)) {
+      const d = await getJiraIssueDetails(key);
+      if (!d) continue;
+      const done = ['qa success', 'done', 'released', 'closed'].includes((d.status || '').toLowerCase());
+      lines.push(`${done ? '✅' : '🔎'} <${JIRA_HOST}/browse/${key}|${key}> — *${d.status}*${d.assigneeDisplay ? ` · ${d.assigneeDisplay}` : ''}`);
+      if (!done) registerFollowUp({ channelId: p.c, threadTs: p.t, jiraKey: key, jiraUrl: `${JIRA_HOST}/browse/${key}`, squad: null });
+    }
+  } catch (_) {}
+  await markChoice(client, body,
+    lines.length
+      ? `🔍 <@${body.user.id}> chose *follow up on existing*:\n${lines.join('\n')}\n_I'm tracking the open ones — I'll follow up every 2 business days until closed._`
+      : `🔍 I couldn't find live tickets in this thread anymore.`);
+});
+
+slackApp.action('qa_cr_dup_cancel', async ({ ack, body, client }) => {
+  await ack();
+  await markChoice(client, body, `✖️ <@${body.user.id}> cancelled — nothing created.`);
 });
 
 // ─────────────────────────────────────────────
@@ -2548,7 +2642,7 @@ function register(realApp, realOpenai) {
   rebuildFollowUpsFromJira()
     .then(() => rebuildFollowUpsFromHistory(realApp.client))
     .catch(err => console.warn('[FollowUp] Rebuild error:', err.message));
-  for (const [name, handler] of _registrations) realApp.event(name, handler);
+  for (const [kind, name, handler] of _registrations) realApp[kind](name, handler);
   startFollowUpScheduler(realApp.client);
   startWeeklyReportScheduler(realApp.client);
   console.log('✅ [ClientReport] module active (gpt-4o-mini) — monitoring:', Object.values(MONITORED_CHANNELS).join(', '));

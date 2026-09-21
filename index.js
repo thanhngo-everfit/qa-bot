@@ -1449,7 +1449,7 @@ async function qaChatReply(context, userText) {
   } catch { return null; }
 }
 
-slackApp.event('app_mention', async ({ event, client, logger }) => {
+const coreMentionHandler = async ({ event, client, logger }) => {
   // Client-report channels are handled by the client-report module
   if (clientReport.MONITORED_CHANNELS[event.channel]) return;
 
@@ -1618,14 +1618,25 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     if (existingKeys.length > 0 && !isForceLog && !isTask) {
       const ticketLinks = [...new Set(existingKeys)].map(k => `<${JIRA_HOST}/browse/${k}|${k}>`).join(', ');
       await agentSt.done();
+      const value = JSON.stringify({ c: event.channel, t: threadTs, x: event.text.substring(0, 1100) });
       await client.chat.postMessage({
-        channel: event.channel, thread_ts: threadTs,
-        text:
-          `I checked this thread first — it already has ${ticketLinks}, so I didn't create a duplicate.\n` +
-          `Say _"follow up"_ and I'll track the existing ticket, or _"force log"_ if you really need a separate one.`,
+        channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+        text: `This thread already has ${ticketLinks} — what should I do?`,
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: `This thread already has ${ticketLinks}.\nThreads often cover several issues — tell me how to proceed:` } },
+          { type: 'actions', elements: [
+            { type: 'button', style: 'primary', action_id: 'qa_core_dup_remaining', value,
+              text: { type: 'plain_text', text: '🧩 Cover remaining issues', emoji: true } },
+            { type: 'button', action_id: 'qa_core_dup_force', value,
+              text: { type: 'plain_text', text: '🆕 Log new ticket anyway', emoji: true } },
+            { type: 'button', action_id: 'qa_core_dup_follow', value,
+              text: { type: 'plain_text', text: '🔍 Follow up on existing', emoji: true } },
+            { type: 'button', style: 'danger', action_id: 'qa_core_dup_cancel', value,
+              text: { type: 'plain_text', text: '✖️ Cancel', emoji: true } },
+          ] },
+        ],
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
-      await client.reactions.add({ channel: event.channel, name: 'warning', timestamp: event.ts }).catch(() => {});
       return;
     }
 
@@ -1867,6 +1878,76 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
     await client.reactions.add({ channel: event.channel, name: 'x', timestamp: event.ts }).catch(() => {});
   }
+};
+slackApp.event('app_mention', coreMentionHandler);
+
+// ── Core duplicate-guard button actions ──────────────────────────────
+function coreDupPayload(body) {
+  try { return JSON.parse(body.actions[0].value); } catch { return null; }
+}
+async function coreMarkChoice(client, body, line) {
+  try {
+    await client.chat.update({
+      channel: body.channel.id, ts: body.message.ts,
+      text: line, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: line } }],
+    });
+  } catch (_) {}
+}
+async function coreRunSynthetic(client, logger, payload, text, clickerId) {
+  const syntheticEvent = { channel: payload.c, thread_ts: payload.t, ts: payload.t, user: clickerId, text };
+  await coreMentionHandler({ event: syntheticEvent, client, logger });
+}
+
+slackApp.action('qa_core_dup_force', async ({ ack, body, client, logger }) => {
+  await ack();
+  const p = coreDupPayload(body); if (!p) return;
+  await coreMarkChoice(client, body, `🆕 <@${body.user.id}> chose *log a new ticket anyway* — on it.`);
+  await coreRunSynthetic(client, logger, p, `force log ${p.x}`, body.user.id);
+});
+
+slackApp.action('qa_core_dup_remaining', async ({ ack, body, client, logger }) => {
+  await ack();
+  const p = coreDupPayload(body); if (!p) return;
+  await coreMarkChoice(client, body, `🧩 <@${body.user.id}> chose *cover remaining issues* — checking what's already ticketed.`);
+  const covered = [];
+  try {
+    const keys = await scanThreadTicketKeys(client, p.c, p.t);
+    for (const key of keys.slice(0, 8)) {
+      const snap = await getIssueSnapshot(key);
+      if (snap) covered.push(`${key} — ${snap.summary}`);
+    }
+  } catch (_) {}
+  const directive =
+    `force log ${p.x}\n` +
+    `IMPORTANT: Create tickets ONLY for issues discussed in this thread that are NOT already covered by an existing ticket. ` +
+    `Already covered (do NOT recreate these): ${covered.length ? covered.join(' | ') : 'unknown — compare against ticket titles found in the thread'}. ` +
+    `If every issue is already covered, return an empty tickets array.`;
+  await coreRunSynthetic(client, logger, p, directive, body.user.id);
+});
+
+slackApp.action('qa_core_dup_follow', async ({ ack, body, client, logger }) => {
+  await ack();
+  const p = coreDupPayload(body); if (!p) return;
+  const lines = [];
+  try {
+    const keys = await scanThreadTicketKeys(client, p.c, p.t);
+    for (const key of keys.slice(0, 8)) {
+      const snap = await getIssueSnapshot(key);
+      if (!snap) continue;
+      const done = ['qa success', 'done', 'released', 'closed'].includes(snap.status.toLowerCase());
+      lines.push(`${done ? '✅' : '🔎'} <${JIRA_HOST}/browse/${key}|${key}> — *${snap.status}*${snap.assignee ? ` · ${snap.assignee}` : ''}`);
+      if (!done) clientReport.registerFollowUp({ channelId: p.c, threadTs: p.t, jiraKey: key, jiraUrl: `${JIRA_HOST}/browse/${key}`, squad: null });
+    }
+  } catch (_) {}
+  await coreMarkChoice(client, body,
+    lines.length
+      ? `🔍 <@${body.user.id}> chose *follow up on existing*:\n${lines.join('\n')}\n_I'm tracking the open ones — I'll follow up every 2 business days until closed._`
+      : `🔍 I couldn't find live tickets in this thread anymore.`);
+});
+
+slackApp.action('qa_core_dup_cancel', async ({ ack, body, client }) => {
+  await ack();
+  await coreMarkChoice(client, body, `✖️ <@${body.user.id}> cancelled — nothing created.`);
 });
 
 (async () => {
