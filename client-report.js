@@ -1581,7 +1581,7 @@ Actions:
 - "cancel": stop follow-up pings ("stop reminding", "đừng ping nữa", "cancel tracking", "done tracking")
 - "weekly_report": generate the weekly summary ("weekly report", "báo cáo tuần", "run report")
 - "retract": user asks the BOT to delete/remove its own previous message ("delete this response", "xóa tin nhắn đó", "remove your reply")
-- "task": substantive work on this thread that is NONE of the above — summarize, extract/list items, draft a message/reply/announcement, translate, compare, review, write documentation ("tóm tắt thread", "summary all items", "draft a reply to the coach", "translate this for CS")
+- "task": work whose OUTPUT IS A SLACK MESSAGE and is NONE of the above — NEVER choose "task" when the user wants cards/tickets created or assigned (that is create_card or assign, even combined with other words like "review and create cards") — summarize, extract/list items, draft a message/reply/announcement, translate, compare, review, write documentation ("tóm tắt thread", "summary all items", "draft a reply to the coach", "translate this for CS")
 - "unknown": greetings, thanks, or anything else
 
 JSON only, no other text.`,

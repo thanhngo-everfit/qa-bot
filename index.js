@@ -1517,9 +1517,9 @@ async function agentRoute(userText, context, existingKeys) {
         { role: 'system', content: `You are the decision core of QA Agent, a Jira assistant in Slack. Users write English or Vietnamese. Decide ONE action for the user's mention. Return ONLY JSON: {"action":"log_ticket"|"follow_up"|"task"|"retract"|"answer"}
 
 Actions:
-- "log_ticket": user wants a NEW Jira ticket created from this thread ("log this", "t\u1ea1o ticket", "l\u00ean card", or a bare tag in a thread with NO existing ticket)
+- "log_ticket": user wants Jira ticket(s) CREATED from this thread \u2014 in any phrasing: "log this", "t\u1ea1o ticket", "l\u00ean card", "create card(s)", "create N tickets", "assign to @member" / "giao cho @member" (create-and-assign), or a bare tag in a thread with NO existing ticket
 - "follow_up": user wants status/progress/tracking of the EXISTING ticket(s) in this thread ("follow up on this", "theo d\u00f5i", "status?", "track this", "any update", "check ti\u1ebfn \u0111\u1ed9", "nh\u1eafc dev gi\u00fap")
-- "task": user asks for substantive WORK on this thread or topic — summarize, list/extract items, draft a message/announcement/release note, translate, compare, plan tests, review, write documentation, analyze in depth ("summary all demo items", "t\u00f3m t\u1eaft thread n\u00e0y", "draft the announcement", "extract action items", "translate this for the client")
+- "task": work whose OUTPUT IS A SLACK MESSAGE \u2014 summarize, list/extract items, draft a message/announcement/release note, translate, compare, plan tests, review, write documentation, analyze in depth ("summary all demo items", "t\u00f3m t\u1eaft thread n\u00e0y", "draft the announcement", "extract action items"). NEVER choose "task" when the user wants tickets/cards created, assigned, or updated in Jira \u2014 that is "log_ticket". If a message mentions BOTH (e.g. "review these issues and create cards"), the Jira action wins: choose "log_ticket".
 - "retract": user asks the BOT to delete/remove its own previous message ("delete this response", "delete your last message", "xóa tin nhắn đó", "remove that reply")
 - "answer": greeting, short question, quick opinion — brief conversational replies only
 
@@ -1609,7 +1609,15 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     // Explicit commands skip the router: force log / create task always log.
     if (!isForceLog && !/^create\s?(task|ticket)/.test(triggerText)) {
       const existingKeys = await scanThreadTicketKeys(client, event.channel, threadTs);
-      const action = await agentRoute(triggerText, context, existingKeys);
+      // Deterministic fast-path: explicit ticket-creation/assignment language
+      // is ALWAYS a log request — never let the AI router reinterpret it as
+      // a summary/task (real incident: 'create card and assign to @X' got
+      // routed to task and produced a summary).
+      const wantsTicket =
+        /\b(create|log|make|t\u1ea1o|l\u00ean)\b[^.]{0,40}\b(cards?|tickets?|bugs?|tasks?|issues?)\b/i.test(event.text) ||
+        /\b(assign|giao)\s+(to\s+|cho\s+)?<@/i.test(event.text);
+      if (wantsTicket) logger.info('[QAAgent] Fast-path: ticket-creation language detected \u2192 log_ticket');
+      const action = wantsTicket ? 'log_ticket' : await agentRoute(triggerText, context, existingKeys);
       logger.info(`[QAAgent] route="${action}" existing=[${existingKeys.join(',')}] msg="${triggerText.substring(0, 50)}"`);
 
       if (action === 'retract') {
