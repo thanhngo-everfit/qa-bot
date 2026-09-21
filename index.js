@@ -13,6 +13,7 @@ const {
 } = lib;
 
 const clientReport = require('./client-report');
+const { runAgent } = require('./agent');
 
 const slackApp = new App({
   token:         process.env.SLACK_BOT_TOKEN,
@@ -1492,110 +1493,47 @@ const coreMentionHandler = async ({ event, client, logger }) => {
       // is ALWAYS a log request — never let the AI router reinterpret it as
       // a summary/task (real incident: 'create card and assign to @X' got
       // routed to task and produced a summary).
+      // Deterministic fast-path: explicit ticket-creation/assignment language
+      // goes straight to the battle-tested creation pipeline (multi-ticket,
+      // dedup buttons, epic parenting, attachments).
       const wantsTicket =
         /\b(create|log|make|t\u1ea1o|l\u00ean)\b[^.]{0,40}\b(cards?|tickets?|bugs?|tasks?|issues?)\b/i.test(event.text) ||
         /\b(assign|giao)\s+(to\s+|cho\s+)?<@/i.test(event.text);
-      if (wantsTicket) logger.info('[QAAgent] Fast-path: ticket-creation language detected \u2192 log_ticket');
-      const action = wantsTicket ? 'log_ticket' : await agentRoute(triggerText, context, existingKeys);
-      logger.info(`[QAAgent] route="${action}" existing=[${existingKeys.join(',')}] msg="${triggerText.substring(0, 50)}"`);
 
-      if (action === 'retract') {
+      if (!wantsTicket) {
+        // ── THE AGENT LOOP ──
+        // Everything that isn't an explicit create request goes to the real
+        // agent: tools + iterative decisions (read channel, search Jira,
+        // create/assign/transition/comment, follow-ups, retract) until done.
+        const agentLoopSt = agentStatus(client, event.channel, threadTs);
+        await agentLoopSt.start('🤖 _QA Agent is on it…_');
+        let result = null;
         try {
-          const { user_id: botUid } = await client.auth.test();
-          const replies = await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 100 });
-          const mine = (replies.messages || [])
-            .filter(m => m.user === botUid && m.ts !== threadTs && parseFloat(m.ts) < parseFloat(event.ts))
-            .sort((a, b) => parseFloat(b.ts) - parseFloat(a.ts));
-          if (!mine.length) {
-            await client.chat.postMessage({
-              channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-              text: "I don't have a message of mine in this thread to delete.",
-            });
-          } else {
-            await client.chat.delete({ channel: event.channel, ts: mine[0].ts });
-            logger.info(`[QAAgent] Retracted own message ${mine[0].ts}`);
-          }
+          result = await runAgent({
+            client, logger,
+            channelId: event.channel,
+            threadTs,
+            requesterId: event.user,
+            requesterName: await resolveUserName(client, event.user),
+            requestText: event.text.replace(/<@[A-Z0-9]+>/g, '').trim() || '(bare tag — read the thread and do the most useful thing: log it if it is an unlogged bug/task report, otherwise summarize status)',
+            threadContext: context,
+            existingKeys,
+            status: agentLoopSt,
+            registerFollowUp: clientReport.registerFollowUp,
+          });
         } catch (err) {
-          logger.warn('[QAAgent] Retract failed:', err.data?.error || err.message);
-          await client.chat.postMessage({
-            channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-            text: `I couldn't delete it (${err.data?.error || err.message}) — a workspace admin can remove it via the message's ⋮ menu.`,
-          });
+          logger.warn('[Agent] loop failed:', err.message);
         }
-        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
-        await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
-        return;
-      }
-
-      if (action === 'task') {
-        const taskSt = agentStatus(client, event.channel, threadTs);
-        await taskSt.start('\u23f3 _QA Agent is working on it\u2026_');
-        const request = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
-        let workContext = context, maxChars = 12000, scopeNote = null;
-        if (lib.detectChannelScope(request)) {
-          const days = lib.parseWindowDays(request);
-          await taskSt.update(`\ud83d\udcda _QA Agent is reading this channel's threads from the last ${days} days\u2026_`);
-          const gathered = await lib.gatherChannelContext(client, event.channel, { days });
-          if (gathered.context) { workContext = gathered.context; maxChars = 30000; }
-          scopeNote = gathered.note;
-        }
-        const result = scopeNote ? scopeNote : await qaTaskWork(workContext, request, maxChars);
-        await taskSt.done();
+        await agentLoopSt.done();
         await client.chat.postMessage({
           channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-          text: result || "I couldn't complete that from what's in this thread \u2014 give me a bit more detail on what you need.",
+          text: result || 'I ran into an error and could not finish — try again in a moment.',
         });
         await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
         await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
         return;
       }
-
-      if (action === 'answer') {
-        const reply = await qaChatReply(context, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
-        await client.chat.postMessage({
-          channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-          text: reply || 'Just tell me what you need \u2014 log a ticket, follow up on one, or ask me anything about this thread.',
-        });
-        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
-        await client.reactions.add({ channel: event.channel, name: 'speech_balloon', timestamp: event.ts }).catch(() => {});
-        return;
-      }
-
-      if (action === 'follow_up') {
-        if (!existingKeys.length) {
-          await client.chat.postMessage({
-            channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-            text: `I don't see any Jira ticket in this thread yet \u2014 say _"log this"_ and I'll create one first.`,
-          });
-        } else {
-          const lines = [];
-          for (const key of existingKeys.slice(0, 5)) {
-            const snap = await getIssueSnapshot(key);
-            if (!snap) continue;
-            const done = ['qa success', 'done', 'released', 'closed'].includes(snap.status.toLowerCase());
-            lines.push(`${done ? '\u2705' : '\ud83d\udd0e'} <${JIRA_HOST}/browse/${key}|${key}> \u2014 *${snap.status}*${snap.assignee ? ` \u00b7 ${snap.assignee}` : ''}`);
-            if (!done) {
-              clientReport.registerFollowUp({
-                channelId: event.channel, threadTs, jiraKey: key,
-                jiraUrl: `${JIRA_HOST}/browse/${key}`, squad: null,
-              });
-            }
-          }
-          const anyOpen = lines.some(l => l.startsWith('\ud83d\udd0e'));
-          lines.push('');
-          lines.push(anyOpen
-            ? `_I'm tracking this \u2014 I'll follow up with the assignee every 2 business days until it's closed._`
-            : `_All tickets here are already closed \u2014 nothing to track._`);
-          await client.chat.postMessage({
-            channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-            text: lines.join('\n'),
-          });
-        }
-        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
-        await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
-        return;
-      }
-      // action === 'log_ticket' falls through to the creation pipeline below
+      logger.info('[QAAgent] Fast-path: ticket-creation language detected → creation pipeline');
     }
 
     const agentSt = agentStatus(client, event.channel, threadTs);
