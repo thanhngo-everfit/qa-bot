@@ -1435,13 +1435,36 @@ async function getParentFromChannelCanvas(client, channelId) {
 
 // ── Agent status: live progress message (agent-working feel) ──
 function agentStatus(client, channel, threadTs) {
-  let ts = null;
+  let ts = null, base = '', dots = 0, timer = null, killer = null;
+  const render = () => dots ? `${base} ${'·'.repeat(dots)}` : base;
+  const stopTimers = () => { if (timer) clearInterval(timer); if (killer) clearTimeout(killer); timer = killer = null; };
+  const del = async () => {
+    stopTimers();
+    if (!ts) return;
+    const t = ts; ts = null;
+    try { await client.chat.delete({ channel, ts: t }); } catch (_) {}
+  };
   return {
     async start(text) {
-      try { const r = await client.chat.postMessage({ channel, thread_ts: threadTs, unfurl_links: false, text }); ts = r.ts; } catch (_) {}
+      base = text; dots = 0;
+      try {
+        const r = await client.chat.postMessage({ channel, thread_ts: threadTs, unfurl_links: false, text: render() });
+        ts = r.ts;
+        // Animated working dots — edits the status every 2.5s so it feels alive
+        timer = setInterval(async () => {
+          if (!ts) return;
+          dots = (dots + 1) % 4;
+          try { await client.chat.update({ channel, ts, text: render() }); } catch (_) {}
+        }, 2500);
+        killer = setTimeout(del, 4 * 60 * 1000);   // safety net: a status can never orphan
+      } catch (_) {}
     },
-    async update(text) { if (!ts) return; try { await client.chat.update({ channel, ts, text }); } catch (_) {} },
-    async done() { if (!ts) return; try { await client.chat.delete({ channel, ts }); } catch (_) {} ts = null; },
+    async update(text) {
+      base = text; dots = 0;
+      if (!ts) return;
+      try { await client.chat.update({ channel, ts, text: render() }); } catch (_) {}
+    },
+    async done() { await del(); },
   };
 }
 
@@ -1676,6 +1699,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     // Skip duplicate detection for explicit Task creation — user is intentionally creating a new ticket
     if (existingKeys.length > 0 && !isForceLog && !isTask) {
       const ticketLinks = [...new Set(existingKeys)].map(k => `<${JIRA_HOST}/browse/${k}|${k}>`).join(', ');
+      await agentSt.done();
       await client.chat.postMessage({
         channel: event.channel, thread_ts: threadTs,
         text:
@@ -1705,6 +1729,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
 
     // Guard: LLM returned an empty array — nothing to create
     if (tickets.length === 0) {
+      await agentSt.done();
       await client.chat.postMessage({
         channel: event.channel, thread_ts: threadTs,
         text:
@@ -1825,7 +1850,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       }
 
       logger.info(`[QABot] Creating ${issueType}: ${ticket.summary} epic=${epicKey || 'none'} parent=${parentKey || 'none'}`);
-      await agentSt.update('🎫 _QA Agent is creating the Jira ticket…_');
+      await agentSt.update('📝 _QA Agent is creating the Jira ticket(s)…_');
       const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId, issueType);
 
       if (sprintId) await addIssueToSprint(jira.key, sprintId);
@@ -1877,7 +1902,8 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     const epicLine = epicKey ? `\nEpic: <${JIRA_HOST}/browse/${epicKey}|${epicKey}>` : '';
 
     const responseText = lines.join('\n\n') + epicLine;
-    await client.chat.postMessage({
+    await agentSt.done();
+      await client.chat.postMessage({
       channel: event.channel, thread_ts: threadTs, unfurl_links: false,
       text: responseText || "Something went wrong on my side — I wasn't able to create the ticket this time. Try tagging me again in a moment.",
     });
@@ -1890,6 +1916,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     if (err.code === 'slack_webapi_platform_error' && err.data?.error === 'missing_scope') {
       const needed = err.data?.needed || 'unknown';
       logger.error(`[QABot] Missing Slack scope: ${needed} (provided: ${err.data?.provided})`);
+      await agentSt.done();
       await client.chat.postMessage({
         channel: event.channel, thread_ts: event.thread_ts || event.ts,
         text:
@@ -1907,7 +1934,8 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       ? Object.entries(jiraErrors).map(([f, m]) => `${f}: ${m}`).join(', ')
       : (jiraMessages || []).join(', ') || err.message;
     logger.error('[QABot]', err.response?.data ?? err.message);
-    await client.chat.postMessage({
+    await agentSt.done();
+      await client.chat.postMessage({
       channel: event.channel, thread_ts: event.thread_ts || event.ts,
       text: `I hit an error while working on this and couldn't finish: \`${errDetail}\`\nGive it another try in a moment — if it keeps failing, my logs have the details.`,
     });
