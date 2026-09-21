@@ -513,7 +513,14 @@ async function getActiveSprintId() {
       params: { state: 'active' },
       headers: { Authorization: jiraAuth(), Accept: 'application/json' },
     });
-    return sprintRes.data?.values?.[0]?.id ?? null;
+    const sprints = sprintRes.data?.values || [];
+    // Multiple sprints can be active at once (dev sprint + "SM Review").
+    // Tickets must ALWAYS go to the real Active Sprint — never SM Review.
+    const eligible = sprints.filter(s => !/sm\s*review/i.test(s.name || ''));
+    if (!eligible.length) return null;
+    eligible.sort((a, b) => new Date(b.startDate || 0) - new Date(a.startDate || 0));
+    console.log(`[Sprint] Selected active sprint: ${eligible[0].name} (${eligible[0].id})`);
+    return eligible[0].id;
   } catch { return null; }
 }
 
@@ -885,27 +892,20 @@ function buildAnalysisReply(analysis, squad, contacts) {
   return lines.join('\n');
 }
 
-// Ticket reply — used by create card: short confirmation + follow-up schedule
+// Ticket reply — used by create card: compact confirmation
 function buildTicketReply(createdJiras) {
   const lines = [];
   for (const { jira, ticket, assigneeSlackIds, uploadedCount } of createdJiras) {
     const typeEmoji    = ticket.summary.includes('Fix data') ? '🔧' : ticket.type === 'Task' ? '📋' : '🐛';
     const assigneeLine = assigneeSlackIds.length
-      ? `Assigned → ${assigneeSlackIds.map(id => `<@${id}>`).join(', ')}`
-      : `Assigned → _unassigned_`;
+      ? assigneeSlackIds.map(id => `<@${id}>`).join(', ')
+      : '_unassigned_';
     const attachLine = uploadedCount > 0 ? ` · 📎 ${uploadedCount} file(s)` : '';
-    lines.push(`${typeEmoji} <${jira.url}|${jira.key}> created`);
-    lines.push(`   ${ticket.summary}`);
-    lines.push(`   ${assigneeLine}${attachLine}`);
+    lines.push(`${typeEmoji} <${jira.url}|${jira.key}> — ${ticket.summary}`);
+    lines.push(`   Assignee: ${assigneeLine} · Sprint: Active${attachLine}`);
   }
-
   lines.push('');
-  lines.push(`_Follow-up schedule:_`);
-  lines.push(`• I'll ping the assignee daily if no status update`);
-  lines.push(`• *QA Ready* → I'll tag SM to assign a QA member`);
-  lines.push(`• *QA Success* → I'll tag PC to notify CS and close Intercom`);
-  lines.push(`• Use \`@QA Bot followup\` to check status anytime`);
-
+  lines.push(`_I'll follow up with the assignee, tag SM at QA Ready, and tag PC at QA Success._`);
   return lines.join('\n');
 }
 
@@ -1247,12 +1247,43 @@ async function findOrRegisterTracked(client, channelId, threadTs, botBotId, botU
 // MAIN EVENT HANDLER (@QA Bot commands)
 // ─────────────────────────────────────────────
 
+// ── AI intent router: understand natural language commands ──
+// Lets people talk to the bot naturally in English or Vietnamese instead
+// of memorizing exact command prefixes.
+async function interpretCommand(rawText) {
+  const cleaned = rawText.replace(/<@[A-Z0-9]+>/g, '@member').trim().substring(0, 400);
+  try {
+    const raw = (await aiCall(
+      `You route messages for QA Bot, a Slack bot in Everfit bug-report channels. Users write in English or Vietnamese.
+Classify the message into exactly ONE action. Return ONLY JSON: {"action":"<action>"}
+
+Actions:
+- "analyze": analyze/summarize/triage the issue ("what's wrong here", "phân tích", "check this issue", "what do you think")
+- "create_card": create a Jira ticket/card without naming an assignee ("tạo card", "log this", "make a ticket", "lên card giúp em")
+- "assign": create/assign a ticket TO specific @member(s) ("giao cho @member", "assign @member fix this", "@member handle giúp", "nhờ @member fix")
+- "reassign": change assignee of an EXISTING ticket ("reassign", "đổi người", "chuyển qua @member", "change assignee")
+- "followup": ask ticket status/progress ("status?", "tới đâu rồi", "any update?", "sao rồi", "check tiến độ")
+- "troubleshoot": ask for CS troubleshooting steps ("how to fix", "hướng dẫn xử lý", "steps to try")
+- "cancel": stop follow-up pings ("stop reminding", "đừng ping nữa", "cancel tracking", "done tracking")
+- "weekly_report": generate the weekly summary ("weekly report", "báo cáo tuần", "run report")
+- "unknown": greetings, thanks, or anything else
+
+JSON only, no other text.`,
+      cleaned, 50, true
+    )).trim();
+    const parsed = JSON.parse(raw.substring(raw.indexOf('{'), raw.lastIndexOf('}') + 1));
+    const valid = ['analyze', 'create_card', 'assign', 'reassign', 'followup', 'troubleshoot', 'cancel', 'weekly_report'];
+    return valid.includes(parsed.action) ? parsed.action : 'unknown';
+  } catch { return 'unknown'; }
+}
+
 slackApp.event('app_mention', async ({ event, client, logger }) => {
   if (!MONITORED_CHANNELS[event.channel]) return;
 
   const { user_id: botUserId, bot_id: botBotId } = await client.auth.test();
   const triggerText = event.text.replace(/<@[A-Z0-9]+>/g, '').trim().toLowerCase();
 
+  // Fast path: exact command prefixes (no AI cost, instant)
   const isAnalyze        = /^(analyze|analysis|phân tích|phan tich)/.test(triggerText);
   const isWeeklyReport   = /^(weekly report|weekly|báo cáo tuần)/.test(triggerText);
   const isCreateCard     = /^(create\s?(card|ticket)|log\s?(bug|this)|assign\s?to)/.test(triggerText);
@@ -1260,24 +1291,38 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
   const isTroubleshoot   = /^(troubleshoot|trouble\s?shoot|debug|how\s?to\s?fix)/.test(triggerText);
   const isCancel         = /^(cancel|stop|close)/.test(triggerText);
   const isChangeAssignee = /^(reassign|change\s?assignee|assign\s?this\s?to|move\s?to)/.test(triggerText);
-  const isValidCommand   = isAnalyze || isWeeklyReport || isCreateCard || isFollowup || isTroubleshoot || isCancel || isChangeAssignee;
+  const matchedFastPath  = isAnalyze || isWeeklyReport || isCreateCard || isFollowup || isTroubleshoot || isCancel || isChangeAssignee;
 
   try { await client.reactions.add({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }); } catch (_) {}
 
   try {
-    if (!isValidCommand) {
+    // Smart path: natural language → AI intent classification.
+    // Understands anything: "giao cho Huy fix giúp em", "log this and give
+    // it to backend", "tới đâu rồi?", "đừng nhắc nữa", "làm report tuần" ...
+    let aiAction = null;
+    if (!matchedFastPath) {
+      aiAction = await interpretCommand(event.text);
+      logger.info(`[Bot] AI router: "${triggerText.substring(0, 60)}" → ${aiAction}`);
+    }
+
+    const doAnalyze  = isAnalyze        || aiAction === 'analyze';
+    const doWeekly   = isWeeklyReport   || aiAction === 'weekly_report';
+    const doCreate   = isCreateCard     || aiAction === 'create_card' || aiAction === 'assign';
+    const doFollowup = isFollowup       || aiAction === 'followup';
+    const doTrouble  = isTroubleshoot   || aiAction === 'troubleshoot';
+    const doCancel   = isCancel         || aiAction === 'cancel';
+    const doReassign = isChangeAssignee || aiAction === 'reassign';
+    const aiWantsAssign = aiAction === 'assign' || triggerText.startsWith('assign to');
+
+    if (!doAnalyze && !doWeekly && !doCreate && !doFollowup && !doTrouble && !doCancel && !doReassign) {
       await client.chat.postMessage({
         channel: event.channel, thread_ts: event.thread_ts || event.ts,
         text:
-          `Here's what I can do:\n\n` +
-          `• \`@QA Bot analyze\` — re-run issue analysis\n` +
-          `• \`@QA Bot weekly report\` — post last week's summary to all channels\n` +
-          `• \`@QA Bot create card\` — create Jira ticket from this thread\n` +
-          `• \`@QA Bot assign to @person\` — create ticket and assign\n` +
-          `• \`@QA Bot reassign to @person [UP-XXXXX]\` — change assignee\n` +
-          `• \`@QA Bot followup\` — check ticket status\n` +
-          `• \`@QA Bot troubleshoot\` — get CS troubleshooting steps\n` +
-          `• \`@QA Bot cancel\` — stop follow-up tracking`,
+          `I couldn't figure out what you need — just tell me in plain English or Vietnamese, e.g. _"log this and assign to @Huy"_, _"status?"_, _"tạo card giúp em"_.\n\n` +
+          `Or use a command:\n` +
+          `• \`analyze\` — issue analysis · \`create card\` — Jira ticket · \`assign to @person\`\n` +
+          `• \`followup\` — check status · \`reassign to @person\` · \`troubleshoot\` — CS steps\n` +
+          `• \`weekly report\` · \`cancel\` — stop follow-up tracking`,
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       await client.reactions.add({ channel: event.channel, name: 'question', timestamp: event.ts }).catch(() => {});
@@ -1302,7 +1347,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     // ═══════════════════════════════════════════
     // ANALYZE — re-run analysis on demand
     // ═══════════════════════════════════════════
-    if (isAnalyze) {
+    if (doAnalyze) {
       logger.info('[Bot] Analyze triggered manually');
       const analysis = await analyzeThread(context, slackThreadUrl);
       const squad    = analysis.tickets[0]?.squad || detectSquadFromKeywords(context);
@@ -1319,7 +1364,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     // ═══════════════════════════════════════════
     // WEEKLY REPORT — manual trigger
     // ═══════════════════════════════════════════
-    if (isWeeklyReport) {
+    if (doWeekly) {
       logger.info('[Bot] Manual weekly report triggered');
       try { await client.reactions.add({ channel: event.channel, name: 'bar_chart', timestamp: event.ts }); } catch (_) {}
       await sendWeeklyReport(client);
@@ -1331,7 +1376,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     // ═══════════════════════════════════════════
     // CANCEL
     // ═══════════════════════════════════════════
-    if (isCancel) {
+    if (doCancel) {
       const tracked = await findOrRegisterTracked(client, event.channel, threadTs, botBotId, botUserId);
       if (!tracked) {
         await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: '⚠️ No active follow-up found for this thread.' });
@@ -1350,7 +1395,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     // ═══════════════════════════════════════════
     // CHANGE ASSIGNEE
     // ═══════════════════════════════════════════
-    if (isChangeAssignee) {
+    if (doReassign) {
       const mentionedUsers = (event.text.match(/<@([A-Z0-9]+)>/g) || [])
         .map(m => m.replace(/<@|>/g, '')).filter(id => id !== botUserId && !ASSIGNEE_BLOCKLIST.has(id));
 
@@ -1406,7 +1451,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     // ═══════════════════════════════════════════
     // FOLLOW-UP (manual trigger)
     // ═══════════════════════════════════════════
-    if (isFollowup) {
+    if (doFollowup) {
       const tracked = await findOrRegisterTracked(client, event.channel, threadTs, botBotId, botUserId);
 
       // ── No ticket yet → tag SM/PC to review and assign ──
@@ -1548,7 +1593,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     // ═══════════════════════════════════════════
     // TROUBLESHOOT
     // ═══════════════════════════════════════════
-    if (isTroubleshoot) {
+    if (doTrouble) {
       const reply = await aiCall(
         `You are QA Bot for Everfit. Provide practical troubleshooting steps for the CS team to try BEFORE escalating to dev. CS are non-technical — steps must be clear and specific.
 
@@ -1618,7 +1663,7 @@ Max 8 steps total. Plain English only.`,
     }
 
     // Shortcut: "assign to @X" when a LIVE ticket already exists
-    if (triggerText.startsWith('assign to') && liveKeys.length && triggerAssignees.length) {
+    if (aiWantsAssign && liveKeys.length && triggerAssignees.length) {
       const targetKey = liveKeys[0];
       const newJiraId = await resolveJiraAccountId(client, triggerAssignees[0]);
       if (newJiraId) {

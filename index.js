@@ -1030,7 +1030,14 @@ async function getActiveSprintId() {
       params: { state: 'active' },
       headers: { Authorization: jiraAuth(), Accept: 'application/json' },
     });
-    return sprintRes.data?.values?.[0]?.id ?? null;
+    const sprints = sprintRes.data?.values || [];
+    // Multiple sprints can be active at once (dev sprint + "SM Review").
+    // Tickets must ALWAYS go to the real Active Sprint — never SM Review.
+    const eligible = sprints.filter(s => !/sm\s*review/i.test(s.name || ''));
+    if (!eligible.length) return null;
+    eligible.sort((a, b) => new Date(b.startDate || 0) - new Date(a.startDate || 0));
+    console.log(`[Sprint] Selected active sprint: ${eligible[0].name} (${eligible[0].id})`);
+    return eligible[0].id;
   } catch { return null; }
 }
 
