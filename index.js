@@ -792,10 +792,8 @@ async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, pa
   // Reporter — safe to set at creation (standard Jira field)
   if (reporterJiraId) fields.reporter = { accountId: reporterJiraId };
 
-  const res = await axios.post(`${JIRA_HOST}/rest/api/3/issue`, { fields }, {
-    headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' },
-  });
-  const issueKey = res.data.key;
+  const { key: issueKey, notes: createNotes } = await lib.createJiraIssueResilient(fields);
+  if (createNotes.length) console.log(`[QABot] ${issueKey} created with adjustments: ${createNotes.join(' · ')}`);
 
   // QA field — set via update because it may not be on the Create screen for UP project
   if (reporterJiraId) {
@@ -810,7 +808,7 @@ async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, pa
     }
   }
 
-  return { key: issueKey, url: `${JIRA_HOST}/browse/${issueKey}` };
+  return { key: issueKey, url: `${JIRA_HOST}/browse/${issueKey}`, notes: createNotes };
 }
 
 // ── Fetch Jira issue title ────────────────────
@@ -1787,7 +1785,9 @@ const coreMentionHandler = async ({ event, client, logger }) => {
         `${headline} → <${jira.url}|${jira.key}>\n` +
         `*${ticket.summary}*\n` +
         `*${ticket.priority}* priority · *${ticket.platform}* · ${assigneeLine}${attachLine}${acLine}\n` +
-        `_Epic, Fix Version and Active Sprint are set. Tag me anytime to follow up._`
+        (jira.notes && jira.notes.length
+          ? `_${jira.notes.join(' · ')}. Active Sprint is set — tag me anytime to follow up._`
+          : `_Epic, Fix Version and Active Sprint are set. Tag me anytime to follow up._`)
       );
     });
 

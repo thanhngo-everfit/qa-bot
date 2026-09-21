@@ -159,6 +159,58 @@ async function getProjectIssueTypes() {
   return _issueTypesCache || ['Bug', 'Task'];
 }
 
+// ── Jira: resilient issue creation ───────────────────────────────────
+// Different issue types have different create screens: fields like
+// fixVersions, priority, or the Epic Link custom field may not exist on
+// a given type, and Jira rejects the WHOLE request with a 400. This
+// helper retries, dropping or swapping the offending fields (Epic Link
+// falls back to the modern parent link), so a valid ticket still gets
+// created — and reports exactly what was adjusted.
+async function createJiraIssueResilient(fields) {
+  const notes = [];
+  let lastErr = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const res = await axios.post(`${JIRA_HOST}/rest/api/3/issue`, { fields }, {
+        headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' },
+      });
+      return { key: res.data.key, notes };
+    } catch (err) {
+      const status = err.response?.status;
+      const data = err.response?.data || {};
+      const fieldErrors = data.errors || {};
+      lastErr = { status, fieldErrors, messages: data.errorMessages || [] };
+      if (status !== 400 || !Object.keys(fieldErrors).length) break;
+      let fixed = false;
+      for (const bad of Object.keys(fieldErrors)) {
+        if (bad === 'customfield_10014' && fields.customfield_10014) {
+          const key = fields.customfield_10014;
+          delete fields.customfield_10014;
+          if (!fields.parent) {
+            fields.parent = { key };
+            notes.push(`Epic Link isn't supported on this issue type — attached via parent ${key} instead`);
+          } else {
+            notes.push('Epic Link not supported on this issue type — omitted');
+          }
+          fixed = true;
+        } else if (bad === 'parent' && fields.parent) {
+          notes.push(`couldn't attach to parent ${fields.parent.key} (${fieldErrors[bad]})`);
+          delete fields.parent;
+          fixed = true;
+        } else if (fields[bad] !== undefined) {
+          notes.push(`${bad} isn't supported on this issue type — omitted`);
+          delete fields[bad];
+          fixed = true;
+        }
+      }
+      if (!fixed) break;
+    }
+  }
+  const e = new Error(`Jira create failed (${lastErr?.status}): ${(lastErr?.messages || []).join('; ') || JSON.stringify(lastErr?.fieldErrors || {})}`);
+  e.fieldErrors = lastErr?.fieldErrors;
+  throw e;
+}
+
 // ── Jira: quick issue snapshot ───────────────────────────────────────
 async function getIssueSnapshot(issueKey) {
   try {
@@ -293,7 +345,7 @@ Rules:
 module.exports = {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiComplete, aiCall,
-  agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes,
+  agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient,
   resolveUserName, resolveInlineMentions, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
   slackify,

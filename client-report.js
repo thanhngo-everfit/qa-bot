@@ -11,7 +11,7 @@ const path = require('path');
 const {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiCall,
-  agentStatus, getActiveSprintId,
+  agentStatus, getActiveSprintId, createJiraIssueResilient,
   resolveInlineMentions, qaTaskWork,
 } = require('./lib');
 
@@ -648,10 +648,9 @@ async function createJiraIssue(ticket, jiraAccountIds) {
   if (parentKey) fields.parent = { key: parentKey };
   if (jiraAccountIds.length) fields.assignee = { accountId: jiraAccountIds[0] };
 
-  const res = await axios.post(`${JIRA_HOST}/rest/api/3/issue`, { fields }, {
-    headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' },
-  });
-  return { key: res.data.key, url: `${JIRA_HOST}/browse/${res.data.key}` };
+  const { key, notes } = await createJiraIssueResilient(fields);
+  if (notes.length) console.log(`[Bot] ${key} created with adjustments: ${notes.join(' · ')}`);
+  return { key, url: `${JIRA_HOST}/browse/${key}`, notes };
 }
 
 // ─────────────────────────────────────────────

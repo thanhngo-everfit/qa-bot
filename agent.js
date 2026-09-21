@@ -10,7 +10,7 @@
 const axios = require('axios');
 const {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
-  aiComplete, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes,
+  aiComplete, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient,
   resolveInlineMentions, resolveUserName, gatherChannelContext, slackify,
 } = require('./lib');
 
@@ -202,10 +202,13 @@ async function execTool(name, args, ctx) {
           assignee = await jiraUserByQuery(args.assignee_query);
           if (assignee) fields.assignee = { accountId: assignee.accountId };
         }
-        const res = await axios.post(`${JIRA_HOST}/rest/api/3/issue`, { fields }, {
-          headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' },
-        });
-        const key = res.data?.key;
+        let createRes;
+        try {
+          createRes = await createJiraIssueResilient(fields);
+        } catch (e) {
+          return { error: e.message, field_errors: e.fieldErrors || null };
+        }
+        const key = createRes.key;
         const sprintId = await getActiveSprintId();
         if (sprintId && key) {
           await axios.post(`${JIRA_HOST}/rest/agile/1.0/sprint/${sprintId}/issue`, { issues: [key] }, {
@@ -215,7 +218,8 @@ async function execTool(name, args, ctx) {
         if (key && registerFollowUp) registerFollowUp({ channelId, threadTs, jiraKey: key, jiraUrl: `${JIRA_HOST}/browse/${key}`, squad: null });
         return { created: key, url: `${JIRA_HOST}/browse/${key}`,
                  assignee: assignee?.displayName || (args.assignee_query ? `NOT FOUND for "${args.assignee_query}" — created unassigned` : null),
-                 sprint: sprintId ? 'Active Sprint' : 'no active sprint found' };
+                 sprint: sprintId ? 'Active Sprint' : 'no active sprint found',
+                 adjustments: createRes.notes.length ? createRes.notes : undefined };
       }
       case 'jira_assign': {
         const u = await jiraUserByQuery(args.user_query);
@@ -262,7 +266,7 @@ async function execTool(name, args, ctx) {
         return { error: `unknown tool ${name}` };
     }
   } catch (err) {
-    return { error: `${name} failed: ${err.response?.status || ''} ${err.response?.data?.errorMessages?.join('; ') || err.data?.error || err.message}`.trim() };
+    return { error: `${name} failed: ${err.response?.status || ''} ${err.response?.data?.errorMessages?.join('; ') || (err.response?.data?.errors ? JSON.stringify(err.response.data.errors) : '') || err.data?.error || err.message}`.trim() };
   }
 }
 
