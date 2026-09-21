@@ -118,6 +118,7 @@ function agentStatus(client, channel, threadTs) {
       try { await client.chat.update({ channel, ts, text: render() }); } catch (_) {}
     },
     async done() { await del(); },
+    get ts() { return ts; },
   };
 }
 

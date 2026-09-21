@@ -256,7 +256,8 @@ async function execTool(name, args, ctx) {
       case 'delete_own_last_message': {
         const { user_id: botUid } = await client.auth.test();
         const replies = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 100 });
-        const mine = (replies.messages || []).filter(m => m.user === botUid && m.ts !== threadTs)
+        const mine = (replies.messages || [])
+          .filter(m => m.user === botUid && m.ts !== threadTs && m.ts !== ctx.excludeTs)  // never the live status message
           .sort((a, b) => parseFloat(b.ts) - parseFloat(a.ts));
         if (!mine.length) return { error: 'no own message found in this thread' };
         await client.chat.delete({ channel: channelId, ts: mine[0].ts });
@@ -298,12 +299,19 @@ Rules:
     { role: 'user', content: `Thread transcript:\n${(threadContext || '(no thread — direct channel mention)').substring(0, 9000)}\n\nRequest from ${requesterName}: ${requestText}` },
   ];
 
+  const executedTools = [];
+  let retractSucceeded = false;
+
   for (let step = 0; step < 8; step++) {
     const res = await aiComplete({ model: 'gpt-4o', max_tokens: 1600, messages, tools: TOOLS, tool_choice: 'auto' });
     const msg = res.choices[0].message;
     messages.push(msg);
 
     if (!msg.tool_calls || !msg.tool_calls.length) {
+      // Delete-only requests get a silent ack (✅ reaction), not a narration
+      if (retractSucceeded && executedTools.every(n => n === 'delete_own_last_message')) {
+        return { __silent: true };
+      }
       return slackify(msg.content?.trim()) || "I couldn't produce a result for that — try rephrasing.";
     }
 
@@ -312,7 +320,9 @@ Rules:
       try { args = JSON.parse(tc.function.arguments || '{}'); } catch (_) {}
       if (status) await status.update(`🤖 QA Agent ${TOOL_STATUS[tc.function.name] || `_running ${tc.function.name}…_`}`);
       logger?.info?.(`[Agent] tool ${tc.function.name} ${JSON.stringify(args).substring(0, 200)}`);
-      const out = await execTool(tc.function.name, args, { client, channelId, threadTs, registerFollowUp, allowCreate });
+      const out = await execTool(tc.function.name, args, { client, channelId, threadTs, registerFollowUp, allowCreate, excludeTs: status ? status.ts : null });
+      executedTools.push(tc.function.name);
+      if (tc.function.name === 'delete_own_last_message' && out && out.deleted) retractSucceeded = true;
       messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(out).substring(0, 12000) });
     }
   }

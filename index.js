@@ -1523,10 +1523,12 @@ const coreMentionHandler = async ({ event, client, logger }) => {
           logger.warn('[Agent] loop failed:', err.message);
         }
         await agentLoopSt.done();
-        await client.chat.postMessage({
-          channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-          text: result || 'I ran into an error and could not finish — try again in a moment.',
-        });
+        if (!(result && result.__silent)) {
+          await client.chat.postMessage({
+            channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+            text: (typeof result === 'string' && result) || 'I ran into an error and could not finish — try again in a moment.',
+          });
+        }
         await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
         await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
         return;
