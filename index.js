@@ -53,6 +53,23 @@ async function getThreadReporterSlackId(client, channelId, threadTs) {
   }
 }
 
+// Resolve inline <@UID> mentions to real names (cached) — raw Slack IDs
+// must never leak into AI context or replies.
+const _userNameCache = new Map();
+async function resolveUserName(client, uid) {
+  if (_userNameCache.has(uid)) return _userNameCache.get(uid);
+  let name = uid;
+  try { name = (await client.users.info({ user: uid })).user?.real_name || uid; } catch (_) {}
+  _userNameCache.set(uid, name);
+  return name;
+}
+async function resolveInlineMentions(client, text) {
+  const uids = [...new Set([...(text || '').matchAll(/<@([A-Z0-9]+)>/g)].map(m => m[1]))];
+  let out = text || '';
+  for (const uid of uids) out = out.split(`<@${uid}>`).join(`@${await resolveUserName(client, uid)}`);
+  return out;
+}
+
 async function getThread(client, channelId, threadTs) {
   const result   = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 200 });
   const messages = result.messages || [];
@@ -66,9 +83,7 @@ async function getThread(client, channelId, threadTs) {
       const info = await client.users.info({ user: msg.user });
       name = info.user?.real_name || name;
     } catch (_) {}
-    const text = (msg.text || '')
-      // User mentions <@USERID> → @name
-      .replace(/<@([A-Z0-9]+)>/g, (_, uid) => `@${uid}`)
+    const text = (await resolveInlineMentions(client, msg.text || ''))
       // User-group / subteam mentions <!subteam^ID|display> or <!subteam^ID>
       .replace(/<!subteam\^[A-Z0-9]+\|([^>]+)>/g, '@$1')
       .replace(/<!subteam\^[A-Z0-9]+>/g, '')
@@ -1452,12 +1467,13 @@ async function agentRoute(userText, context, existingKeys) {
       model: 'gpt-4o', max_tokens: 60,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: `You are the decision core of QA Agent, a Jira assistant in Slack. Users write English or Vietnamese. Decide ONE action for the user's mention. Return ONLY JSON: {"action":"log_ticket"|"follow_up"|"answer"}
+        { role: 'system', content: `You are the decision core of QA Agent, a Jira assistant in Slack. Users write English or Vietnamese. Decide ONE action for the user's mention. Return ONLY JSON: {"action":"log_ticket"|"follow_up"|"task"|"answer"}
 
 Actions:
 - "log_ticket": user wants a NEW Jira ticket created from this thread ("log this", "t\u1ea1o ticket", "l\u00ean card", or a bare tag in a thread with NO existing ticket)
 - "follow_up": user wants status/progress/tracking of the EXISTING ticket(s) in this thread ("follow up on this", "theo d\u00f5i", "status?", "track this", "any update", "check ti\u1ebfn \u0111\u1ed9", "nh\u1eafc dev gi\u00fap")
-- "answer": greeting, question, opinion, summary request, anything conversational
+- "task": user asks for substantive WORK on this thread or topic — summarize, list/extract items, draft a message/announcement/release note, translate, compare, plan tests, review, write documentation, analyze in depth ("summary all demo items", "t\u00f3m t\u1eaft thread n\u00e0y", "draft the announcement", "extract action items", "translate this for the client")
+- "answer": greeting, short question, quick opinion — brief conversational replies only
 
 CRITICAL RULE: Existing tickets in thread: ${existingKeys.length ? existingKeys.join(', ') : 'NONE'}.
 If tickets already exist, "log_ticket" is almost never right \u2014 requests mentioning the issue, tracking, or checking route to "follow_up". Only choose "log_ticket" despite existing tickets if the user EXPLICITLY asks for a new/additional/separate ticket.
@@ -1466,8 +1482,31 @@ A bare tag (empty message) with existing tickets \u2192 "follow_up". A bare tag 
       ],
     });
     const parsed = JSON.parse(res.choices[0].message.content || '{}');
-    return ['log_ticket', 'follow_up', 'answer'].includes(parsed.action) ? parsed.action : 'log_ticket';
+    return ['log_ticket', 'follow_up', 'task', 'answer'].includes(parsed.action) ? parsed.action : 'log_ticket';
   } catch { return 'log_ticket'; } // on failure, original behavior
+}
+
+
+// ── General task worker: QA Agent does ANY requested knowledge work ──
+async function qaTaskWork(context, userText) {
+  try {
+    const res = await openai.chat.completions.create({
+      model: 'gpt-4o', max_tokens: 1800,
+      messages: [
+        { role: 'system', content: `You are QA Agent, Everfit's autonomous QA assistant in Slack. A teammate tagged you in a thread with a work request. Do the work fully and directly — summarize, extract/list items, draft messages or announcements, translate, compare, plan tests, review, analyze — whatever they asked.
+
+Rules:
+- Output in ENGLISH only, regardless of the thread's language
+- Use Slack formatting: *bold* for emphasis and section names, \u2022 for bullets; NO markdown headers (#)
+- Refer to people by the names in the transcript. NEVER output raw Slack IDs like U07ABCDEF
+- Be complete but not padded — deliver the work product itself, no preamble like "Here is the summary"
+- If the thread doesn't contain enough information, deliver the best partial result and state clearly what is missing
+- Never invent ticket numbers, links, or facts not present in the thread` },
+        { role: 'user', content: `Thread transcript:\n${(context || '(no thread)').substring(0, 12000)}\n\nRequest: ${userText}` },
+      ],
+    });
+    return res.choices[0].message.content?.trim() || null;
+  } catch { return null; }
 }
 
 async function qaChatReply(context, userText) {
@@ -1524,6 +1563,20 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       const existingKeys = await scanThreadTicketKeys(client, event.channel, threadTs);
       const action = await agentRoute(triggerText, context, existingKeys);
       logger.info(`[QAAgent] route="${action}" existing=[${existingKeys.join(',')}] msg="${triggerText.substring(0, 50)}"`);
+
+      if (action === 'task') {
+        const taskSt = agentStatus(client, event.channel, threadTs);
+        await taskSt.start('\u23f3 _QA Agent is working on it\u2026_');
+        const result = await qaTaskWork(context, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
+        await taskSt.done();
+        await client.chat.postMessage({
+          channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+          text: result || "I couldn't complete that from what's in this thread \u2014 give me a bit more detail on what you need.",
+        });
+        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+        await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
+        return;
+      }
 
       if (action === 'answer') {
         const reply = await qaChatReply(context, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
