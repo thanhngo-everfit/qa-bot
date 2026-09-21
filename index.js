@@ -1396,6 +1396,18 @@ async function getParentFromChannelCanvas(client, channelId) {
   }
 }
 
+// ── Agent status: live progress message (agent-working feel) ──
+function agentStatus(client, channel, threadTs) {
+  let ts = null;
+  return {
+    async start(text) {
+      try { const r = await client.chat.postMessage({ channel, thread_ts: threadTs, unfurl_links: false, text }); ts = r.ts; } catch (_) {}
+    },
+    async update(text) { if (!ts) return; try { await client.chat.update({ channel, ts, text }); } catch (_) {} },
+    async done() { if (!ts) return; try { await client.chat.delete({ channel, ts }); } catch (_) {} ts = null; },
+  };
+}
+
 // ── Conversational intelligence for QA Bot mentions ─────────────────
 // Distinguishes "log this" from greetings/questions, and answers the
 // latter like an assistant instead of dumping boilerplate (or worse,
@@ -1486,7 +1498,11 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       }
     }
 
+    const agentSt = agentStatus(client, event.channel, threadTs);
+    await agentSt.start('⏳ _Dispatching to QA Agent — reading the thread…_');
+
     // Classify Bug vs Task — explicit keyword wins; otherwise AI decides from thread content
+    await agentSt.update('🧠 _QA Agent is identifying Bug vs Task…_');
     const issueType = await classifyIssueType(triggerText, context);
     const isTask    = issueType === 'Task';
     logger.info(`[QABot] Issue type classified as: ${issueType}`);
@@ -1660,6 +1676,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       }
 
       logger.info(`[QABot] Creating ${issueType}: ${ticket.summary} epic=${epicKey || 'none'} parent=${parentKey || 'none'}`);
+      await agentSt.update('🎫 _QA Agent is creating the Jira ticket…_');
       const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId, issueType);
 
       if (sprintId) await addIssueToSprint(jira.key, sprintId);
@@ -1681,7 +1698,9 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
           const ok  = await uploadAttachmentToJira(jira.key, att.name, buf, att.mimetype);
           if (ok) { uploaded++; logger.info(`[QABot] ✓ ${att.name}`); }
           else     { logger.warn(`[QABot] ✗ ${att.name} failed to upload`); }
-        } catch (err) {
+          await agentSt.done();
+  } catch (err) {
+    try { await agentSt.done(); } catch (_) {}
           logger.warn(`[QABot] ✗ ${att.name}: ${err.message}`);
         }
       }

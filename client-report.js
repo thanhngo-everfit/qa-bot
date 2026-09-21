@@ -1467,6 +1467,30 @@ async function findOrRegisterTracked(client, channelId, threadTs, botBotId, botU
 // MAIN EVENT HANDLER (@QA Bot commands)
 // ─────────────────────────────────────────────
 
+// ── Agent status: live progress message that updates through phases ──
+// Gives the "an agent is working" feel: one message posted immediately,
+// edited as work progresses, deleted when the real reply lands.
+function agentStatus(client, channel, threadTs) {
+  let ts = null;
+  return {
+    async start(text) {
+      try {
+        const r = await client.chat.postMessage({ channel, thread_ts: threadTs, unfurl_links: false, text });
+        ts = r.ts;
+      } catch (_) {}
+    },
+    async update(text) {
+      if (!ts) return;
+      try { await client.chat.update({ channel, ts, text }); } catch (_) {}
+    },
+    async done() {
+      if (!ts) return;
+      try { await client.chat.delete({ channel, ts }); } catch (_) {}
+      ts = null;
+    },
+  };
+}
+
 // ── AI intent router: understand natural language commands ──
 // Lets people talk to the bot naturally in English or Vietnamese instead
 // of memorizing exact command prefixes.
@@ -1525,6 +1549,8 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       logger.info(`[Bot] AI router: "${triggerText.substring(0, 60)}" → ${aiAction}`);
     }
 
+    const agentSt = agentStatus(client, event.channel, event.thread_ts || event.ts);
+
     const doAnalyze  = isAnalyze        || aiAction === 'analyze';
     const doWeekly   = isWeeklyReport   || aiAction === 'weekly_report';
     const doCreate   = isCreateCard     || aiAction === 'create_card' || aiAction === 'assign';
@@ -1548,7 +1574,9 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
           `Thread context:\n${(threadCtx || '(no thread — mentioned directly in channel)').substring(0, 3000)}\n\nUser message: ${question}`,
           400, false, 'gpt-4o'
         )).trim();
-      } catch (err) { logger.warn('[Bot] Chat fallback failed:', err.message); }
+        await agentSt.done();
+  } catch (err) {
+    try { await agentSt.done(); } catch (_) {} logger.warn('[Bot] Chat fallback failed:', err.message); }
 
       await client.chat.postMessage({
         channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false,
@@ -1578,6 +1606,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
     // ANALYZE — re-run analysis on demand
     // ═══════════════════════════════════════════
     if (doAnalyze) {
+      await agentSt.start('⏳ _Dispatching to QA Agent — analyzing this thread…_');
       logger.info('[Bot] Analyze triggered manually');
       const analysis = await analyzeThread(context, slackThreadUrl);
       const squad    = analysis.tickets[0]?.squad || detectSquadFromKeywords(context);
@@ -1595,6 +1624,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
     // WEEKLY REPORT — manual trigger
     // ═══════════════════════════════════════════
     if (doWeekly) {
+      await agentSt.start('⏳ _Dispatching to QA Agent — compiling the weekly report…_');
       logger.info('[Bot] Manual weekly report triggered');
       try { await client.reactions.add({ channel: event.channel, name: 'bar_chart', timestamp: event.ts }); } catch (_) {}
       await sendWeeklyReport(client);
@@ -1682,6 +1712,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
     // FOLLOW-UP (manual trigger)
     // ═══════════════════════════════════════════
     if (doFollowup) {
+      await agentSt.start('⏳ _QA Agent is checking ticket status…_');
       const tracked = await findOrRegisterTracked(client, event.channel, threadTs, botBotId, botUserId);
 
       // ── No ticket yet → tag SM/PC to review and assign ──
@@ -1824,6 +1855,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
     // TROUBLESHOOT
     // ═══════════════════════════════════════════
     if (doTrouble) {
+      await agentSt.start('⏳ _QA Agent is preparing troubleshooting steps…_');
       const reply = await aiCall(
         `You are QA Bot for Everfit. Provide practical troubleshooting steps for the CS team to try BEFORE escalating to dev. CS are non-technical — steps must be clear and specific.
 
@@ -1872,7 +1904,10 @@ Max 8 steps total. Plain English only.`,
 
     // Run analysis to get ticket details
     logger.info('[Bot] Create card — analyzing thread...');
+    await agentSt.start('⏳ _Dispatching to QA Agent — reading the thread…_');
+    await agentSt.update('🧠 _QA Agent is analyzing and drafting the ticket…_');
     const analysis = await analyzeThread(context, slackThreadUrl);
+    await agentSt.update('🎫 _QA Agent is creating the Jira card…_');
     logger.info(`[Bot] Severity=${analysis.severity} · tickets=${analysis.tickets.length}`);
 
     const squad = analysis.tickets[0]?.squad || detectSquadFromKeywords(context);
@@ -2052,9 +2087,13 @@ slackApp.event('message', async ({ event, client, logger }) => {
     logger.info(`[Bot] Auto-analyzing new thread in ${MONITORED_CHANNELS[event.channel]}`);
     await client.reactions.add({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
 
+    const status = agentStatus(client, event.channel, event.ts);
+    await status.start('⏳ _Dispatching to QA Agent…_');
+
     const slackThreadUrl = buildSlackThreadUrl(event.channel, event.ts);
     const context = text;
 
+    await status.update('🧠 _QA Agent is analyzing the report…_');
     const analysis = await analyzeThread(context, slackThreadUrl);
     logger.info(`[Bot] Auto-analyze: Severity=${analysis.severity}`);
 
@@ -2062,6 +2101,7 @@ slackApp.event('message', async ({ event, client, logger }) => {
     const contacts = resolveContactMentions(squad ? getSquadContacts(squad) : null);
 
     const replyText = buildAnalysisReply(analysis, squad, contacts);
+    await status.done();
     await client.chat.postMessage({
       channel: event.channel,
       thread_ts: event.ts,
