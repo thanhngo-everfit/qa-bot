@@ -563,23 +563,60 @@ function renderLineAdf(line) {
   return lineToAdfContent(line);
 }
 
+// Full markdown -> ADF converter — same format as QA Bot's normal tickets:
+// ## headings, ordered lists (1. 2.), bullet lists (- ), **bold**, links.
 function buildAdfDescription(text) {
-  return {
-    type: 'doc', version: 1,
-    content: (text || '').split('\n')
-      .filter(l => l.trim())
-      .map(l => ({ type: 'paragraph', content: renderLineAdf(l) })),
-  };
+  const lines = (text || '').split('\n').filter(l => l.trim() !== '');
+  const content = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i].trim();
+
+    if (/^\d+\.\s/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\d+\.\s/.test(lines[i].trim())) {
+        items.push({ type: 'listItem', content: [{ type: 'paragraph', content: renderLineAdf(lines[i].trim().replace(/^\d+\.\s+/, '')) }] });
+        i++;
+      }
+      content.push({ type: 'orderedList', content: items });
+      continue;
+    }
+
+    if (/^-\s/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^-\s/.test(lines[i].trim())) {
+        items.push({ type: 'listItem', content: [{ type: 'paragraph', content: renderLineAdf(lines[i].trim().replace(/^-\s+/, '')) }] });
+        i++;
+      }
+      content.push({ type: 'bulletList', content: items });
+      continue;
+    }
+
+    if (line.startsWith('## ')) {
+      content.push({ type: 'heading', attrs: { level: 2 }, content: [{ type: 'text', text: line.slice(3).trim() }] });
+      i++;
+      continue;
+    }
+
+    content.push({ type: 'paragraph', content: renderLineAdf(line) });
+    i++;
+  }
+
+  return { type: 'doc', version: 1, content };
 }
 
 async function createJiraIssue(ticket, jiraAccountIds) {
   const sevMeta = SEVERITY_META[ticket.severity] || SEVERITY_META.Medium;
+  // Reference section appended in code so the thread link is never lost
+  let descText = (ticket.description || '').trim().replace(/^Slack thread:.*$/m, '').trim();
+  if (ticket.slackThreadUrl) descText += `\n\n## Reference\n- Slack thread: ${ticket.slackThreadUrl}`;
   const fields = {
     project:     { key: JIRA_PROJECT },
     summary:     ticket.summary,
     issuetype:   { name: ticket.type === 'Task' ? 'Task' : 'Bug' },
     priority:    { name: sevMeta.jiraPriority },   // derived from severity
-    description: buildAdfDescription(ticket.description),
+    description: buildAdfDescription(descText),
     fixVersions: [{ id: '27643' }],
   };
   const parentKey = PLATFORM_PARENTS[ticket.platform];
@@ -732,40 +769,47 @@ REMINDER: every string value below must be in ENGLISH — translate all Vietname
   ]
 }
 
-DESCRIPTION TEMPLATE (Bug):
-Slack thread: ${slackThreadUrl}
-Squad: <squad>
-Severity: <severity> — <rationale>
+DESCRIPTION TEMPLATE (Bug) — use this EXACT structure with ## section headings (real newlines, **bold** for key terms):
 
-Reported by: <coach/client name or email — NOT the CS/SM who posted>
-Intercom link: <URL if found, else omit this line>
+## Bug Description
+[1-3 sentences: what exactly is broken, under what conditions, who is affected. Specific — use thread details.]
 
-Affected area: <feature or screen name>
+## Report Info
+- **Reported by:** <coach/client name AND email — NOT the CS/SM who posted>
+- **Intercom:** <URL if found, else omit this line>
+- **Squad:** <squad>
+- **Severity:** <severity> — <one-line rationale>
 
-Steps to reproduce:
-1. <step>
-2. <step>
+## Root Cause
+[Why this happens technically. From thread if stated, else a concise inference from symptoms. Never N/A.]
 
-Expected behavior: <what should happen>
-Actual behavior: <what actually happens>
+## Expected Behavior
+- [what SHOULD happen]
 
-Resolution Steps:
-- <step from KB pattern if applicable>
-- <step>
+## Steps to Reproduce
+1. [specific step from thread]
+2. [specific step]
 
-DESCRIPTION TEMPLATE (Task / Data fix):
-Slack thread: ${slackThreadUrl}
-Squad: <squad>
-Severity: <severity> — <rationale>
+## Resolution Steps
+- [step from KB pattern if applicable — omit this section entirely if nothing useful]
 
-Reported by: <coach/client name or email>
-Intercom link: <URL if found, else omit this line>
+DESCRIPTION TEMPLATE (Task / Data fix) — use this EXACT structure with ## section headings:
 
-Request details: <clear, specific description of what needs to be done>
+## Context
+[2-3 sentences: who requested this, what needs to be done, and why. Business context from the thread.]
 
-Resolution Steps:
-- <step>
-- <step>`;
+## Report Info
+- **Reported by:** <coach/client name AND email>
+- **Intercom:** <URL if found, else omit this line>
+- **Squad:** <squad>
+- **Severity:** <severity> — <one-line rationale>
+
+## Requirements
+1. **[Short label]** — [specific description of what needs to be done]
+2. **[Short label]** — [specific description, add more as needed]
+
+ISSUE TYPE RULE: broken/incorrect behavior → Bug. Data fix, config change, account/email update, enable feature, export request, or any "please do X" → Task. Pick per ticket.
+Do NOT include the Slack thread link in the description — it is appended automatically as a Reference section.`;
 
   const rawResponse = await aiCall(systemPrompt, `Slack thread:\n\n${context}`, 3500, true); // jsonMode
 
@@ -792,7 +836,7 @@ Resolution Steps:
 
   if (parsed) {
     if (Array.isArray(parsed.tickets)) {
-      parsed.tickets = parsed.tickets.map(t => normalizeTicketSummary(t, parsed));
+      parsed.tickets = parsed.tickets.map(t => ({ ...normalizeTicketSummary(t, parsed), slackThreadUrl }));
     }
     return parsed;
   }
@@ -828,6 +872,7 @@ Resolution Steps:
       severity_rationale:    'Defaulted to Medium (AI parse error — please verify)',
       tickets: [{
         summary:          `[Client Report][Web][General] ${englishTitle || 'Client reported issue — see Slack thread'}`,
+        slackThreadUrl,
         type:             'Bug',
         severity:         'Medium',
         platform:         'Web',
