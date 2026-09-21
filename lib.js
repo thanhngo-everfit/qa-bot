@@ -69,9 +69,27 @@ async function aiCall(system, userContent, maxTokens = 1000, jsonMode = false, m
 }
 
 // ── Agent status: live progress message (animated working dots) ─────
+// Claude-style thinking indicator: an informative first-person phase
+// line plus a rotating "thinking" word underneath — no emoji, no dots.
+// All phase texts are normalized here centrally, so every caller in any
+// file automatically gets the same voice and style.
+const THINKING_WORDS = ['Thinking', 'Working on it', 'Analyzing', 'Connecting the dots', 'Almost there'];
+
+function _cleanStatus(text) {
+  let t = (text || '').replace(/_/g, '').replace(/…/g, '').trim();
+  t = t.replace(/^[^A-Za-z]+/, '').trim();                    // strip emoji / punctuation prefix
+  t = t.replace(/^Dispatching to QA Agent.*$/i, 'on it');
+  t = t.replace(/^QA Agent (is )?/i, '');                     // "QA Agent is X" → "X"
+  t = t.replace(/^[^A-Za-z]+/, '').trim();                    // strip emoji again after prefix removal
+  t = t.replace(/[.\s]+$/, '').trim();
+  if (!t) return "I'm on it";
+  if (!/^I(['’]m| am|\b)/i.test(t)) t = "I'm " + t.charAt(0).toLowerCase() + t.slice(1);
+  return t;
+}
+
 function agentStatus(client, channel, threadTs) {
-  let ts = null, base = '', dots = 0, timer = null, killer = null;
-  const render = () => dots ? `${base} ${'·'.repeat(dots)}` : base;
+  let ts = null, base = '', wi = 0, timer = null, killer = null;
+  const render = () => `_${base}_\n_${THINKING_WORDS[wi % THINKING_WORDS.length]}_`;
   const stopTimers = () => { if (timer) clearInterval(timer); if (killer) clearTimeout(killer); timer = killer = null; };
   const del = async () => {
     stopTimers();
@@ -81,21 +99,21 @@ function agentStatus(client, channel, threadTs) {
   };
   return {
     async start(text) {
-      base = text; dots = 0;
+      base = _cleanStatus(text); wi = 0;
       try {
         const r = await client.chat.postMessage({ channel, thread_ts: threadTs, unfurl_links: false, text: render() });
         ts = r.ts;
-        // Animated working dots — edits the status every 2.5s so it feels alive
+        // Rotate the thinking word every 2.5s — alive, like Claude's indicator
         timer = setInterval(async () => {
           if (!ts) return;
-          dots = (dots + 1) % 4;
+          wi++;
           try { await client.chat.update({ channel, ts, text: render() }); } catch (_) {}
         }, 2500);
         killer = setTimeout(del, 4 * 60 * 1000);   // safety net: a status can never orphan
       } catch (_) {}
     },
     async update(text) {
-      base = text; dots = 0;
+      base = _cleanStatus(text); wi = 0;
       if (!ts) return;
       try { await client.chat.update({ channel, ts, text: render() }); } catch (_) {}
     },
