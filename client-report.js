@@ -1551,8 +1551,15 @@ const crMentionHandler = async ({ event, client, logger }) => {
             text: "I don't have a message of mine in this thread to delete.",
           });
         } else {
-          await client.chat.delete({ channel: event.channel, ts: mine[0].ts });
-          logger.info(`[Bot] Retracted own message ${mine[0].ts}`);
+          const wantAll = /\ball\b|tất cả|hết|mọi tin/i.test(event.text);
+          const targets = wantAll ? mine.slice(0, 50) : [mine[0]];
+          for (const m of targets) {
+            try {
+              await client.chat.delete({ channel: event.channel, ts: m.ts });
+              if (targets.length > 3) await new Promise(r => setTimeout(r, 350));
+            } catch (_) {}
+          }
+          logger.info(`[Bot] Retracted ${targets.length} own message(s)`);
         }
       } catch (err) {
         logger.warn('[Bot] Retract failed:', err.data?.error || err.message);

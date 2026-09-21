@@ -75,9 +75,12 @@ const TOOLS = [
     parameters: { type: 'object', required: ['key'], properties: { key: { type: 'string' } } },
   } },
   { type: 'function', function: {
-    name: 'delete_own_last_message',
-    description: 'Delete the agent\'s own most recent message in this thread (when asked to retract/remove a reply).',
-    parameters: { type: 'object', properties: {} },
+    name: 'delete_own_messages',
+    description: 'Delete the agent\'s own message(s) in this thread — the most recent one, the last N, or all of them ("delete your last response", "delete all your responses", "xóa hết tin nhắn của bạn").',
+    parameters: { type: 'object', properties: {
+      which: { type: 'string', enum: ['last', 'all'], description: 'Default "last"' },
+      count: { type: 'integer', description: 'Delete the last N of my messages (overrides which)' },
+    } },
   } },
 ];
 
@@ -90,7 +93,7 @@ const TOOL_STATUS = {
   jira_transition:      '🔁 _moving the ticket status…_',
   jira_comment:         '💬 _commenting on the ticket…_',
   register_followup:    '⏰ _setting up follow-up tracking…_',
-  delete_own_last_message: '🧹 _removing my message…_',
+  delete_own_messages: "I'm removing my messages",
 };
 
 // ── Tool implementations ─────────────────────────────────────────────
@@ -253,15 +256,25 @@ async function execTool(name, args, ctx) {
         ctx.registerFollowUp({ channelId, threadTs, jiraKey: args.key.toUpperCase(), jiraUrl: `${JIRA_HOST}/browse/${args.key.toUpperCase()}`, squad: null });
         return { tracking: args.key.toUpperCase() };
       }
-      case 'delete_own_last_message': {
+      case 'delete_own_messages': {
         const { user_id: botUid } = await client.auth.test();
         const replies = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 100 });
         const mine = (replies.messages || [])
           .filter(m => m.user === botUid && m.ts !== threadTs && m.ts !== ctx.excludeTs)  // never the live status message
           .sort((a, b) => parseFloat(b.ts) - parseFloat(a.ts));
         if (!mine.length) return { error: 'no own message found in this thread' };
-        await client.chat.delete({ channel: channelId, ts: mine[0].ts });
-        return { deleted: mine[0].ts };
+        const n = args.count ? Math.min(args.count, mine.length)
+                : args.which === 'all' ? mine.length
+                : 1;
+        let deleted = 0;
+        for (const m of mine.slice(0, Math.min(n, 50))) {
+          try {
+            await client.chat.delete({ channel: channelId, ts: m.ts });
+            deleted++;
+            if (n > 3) await new Promise(r => setTimeout(r, 350));   // stay under rate limits on bulk deletes
+          } catch (_) {}
+        }
+        return deleted ? { deleted } : { error: 'could not delete any messages' };
       }
       default:
         return { error: `unknown tool ${name}` };
@@ -309,7 +322,7 @@ Rules:
 
     if (!msg.tool_calls || !msg.tool_calls.length) {
       // Delete-only requests get a silent ack (✅ reaction), not a narration
-      if (retractSucceeded && executedTools.every(n => n === 'delete_own_last_message')) {
+      if (retractSucceeded && executedTools.every(n => n === 'delete_own_messages')) {
         return { __silent: true };
       }
       return slackify(msg.content?.trim()) || "I couldn't produce a result for that — try rephrasing.";
@@ -322,7 +335,7 @@ Rules:
       logger?.info?.(`[Agent] tool ${tc.function.name} ${JSON.stringify(args).substring(0, 200)}`);
       const out = await execTool(tc.function.name, args, { client, channelId, threadTs, registerFollowUp, allowCreate, excludeTs: status ? status.ts : null });
       executedTools.push(tc.function.name);
-      if (tc.function.name === 'delete_own_last_message' && out && out.deleted) retractSucceeded = true;
+      if (tc.function.name === 'delete_own_messages' && out && out.deleted) retractSucceeded = true;
       messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(out).substring(0, 12000) });
     }
   }
