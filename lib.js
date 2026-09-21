@@ -69,12 +69,10 @@ async function aiCall(system, userContent, maxTokens = 1000, jsonMode = false, m
 }
 
 // ── Agent status: live progress message (animated working dots) ─────
-// Claude-style thinking indicator: an informative first-person phase
-// line plus a rotating "thinking" word underneath — no emoji, no dots.
-// All phase texts are normalized here centrally, so every caller in any
-// file automatically gets the same voice and style.
-const THINKING_WORDS = ['Thinking', 'Working on it', 'Analyzing', 'Connecting the dots', 'Almost there'];
-
+// Live action label, Claude-style: one first-person line stating the
+// CURRENT step ("I'm searching Jira", "I'm creating the Jira ticket"),
+// edited in place whenever the step changes. All phase texts are
+// normalized here centrally — first person, no emoji, no ellipsis.
 function _cleanStatus(text) {
   let t = (text || '').replace(/_/g, '').replace(/…/g, '').trim();
   t = t.replace(/^[^A-Za-z]+/, '').trim();                    // strip emoji / punctuation prefix
@@ -88,34 +86,28 @@ function _cleanStatus(text) {
 }
 
 function agentStatus(client, channel, threadTs) {
-  let ts = null, base = '', wi = 0, timer = null, killer = null;
-  const render = () => `_${base}_\n_${THINKING_WORDS[wi % THINKING_WORDS.length]}_`;
-  const stopTimers = () => { if (timer) clearInterval(timer); if (killer) clearTimeout(killer); timer = killer = null; };
+  // One italic line describing the CURRENT step, truthfully — it changes
+  // whenever the work moves to a new step (per tool call in the agent
+  // loop, per phase in the pipelines). No fake animation.
+  let ts = null, killer = null;
   const del = async () => {
-    stopTimers();
+    if (killer) clearTimeout(killer);
+    killer = null;
     if (!ts) return;
     const t = ts; ts = null;
     try { await client.chat.delete({ channel, ts: t }); } catch (_) {}
   };
   return {
     async start(text) {
-      base = _cleanStatus(text); wi = 0;
       try {
-        const r = await client.chat.postMessage({ channel, thread_ts: threadTs, unfurl_links: false, text: render() });
+        const r = await client.chat.postMessage({ channel, thread_ts: threadTs, unfurl_links: false, text: `_${_cleanStatus(text)}_` });
         ts = r.ts;
-        // Rotate the thinking word every 2.5s — alive, like Claude's indicator
-        timer = setInterval(async () => {
-          if (!ts) return;
-          wi++;
-          try { await client.chat.update({ channel, ts, text: render() }); } catch (_) {}
-        }, 2500);
         killer = setTimeout(del, 4 * 60 * 1000);   // safety net: a status can never orphan
       } catch (_) {}
     },
     async update(text) {
-      base = _cleanStatus(text); wi = 0;
       if (!ts) return;
-      try { await client.chat.update({ channel, ts, text: render() }); } catch (_) {}
+      try { await client.chat.update({ channel, ts, text: `_${_cleanStatus(text)}_` }); } catch (_) {}
     },
     async done() { await del(); },
     get ts() { return ts; },
