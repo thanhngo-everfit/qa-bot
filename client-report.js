@@ -1570,13 +1570,28 @@ const crMentionHandler = async ({ event, client, logger }) => {
     if (aiAction === 'task') {
       const taskSt = agentStatus(client, event.channel, event.thread_ts || event.ts);
       await taskSt.start('⏳ _QA Agent is working on it…_');
-      const threadCtx = event.thread_ts ? await getThread(client, event.channel, event.thread_ts).catch(() => '') : '';
+      const crRequest = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
+      let threadCtx = event.thread_ts ? await getThread(client, event.channel, event.thread_ts).catch(() => '') : '';
+      let crMaxChars = 12000;
+      const { detectChannelScope, parseWindowDays, gatherChannelContext } = require('./lib');
+      if (detectChannelScope(crRequest)) {
+        const days = parseWindowDays(crRequest);
+        await taskSt.update(`\ud83d\udcda _QA Agent is reading this channel's threads from the last ${days} days\u2026_`);
+        const gathered = await gatherChannelContext(client, event.channel, { days });
+        if (gathered.note) {
+          await taskSt.done();
+          await client.chat.postMessage({ channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false, text: gathered.note });
+          await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+          return;
+        }
+        if (gathered.context) { threadCtx = gathered.context; crMaxChars = 30000; }
+      }
       let result = null;
       try {
         result = (await aiCall(
           `You are QA Agent, Everfit's autonomous QA assistant in Slack bug-report channels. A teammate tagged you with a work request. Do the work fully and directly — summarize, extract/list items, draft messages or replies, translate, compare, review, analyze — whatever they asked.
 Rules: Output in ENGLISH only. Use Slack formatting (*bold*, • bullets), no markdown headers. Refer to people by the names in the transcript — NEVER raw Slack IDs. Deliver the work product itself with no preamble. If the thread lacks information, give the best partial result and state what's missing. Never invent ticket numbers, links, or facts.`,
-          `Thread transcript:\n${(threadCtx || '(no thread)').substring(0, 12000)}\n\nRequest: ${event.text.replace(/<@[A-Z0-9]+>/g, '').trim()}`,
+          `Transcript (may contain MULTIPLE threads from the channel, plus a LIVE JIRA STATUS section — treat that section as the current source of truth):\n${(threadCtx || '(no thread)').substring(0, crMaxChars)}\n\nRequest: ${crRequest}`,
           1800, false, 'gpt-4o'
         )).trim();
       } catch (err) { logger.warn('[Bot] Task work failed:', err.message); }

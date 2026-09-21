@@ -1530,7 +1530,16 @@ const coreMentionHandler = async ({ event, client, logger }) => {
       if (action === 'task') {
         const taskSt = agentStatus(client, event.channel, threadTs);
         await taskSt.start('\u23f3 _QA Agent is working on it\u2026_');
-        const result = await qaTaskWork(context, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
+        const request = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
+        let workContext = context, maxChars = 12000, scopeNote = null;
+        if (lib.detectChannelScope(request)) {
+          const days = lib.parseWindowDays(request);
+          await taskSt.update(`\ud83d\udcda _QA Agent is reading this channel's threads from the last ${days} days\u2026_`);
+          const gathered = await lib.gatherChannelContext(client, event.channel, { days });
+          if (gathered.context) { workContext = gathered.context; maxChars = 30000; }
+          scopeNote = gathered.note;
+        }
+        const result = scopeNote ? scopeNote : await qaTaskWork(workContext, request, maxChars);
         await taskSt.done();
         await client.chat.postMessage({
           channel: event.channel, thread_ts: threadTs, unfurl_links: false,
