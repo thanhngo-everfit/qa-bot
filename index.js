@@ -7,6 +7,8 @@ const FormData = require('form-data');
 const JIRA_HOST    = 'https://everfit.atlassian.net';
 const JIRA_PROJECT = 'UP';
 
+const clientReport = require('./client-report');
+
 const slackApp = new App({
   token:         process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
@@ -1388,6 +1390,9 @@ async function getParentFromChannelCanvas(client, channelId) {
 }
 
 slackApp.event('app_mention', async ({ event, client, logger }) => {
+  // Client-report channels are handled by the client-report module
+  if (clientReport.MONITORED_CHANNELS[event.channel]) return;
+
   const authRes   = await client.auth.test();
   const botUserId = authRes.user_id;
   const botBotId  = authRes.bot_id;
@@ -1684,4 +1689,5 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
 (async () => {
   await slackApp.start(process.env.PORT || 3001);
   console.log('✅ QABot running on port', process.env.PORT || 3001);
+  clientReport.register(slackApp, openai);
 })();
