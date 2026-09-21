@@ -1960,6 +1960,11 @@ Max 8 steps total. Plain English only.`,
 
     // Parse trigger: direct assignees vs cc/fyi (cc'd members are NEVER assigned)
     const { assignees: triggerAssignees, ccIds } = parseAssigneesFromTrigger(event.text, botUserId);
+    // "assign to me" / "giao cho em|mình|tôi" (no @mention) → the requester
+    if (!triggerAssignees.length && /\b(assign|giao)\b[^.<\n]{0,30}\b(to\s+)?(me|myself|em|mình|tôi)\b/i.test(event.text)) {
+      triggerAssignees.push(event.user);
+      logger.info('[Bot] Self-assign detected → assigning to requester');
+    }
     if (ccIds.length) logger.info(`[Bot] cc/fyi mentions excluded from assignment: ${ccIds.join(', ')}`);
 
     // Validate that thread tickets still exist in Jira (they may have been deleted)
@@ -1972,6 +1977,11 @@ Max 8 steps total. Plain English only.`,
       // All previous tickets deleted → allow re-creation, don't dedup against dead summaries
       existingSummaries.length = 0;
     }
+
+    // Keys the requester referenced in the command itself (e.g. "under epic
+    // UP-51189", "duplicate of UP-123") are context, NOT duplicate signals.
+    const referencedInTrigger = new Set((event.text.match(/\b(?:UP|PLAN)-\d+\b/gi) || []).map(k => k.toUpperCase()));
+    const dedupKeys = liveKeys.filter(k => !referencedInTrigger.has(k));
 
     // Shortcut: "assign to @X" when a LIVE ticket already exists
     if (aiWantsAssign && liveKeys.length && triggerAssignees.length) {
@@ -2011,7 +2021,7 @@ Max 8 steps total. Plain English only.`,
       await agentSt.done();
       await client.chat.postMessage({
         channel: event.channel, thread_ts: threadTs,
-        text: `I held off — this thread already has ${liveKeys.map(k => `<${JIRA_HOST}/browse/${k}|${k}>`).join(', ')}. Say _"follow up"_ to track it, or _"force log"_ if you need a separate ticket.`,
+        text: `I held off — this thread already has ${(dedupKeys.length ? dedupKeys : liveKeys).map(k => `<${JIRA_HOST}/browse/${k}|${k}>`).join(', ')}. Say _"follow up"_ to track it, or _"force log"_ if you need a separate ticket.`,
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       return;

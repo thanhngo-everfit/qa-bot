@@ -316,6 +316,8 @@ CRITICAL RULES:
 8. IMPORTANT — Structured Vietnamese bug reports: threads formatted as "[Platform][Feature][SubFeature]\nNhờ... check\n*Step:*\n1...\n*Actual*:\n...\n*Expected*:\n..." ARE bug reports. Parse the [Platform][Feature] as the prefix, the Actual section as the bug description, and the Expected section as expected behavior. Never return [] for these even if the message asks someone to "check" (nhờ check = "please check/verify this bug").
 
 
+COMMAND-EMBEDDED REQUESTS: the mention message itself may contain the full request (e.g. "Create a ticket under epic UP-51189 for upgrading account X to Studio 1000 clients and assign to me") — parse the work request from that message. A ticket key after "epic"/"under"/"parent" is the PARENT EPIC: never include it in the summary and never treat it as the subject of the ticket.
+
 MULTI-BUG RULES (VERY IMPORTANT — err on the side of ONE ticket):
 - REQUESTER DIRECTIVE OVERRIDES EVERYTHING BELOW: if the requester's directive asks for a specific number of tickets or one per issue ("create 3 tickets for 3 issues", "tách card từng lỗi", "one card per bug"), you MUST enumerate the distinct issues in the thread and return exactly one ticket per issue (up to 6) — the merge-into-one default does NOT apply.
 - DEFAULT (no directive): Create exactly ONE ticket per thread. Most bug reports are a single bug.
@@ -454,6 +456,8 @@ CRITICAL RULES:
 5. The summary should describe the TASK clearly (what to do) — NOT include "[Thanh Ngo]:" or usernames or "Nhờ team check" boilerplate.
 6. A task is work to be done (improvement, new feature, configuration, follow-up). It is NOT a bug report.
 7. NEVER return an empty array. If the thread describes ANY task or request, return at least one ticket.
+
+COMMAND-EMBEDDED REQUESTS: the mention message itself may contain the full request (e.g. "Create a ticket under epic UP-51189 for upgrading account X to Studio 1000 clients and assign to me") — parse the work request from that message. A ticket key after "epic"/"under"/"parent" is the PARENT EPIC: never include it in the summary and never treat it as the subject.
 
 MULTI-TASK RULES (VERY IMPORTANT — err on the side of ONE ticket):
 - DEFAULT: Return exactly ONE ticket. Almost every task thread is a single task.
@@ -1667,13 +1671,19 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     const triggerMentions = (assignPortion.match(/<@([A-Z0-9]+)>/g) || [])
       .map(m => m.replace(/<@|>/g, ''))
       .filter(id => id !== botUserId);
+    // "assign to me" / "giao cho em|mình|tôi" (no @mention) → the requester
+    if (triggerMentions.length === 0 && /\b(assign|giao)\b[^.<\n]{0,30}\b(to\s+)?(me|myself|em|mình|tôi)\b/i.test(event.text)) {
+      triggerMentions.push(event.user);
+      logger.info('[QAAgent] Self-assign detected → assigning to requester');
+    }
     if (ccMatch) {
       logger.info(`[QABot] cc/fyi detected — assignees limited to mentions before "${ccMatch[0]}"`);
     }
 
     // Parse Epic from trigger message (PLAN-XXX or UP-XXX)
-    const epicMatch = event.text.match(/\b(PLAN-\d+|UP-\d+)\b/i);
-    const epicKey   = epicMatch ? epicMatch[0].toUpperCase() : null;
+    const epicExplicit = event.text.match(/\b(?:epic|under|parent)\s+(?:epic\s+)?(PLAN-\d+|UP-\d+)\b/i);
+    const epicAny      = event.text.match(/\b(PLAN-\d+|UP-\d+)\b/i);
+    const epicKey      = (epicExplicit ? epicExplicit[1] : epicAny ? epicAny[1] : null)?.toUpperCase() || null;
 
     // Hardcoded fix version = "To be confirmed" (ID 12023)
     const fixVersionId = '12023';
