@@ -1580,6 +1580,7 @@ Actions:
 - "troubleshoot": ask for CS troubleshooting steps ("how to fix", "hướng dẫn xử lý", "steps to try")
 - "cancel": stop follow-up pings ("stop reminding", "đừng ping nữa", "cancel tracking", "done tracking")
 - "weekly_report": generate the weekly summary ("weekly report", "báo cáo tuần", "run report")
+- "retract": user asks the BOT to delete/remove its own previous message ("delete this response", "xóa tin nhắn đó", "remove your reply")
 - "task": substantive work on this thread that is NONE of the above — summarize, extract/list items, draft a message/reply/announcement, translate, compare, review, write documentation ("tóm tắt thread", "summary all items", "draft a reply to the coach", "translate this for CS")
 - "unknown": greetings, thanks, or anything else
 
@@ -1587,7 +1588,7 @@ JSON only, no other text.`,
       cleaned, 50, true, 'gpt-4o'
     )).trim();
     const parsed = JSON.parse(raw.substring(raw.indexOf('{'), raw.lastIndexOf('}') + 1));
-    const valid = ['analyze', 'create_card', 'assign', 'reassign', 'followup', 'troubleshoot', 'cancel', 'weekly_report', 'task'];
+    const valid = ['analyze', 'create_card', 'assign', 'reassign', 'followup', 'troubleshoot', 'cancel', 'weekly_report', 'task', 'retract'];
     return valid.includes(parsed.action) ? parsed.action : 'unknown';
   } catch { return 'unknown'; }
 }
@@ -1630,6 +1631,33 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     const doCancel   = isCancel         || aiAction === 'cancel';
     const doReassign = isChangeAssignee || aiAction === 'reassign';
     const aiWantsAssign = aiAction === 'assign' || triggerText.startsWith('assign to');
+
+    if (aiAction === 'retract') {
+      try {
+        const replies = await client.conversations.replies({ channel: event.channel, ts: event.thread_ts || event.ts, limit: 100 });
+        const mine = (replies.messages || [])
+          .filter(m => m.user === botUserId && m.ts !== (event.thread_ts || event.ts) && parseFloat(m.ts) < parseFloat(event.ts))
+          .sort((a, b) => parseFloat(b.ts) - parseFloat(a.ts));
+        if (!mine.length) {
+          await client.chat.postMessage({
+            channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false,
+            text: "I don't have a message of mine in this thread to delete.",
+          });
+        } else {
+          await client.chat.delete({ channel: event.channel, ts: mine[0].ts });
+          logger.info(`[Bot] Retracted own message ${mine[0].ts}`);
+        }
+      } catch (err) {
+        logger.warn('[Bot] Retract failed:', err.data?.error || err.message);
+        await client.chat.postMessage({
+          channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false,
+          text: `I couldn't delete it (${err.data?.error || err.message}) — a workspace admin can remove it via the message's ⋮ menu.`,
+        });
+      }
+      await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+      await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
+      return;
+    }
 
     if (aiAction === 'task') {
       const taskSt = agentStatus(client, event.channel, event.thread_ts || event.ts);

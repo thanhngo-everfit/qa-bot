@@ -1512,12 +1512,13 @@ async function agentRoute(userText, context, existingKeys) {
       model: SMART_MODEL, max_tokens: 60,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: `You are the decision core of QA Agent, a Jira assistant in Slack. Users write English or Vietnamese. Decide ONE action for the user's mention. Return ONLY JSON: {"action":"log_ticket"|"follow_up"|"task"|"answer"}
+        { role: 'system', content: `You are the decision core of QA Agent, a Jira assistant in Slack. Users write English or Vietnamese. Decide ONE action for the user's mention. Return ONLY JSON: {"action":"log_ticket"|"follow_up"|"task"|"retract"|"answer"}
 
 Actions:
 - "log_ticket": user wants a NEW Jira ticket created from this thread ("log this", "t\u1ea1o ticket", "l\u00ean card", or a bare tag in a thread with NO existing ticket)
 - "follow_up": user wants status/progress/tracking of the EXISTING ticket(s) in this thread ("follow up on this", "theo d\u00f5i", "status?", "track this", "any update", "check ti\u1ebfn \u0111\u1ed9", "nh\u1eafc dev gi\u00fap")
 - "task": user asks for substantive WORK on this thread or topic — summarize, list/extract items, draft a message/announcement/release note, translate, compare, plan tests, review, write documentation, analyze in depth ("summary all demo items", "t\u00f3m t\u1eaft thread n\u00e0y", "draft the announcement", "extract action items", "translate this for the client")
+- "retract": user asks the BOT to delete/remove its own previous message ("delete this response", "delete your last message", "xóa tin nhắn đó", "remove that reply")
 - "answer": greeting, short question, quick opinion — brief conversational replies only
 
 CRITICAL RULE: Existing tickets in thread: ${existingKeys.length ? existingKeys.join(', ') : 'NONE'}.
@@ -1527,7 +1528,7 @@ A bare tag (empty message) with existing tickets \u2192 "follow_up". A bare tag 
       ],
     });
     const parsed = JSON.parse(res.choices[0].message.content || '{}');
-    return ['log_ticket', 'follow_up', 'task', 'answer'].includes(parsed.action) ? parsed.action : 'log_ticket';
+    return ['log_ticket', 'follow_up', 'task', 'retract', 'answer'].includes(parsed.action) ? parsed.action : 'log_ticket';
   } catch { return 'log_ticket'; } // on failure, original behavior
 }
 
@@ -1608,6 +1609,34 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       const existingKeys = await scanThreadTicketKeys(client, event.channel, threadTs);
       const action = await agentRoute(triggerText, context, existingKeys);
       logger.info(`[QAAgent] route="${action}" existing=[${existingKeys.join(',')}] msg="${triggerText.substring(0, 50)}"`);
+
+      if (action === 'retract') {
+        try {
+          const { user_id: botUid } = await client.auth.test();
+          const replies = await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 100 });
+          const mine = (replies.messages || [])
+            .filter(m => m.user === botUid && m.ts !== threadTs && parseFloat(m.ts) < parseFloat(event.ts))
+            .sort((a, b) => parseFloat(b.ts) - parseFloat(a.ts));
+          if (!mine.length) {
+            await client.chat.postMessage({
+              channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+              text: "I don't have a message of mine in this thread to delete.",
+            });
+          } else {
+            await client.chat.delete({ channel: event.channel, ts: mine[0].ts });
+            logger.info(`[QAAgent] Retracted own message ${mine[0].ts}`);
+          }
+        } catch (err) {
+          logger.warn('[QAAgent] Retract failed:', err.data?.error || err.message);
+          await client.chat.postMessage({
+            channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+            text: `I couldn't delete it (${err.data?.error || err.message}) — a workspace admin can remove it via the message's ⋮ menu.`,
+          });
+        }
+        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+        await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
+        return;
+      }
 
       if (action === 'task') {
         const taskSt = agentStatus(client, event.channel, threadTs);
