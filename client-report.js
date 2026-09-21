@@ -27,11 +27,16 @@ const MONITORED_CHANNELS = {
 // ── Squad Roster (from squad_roster.xlsx) ─────
 // Each squad has: SM, PC, BA, role-based engineers, and domain keywords for detection
 const SQUAD_ROSTER = {
+  // contacts: ordered list — first = lead (SM-level), rest = PC/BA-level.
+  // Known Slack IDs are pre-filled; missing ones are resolved from email
+  // at runtime via users.lookupByEmail (hydrateRosterIds).
   'Core Product - Training & Automation': {
-    sm: 'Thanh Ngo', smId: 'U0142GU335F',
-    pc: 'Duyen Tran', pcId: 'U06401J6QR4',
-    ba: 'Ngoc Nguyen',
-    backend: 'Dong Vo', web: 'Hanh Tran', android: 'Khoa Huynh', ios: 'Tuyen Tran', qa: 'Trang Ngo',
+    contacts: [
+      { email: 'thanhngo@everfit.io',      id: 'U0142GU335F' },
+      { email: 'duyentran@everfit.io',     id: 'U06401J6QR4' },
+      { email: 'anhlethi@everfit.io',      id: null },
+    ],
+    backend: 'Dong Vo', web: 'Hanh Tran', android: 'Khoa Huynh', ios: 'Tuyen Tran',
     domains: [
       'workout', 'training', 'exercise', 'program', 'autoflow', 'video workout',
       'task assignment', 'master planner', 'gamification', 'leaderboard',
@@ -40,52 +45,77 @@ const SQUAD_ROSTER = {
       'form assignment', 'assignment',
     ],
   },
-  'Core Product - Nutrition': {
-    sm: 'Bao Ho', smId: 'U0445EQS1ED',
-    pc: 'Anh Van Le', pcId: 'U04PN2RHT4K',
-    ba: 'Dung Pham',
-    backend: 'Dong Vo', web: 'Ha Duong', android: 'Hoai Ho', ios: 'Tan Huynh', qa: 'Thao Nguyen',
-    domains: [
-      'nutrition', 'meal', 'macro', 'food', 'diet', 'recipe',
-      'myfitnessPal', 'cronometer', 'ingredient', 'calorie', 'meal plan',
-    ],
-  },
   'Core Product - Platform Capability': {
-    sm: 'Thanh Ngo', smId: 'U0142GU335F',
-    pc: 'Nhi Bien', pcId: 'U08J7SGJGNM',
-    ba: 'Dieu Kieu',
-    backend: 'Hong Tu', web: 'Nhan Huynh', android: 'Lam Bui', ios: 'Thinh Le', qa: 'Uyen Thao',
+    // Absorbed Integration & Middleware scope (squad dissolved)
+    contacts: [
+      { email: 'thanhngo@everfit.io',      id: 'U0142GU335F' },
+      { email: 'duyentran@everfit.io',     id: 'U06401J6QR4' },
+      { email: 'ngocnguyenthi@everfit.io', id: null },
+    ],
+    backend: 'Hong Tu', web: 'Nhan Huynh', android: 'Lam Bui', ios: 'Thinh Le',
     domains: [
       'login', 'auth', 'authentication', 'permission', 'workspace',
       'localization', 'branding', 'white label', 'notification settings',
       'account settings', 'team settings', 'sign in', 'sign up', 'password',
+      // merged from Integration & Middleware
+      'integration', 'webhook', 'apple health', 'garmin', 'fitbit',
+      'whoop', 'zapier', 'sync', 'middleware', 'health app', 'google calendar',
     ],
   },
   'Core Product - Engagement': {
-    sm: 'Bao Ho', smId: 'U0445EQS1ED',
-    pc: 'Anh Van Le', pcId: 'U04PN2RHT4K',
-    ba: 'Sally Phan',
-    backend: 'Duc Trinh', web: 'Nhan Huynh', android: 'Khoa Huynh', ios: 'Thinh Le', qa: 'Bich Thuy',
+    contacts: [
+      { email: 'baoho@everfit.io', id: 'U0445EQS1ED' },
+      { email: 'anhle@everfit.io', id: 'U04PN2RHT4K' },
+    ],
+    backend: 'Duc Trinh', web: 'Nhan Huynh', android: 'Khoa Huynh', ios: 'Thinh Le',
     domains: [
       'message', 'chat', 'inbox', 'forum', 'community', 'checkin', 'check-in',
       'client profile', 'body metric',
       'habit', 'goal', 'referral', 'affiliate', 'broadcast',
     ],
   },
-  'Core Product - Integration & Middleware': {
-    sm: 'Thanh Ngo', smId: 'U0142GU335F',
-    pc: 'Nhi Bien', pcId: 'U08J7SGJGNM',
-    ba: 'Sally Phan',
-    backend: 'Viet Mai', web: 'Nhan Huynh', qa: 'Chieu Hoang',
+  'Core Product - Enablement': {
+    contacts: [
+      { email: 'baoho@everfit.io',     id: 'U0445EQS1ED' },
+      { email: 'anhle@everfit.io',     id: 'U04PN2RHT4K' },
+      { email: 'duyentran@everfit.io', id: 'U06401J6QR4' },
+    ],
     domains: [
-      'integration', 'webhook', 'apple health', 'garmin', 'fitbit',
-      'whoop', 'zapier', 'sync', 'middleware', 'health app',
+      'enablement', 'coach onboarding', 'getting started', 'setup wizard',
+      'import client', 'client import', 'csv import', 'data import', 'migration',
+    ],
+  },
+  'Core Product - Nutrition': {
+    contacts: [
+      { email: 'baoho@everfit.io', id: 'U0445EQS1ED' },
+      { email: 'anhle@everfit.io', id: 'U04PN2RHT4K' },
+    ],
+    backend: 'Dong Vo', web: 'Ha Duong', android: 'Hoai Ho', ios: 'Tan Huynh',
+    domains: [
+      'nutrition', 'meal', 'macro', 'food', 'diet', 'recipe',
+      'myfitnesspal', 'cronometer', 'ingredient', 'calorie', 'meal plan',
+    ],
+  },
+  'AI Features': {
+    contacts: [
+      { email: 'hoanguyen@everfit.io', id: 'UQZ2PNPN3' },
+      { email: 'diemdo@everfit.io',    id: null },
+    ],
+    domains: [
+      'ai', 'artificial intelligence', 'ai feature',
+      'ai workout builder', 'ai workout generator', 'ai programming builder', 'push-up challenge',
+      'ai recipe builder', 'ai alternative recipe', 'ai recipe',
+      'smart response', 'smart-response', 'knowledge base',
+      'olly', 'olly voice', 'ask olly',
+      'bi dashboard', 'compare check-in',
+      'ai suggest', 'ai generate', 'ai coach', 'ai meal', 'ai analysis', 'log food with ai',
     ],
   },
   'Payment & Billing': {
-    sm: 'Hoa Nguyen', smId: 'UQZ2PNPN3',
-    pc: 'Tam Nguyen', pcId: 'U08R7JP31CZ',
-    ba: null,
+    contacts: [
+      { email: 'hoanguyen@everfit.io',  id: 'UQZ2PNPN3' },
+      { email: 'tamnguyen@everfit.io',  id: 'U08R7JP31CZ' },
+    ],
     domains: [
       'payment', 'billing', 'subscription', 'invoice', 'charge', 'refund',
       'stripe', 'paypal', 'credit card', 'plan upgrade', 'plan downgrade',
@@ -95,25 +125,14 @@ const SQUAD_ROSTER = {
       'macrosnap', 'macro snap',
     ],
   },
-  'AI Features': {
-    sm: 'Hoa Nguyen', smId: 'UQZ2PNPN3',
-    pc: 'Tam Nguyen', pcId: 'U08R7JP31CZ',
-    ba: null,
+  'Booking': {
+    contacts: [
+      { email: 'hoanguyen@everfit.io',  id: 'UQZ2PNPN3' },
+      { email: 'tamnguyen@everfit.io',  id: 'U08R7JP31CZ' },
+    ],
     domains: [
-      // General
-      'ai', 'artificial intelligence', 'ai feature',
-      // Training Programming
-      'ai workout builder', 'ai workout generator', 'ai programming builder', 'push-up challenge',
-      // Nutrition Programming
-      'ai recipe builder', 'ai alternative recipe', 'ai recipe',
-      // Communication
-      'smart response', 'knowledge base',
-      // AI Agents
-      'olly', 'olly voice', 'ask olly',
-      // Client Performance
-      'bi dashboard', 'compare check-in',
-      // Generic
-      'ai suggest', 'ai generate', 'ai coach', 'ai meal', 'ai analysis', 'log food with ai',
+      'booking', 'appointment', 'book a session', 'session booking',
+      'availability', 'booking page', 'reschedule', 'booking calendar',
     ],
   },
 };
@@ -267,15 +286,43 @@ function detectSquadFromKeywords(text) {
   const lower = text.toLowerCase();
   let best = null, bestScore = 0;
   for (const [squad, roster] of Object.entries(SQUAD_ROSTER)) {
-    const score = (roster.domains || []).filter(kw => lower.includes(kw)).length;
+    let score = 0;
+    for (const kw of roster.domains || []) {
+      // Short keywords (<=3 chars, e.g. 'ai') must match as whole words —
+      // otherwise 'ai' matches inside 'email'/'said'. Longer keywords use
+      // substring match. Score = keyword length, so specific feature names
+      // ('smart response') always outweigh generic areas ('inbox').
+      const hit = kw.length <= 3
+        ? new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(text)
+        : lower.includes(kw);
+      if (hit) score += kw.length;
+    }
     if (score > bestScore) { bestScore = score; best = squad; }
   }
   return best;
 }
 
 function getSquadContacts(squad) {
-  const r = SQUAD_ROSTER[squad];
-  return r ? { sm: r.sm, smId: r.smId, pc: r.pc, pcId: r.pcId } : null;
+  return SQUAD_ROSTER[squad]?.contacts || null;
+}
+
+// Resolve missing Slack IDs from emails once at startup (users.lookupByEmail)
+let _rosterHydrated = false;
+async function hydrateRosterIds(client) {
+  if (_rosterHydrated) return;
+  _rosterHydrated = true;
+  for (const roster of Object.values(SQUAD_ROSTER)) {
+    for (const c of roster.contacts || []) {
+      if (c.id) continue;
+      try {
+        const res = await client.users.lookupByEmail({ email: c.email });
+        c.id = res.user?.id || null;
+        if (c.id) console.log(`[Roster] ${c.email} → ${c.id}`);
+      } catch (err) {
+        console.warn(`[Roster] Could not resolve ${c.email}:`, err.data?.error || err.message);
+      }
+    }
+  }
 }
 
 function getRecommendedAssignee(squad, platform) {
@@ -448,12 +495,11 @@ function normalizeTicketSummary(ticket, analysis) {
 
 // ── Build @mentions from hardcoded IDs ───────
 function resolveContactMentions(contacts) {
-  if (!contacts) return null;
+  if (!contacts || !contacts.length) return null;
+  const m = c => c.id ? `<@${c.id}>` : `*${c.email.split('@')[0]}*`;
   return {
-    sm:        contacts.sm,
-    pc:        contacts.pc,
-    smMention: contacts.smId ? `<@${contacts.smId}>` : `*${contacts.sm}*`,
-    pcMention: contacts.pcId ? `<@${contacts.pcId}>` : `*${contacts.pc}*`,
+    smMention: m(contacts[0]),
+    pcMention: contacts.slice(1).map(m).join(' ') || m(contacts[0]),
   };
 }
 
@@ -665,16 +711,31 @@ SQUADS — detect from the issue context:
   - ${squadList}
 
 SQUAD ROUTING HINTS:
-  - Autoflow, Onboarding Flow, onboarding forms, form assignment,
-    questionnaires, task assignment
-    → always route to "Core Product - Training & Automation"
-  - AI Workout Builder, AI Recipe Builder, AI Alternative Recipe, Olly Voice,
-    Ask Olly, Smart Response, Knowledge Base, BI Dashboard, Push-up Challenge,
-    AI Workout Generator, AI Programming Builder, Compare Check-in form
-    → always route to "AI Features"
-  - MacroSnap, macrosnap license, license assignment, "not eligible for license",
-    license seats, subscription, billing, payment, invoice, refund
-    → route to "Payment & Billing"
+  ⚠️ PRECEDENCE RULE — FEATURE NAME BEATS LOCATION:
+  When a specific feature/product is the subject of the issue, route by
+  THAT FEATURE — even if it appears inside inbox, messages, workout or
+  any other screen. Example: "Smart Response pop-up in inbox" → the
+  subject is Smart Response (AI Features), NOT inbox (Engagement).
+
+  Valid squads (use these EXACT names):
+  - "Core Product - Training & Automation": Autoflow, Onboarding Flow, onboarding
+    forms, form assignment, questionnaires, task assignment, workouts, programs
+  - "Core Product - Platform Capability": login/auth, permissions, workspace &
+    account settings, white label, localization, AND all integrations/middleware
+    (Apple Health, Garmin, Fitbit, Whoop, Zapier, webhooks, sync, Google Calendar)
+    — the former Integration & Middleware squad merged into this one
+  - "Core Product - Engagement": messages/inbox/chat (as a feature itself),
+    forum, check-ins, habits, goals, client profile, referral, broadcast
+  - "Core Product - Enablement": coach onboarding/getting started, client
+    import/migration, setup flows
+  - "Core Product - Nutrition": meals, macros, recipes, MyFitnessPal, Cronometer
+  - "AI Features": AI Workout Builder, AI Recipe Builder, AI Alternative Recipe,
+    Olly / Olly Voice / Ask Olly, Smart Response, Knowledge Base, BI Dashboard,
+    Push-up Challenge, Compare Check-in, anything AI-generated
+  - "Payment & Billing": payments, subscriptions, invoices, refunds, Stripe,
+    licenses/seats, MacroSnap
+  - "Booking": appointments, session booking, availability, booking pages
+
   - If issue involves BOTH an AI feature bug AND a license/billing error
     → create 2 tickets: one for "AI Features", one for "Payment & Billing"
 
@@ -2109,8 +2170,18 @@ function workStage(t) {
 
 // ── Build report for ONE channel, grouped by squad → stage ──
 function buildChannelWeeklyReport(channelName, channelId, threads, weekLabel) {
-  const WEEKLY_MAIN = `<@U0142GU335F> <@U0445EQS1ED> <@UQZ2PNPN3>`;
-  const WEEKLY_CC   = `cc <@U04PN2RHT4K> <@U08J7SGJGNM> <@U06401J6QR4> <@U08R7JP31CZ>`;
+  // Mentions derived from the squad roster: leads first, everyone else cc'd
+  const _m = c => c.id ? `<@${c.id}>` : `*${c.email.split('@')[0]}*`;
+  const _leads = new Map(), _others = new Map();
+  for (const r of Object.values(SQUAD_ROSTER)) {
+    (r.contacts || []).forEach((c, i) => {
+      if (i === 0) _leads.set(c.email, c);
+      else _others.set(c.email, c);
+    });
+  }
+  for (const e of _leads.keys()) _others.delete(e);
+  const WEEKLY_MAIN = [..._leads.values()].map(_m).join(' ');
+  const WEEKLY_CC   = 'cc ' + [..._others.values()].map(_m).join(' ');
 
   // Clean truncation at word boundary — never cut mid-word
   const clip = (s, max = 110) => {
@@ -2150,12 +2221,13 @@ function buildChannelWeeklyReport(channelName, channelId, threads, weekLabel) {
 
   const SQUAD_ORDER = [
     'Core Product - Training & Automation',
-    'Core Product - Nutrition',
     'Core Product - Platform Capability',
     'Core Product - Engagement',
-    'Core Product - Integration & Middleware',
-    'Payment & Billing',
+    'Core Product - Enablement',
+    'Core Product - Nutrition',
     'AI Features',
+    'Payment & Billing',
+    'Booking',
     'Other',
   ];
   const sortedSquads = [...bySquad.keys()].sort((a, b) => {
@@ -2255,6 +2327,7 @@ function startWeeklyReportScheduler(client) {
 function register(realApp, realOpenai) {
   openai = realOpenai;
   loadKnowledgeBase();
+  hydrateRosterIds(realApp.client).catch(() => {});
   for (const [name, handler] of _registrations) realApp.event(name, handler);
   startFollowUpScheduler(realApp.client);
   startWeeklyReportScheduler(realApp.client);
