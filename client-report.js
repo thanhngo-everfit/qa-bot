@@ -153,9 +153,9 @@ const _registrations = [];
 const slackApp = { event: (name, handler) => _registrations.push([name, handler]) };
 
 // ── OpenAI wrapper ──
-async function aiCall(system, userContent, maxTokens = 1000, jsonMode = false) {
+async function aiCall(system, userContent, maxTokens = 1000, jsonMode = false, model = 'gpt-4o-mini') {
   const res = await openai.chat.completions.create({
-    model:      'gpt-4o-mini',
+    model,
     max_tokens: maxTokens,
     ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
     messages: [
@@ -1314,7 +1314,7 @@ Actions:
 - "unknown": greetings, thanks, or anything else
 
 JSON only, no other text.`,
-      cleaned, 50, true
+      cleaned, 50, true, 'gpt-4o'
     )).trim();
     const parsed = JSON.parse(raw.substring(raw.indexOf('{'), raw.lastIndexOf('}') + 1));
     const valid = ['analyze', 'create_card', 'assign', 'reassign', 'followup', 'troubleshoot', 'cancel', 'weekly_report'];
@@ -1360,17 +1360,27 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     const aiWantsAssign = aiAction === 'assign' || triggerText.startsWith('assign to');
 
     if (!doAnalyze && !doWeekly && !doCreate && !doFollowup && !doTrouble && !doCancel && !doReassign) {
+      // Conversational fallback — answer directly like an assistant instead
+      // of dumping a help menu. Uses thread context when available.
+      const threadCtx = event.thread_ts ? await getThread(client, event.channel, event.thread_ts).catch(() => '') : '';
+      const question  = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
+      let reply = null;
+      try {
+        reply = (await aiCall(
+          `You are QA Bot, Everfit's bug-triage assistant living in Slack bug-report channels. You can: analyze issues, create Jira cards, assign devs, check ticket status, run weekly reports, give CS troubleshooting steps, and stop follow-up tracking — teammates trigger these by telling you naturally (e.g. "log this and assign to @Huy", "status?").
+
+Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 sentences. Ground your answer in the thread context when relevant (you may reference what people said, suggest which squad/platform the issue belongs to, or give a technical opinion). If they greet you or ask what you can do, respond warmly and summarize your abilities in one line. If they ask something you truly cannot help with, say so briefly. Never invent ticket numbers or statuses.`,
+          `Thread context:\n${(threadCtx || '(no thread — mentioned directly in channel)').substring(0, 3000)}\n\nUser message: ${question}`,
+          400, false, 'gpt-4o'
+        )).trim();
+      } catch (err) { logger.warn('[Bot] Chat fallback failed:', err.message); }
+
       await client.chat.postMessage({
-        channel: event.channel, thread_ts: event.thread_ts || event.ts,
-        text:
-          `I couldn't figure out what you need — just tell me in plain English or Vietnamese, e.g. _"log this and assign to @Huy"_, _"status?"_, _"tạo card giúp em"_.\n\n` +
-          `Or use a command:\n` +
-          `• \`analyze\` — issue analysis · \`create card\` — Jira ticket · \`assign to @person\`\n` +
-          `• \`followup\` — check status · \`reassign to @person\` · \`troubleshoot\` — CS steps\n` +
-          `• \`weekly report\` · \`cancel\` — stop follow-up tracking`,
+        channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false,
+        text: reply || `Just tell me what you need in plain English or Vietnamese — e.g. _"log this and assign to @Huy"_, _"status?"_, _"tạo card giúp em"_, _"weekly report"_.`,
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
-      await client.reactions.add({ channel: event.channel, name: 'question', timestamp: event.ts }).catch(() => {});
+      await client.reactions.add({ channel: event.channel, name: 'speech_balloon', timestamp: event.ts }).catch(() => {});
       return;
     }
 
