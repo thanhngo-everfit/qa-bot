@@ -10,7 +10,7 @@
 const axios = require('axios');
 const {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
-  aiComplete, getActiveSprintId, getIssueSnapshot,
+  aiComplete, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes,
   resolveInlineMentions, resolveUserName, gatherChannelContext, slackify,
 } = require('./lib');
 
@@ -42,7 +42,7 @@ const TOOLS = [
     parameters: { type: 'object', required: ['summary', 'description_markdown', 'issue_type'], properties: {
       summary: { type: 'string', description: 'Format: [Platform][Feature] Clear English title, <=100 chars' },
       description_markdown: { type: 'string' },
-      issue_type: { type: 'string', enum: ['Bug', 'Task'] },
+      issue_type: { type: 'string', description: 'Exact Jira issue type name as it exists in project UP — e.g. "Bug", "Task", "Product Task", "Story". An invalid name returns the list of valid types so you can retry.' },
       priority: { type: 'string', enum: ['Highest', 'High', 'Medium', 'Low'], description: 'Default Medium' },
       assignee_query: { type: 'string', description: 'Email or full name of the assignee (optional)' },
       epic_key: { type: 'string', description: 'Parent epic like UP-51189 (optional)' },
@@ -182,10 +182,16 @@ async function execTool(name, args, ctx) {
         if (!ctx.allowCreate) {
           return { error: 'BLOCKED: the user did not ask for a new ticket and this thread already has ticket(s). Use register_followup / jira_assign / jira_comment on the existing ticket instead. If a new ticket is genuinely needed, tell the user to say "create ticket" or "force log".' };
         }
+        // Validate the issue type against what actually exists in Jira —
+        // invalid names return the valid list so the loop self-corrects.
+        const types = await getProjectIssueTypes();
+        const wanted = (args.issue_type || 'Bug').trim();
+        const canonicalType = types.find(t => t.toLowerCase() === wanted.toLowerCase());
+        if (!canonicalType) return { error: `Issue type "${wanted}" does not exist in project ${JIRA_PROJECT}.`, valid_types: types };
         const fields = {
           project: { key: JIRA_PROJECT },
           summary: (args.summary || '').substring(0, 250),
-          issuetype: { name: args.issue_type === 'Task' ? 'Task' : 'Bug' },
+          issuetype: { name: canonicalType },
           priority: { name: args.priority || 'Medium' },
           description: mdToAdf(`${args.description_markdown || ''}\n\n## Reference\n- Slack thread: https://everfitt.slack.com/archives/${channelId}/p${String(threadTs).replace('.', '')}`),
           fixVersions: [{ id: '12023' }],

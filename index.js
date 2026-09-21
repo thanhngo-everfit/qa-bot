@@ -1541,9 +1541,18 @@ const coreMentionHandler = async ({ event, client, logger }) => {
 
     // Classify Bug vs Task — explicit keyword wins; otherwise AI decides from thread content
     await agentSt.update('🧠 _QA Agent is identifying Bug vs Task…_');
-    const issueType = await classifyIssueType(triggerText, context);
-    const isTask    = issueType === 'Task';
-    logger.info(`[QABot] Issue type classified as: ${issueType}`);
+    let issueType = await classifyIssueType(triggerText, context);
+    // Explicit issue-type mention overrides Bug/Task classification:
+    // "create a Product Task for..." → issue type "Product Task" (the list
+    // comes from Jira itself, so any type the project has just works).
+    const availableTypes = await lib.getProjectIssueTypes();
+    const explicitType = availableTypes
+      .filter(t => !/^(bug|task)$/i.test(t))
+      .sort((a, b) => b.length - a.length)
+      .find(t => new RegExp(`\\b${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(event.text));
+    if (explicitType) issueType = explicitType;
+    const isTask = issueType !== 'Bug';   // non-Bug types use the task parser + skip dup-guard
+    logger.info(`[QABot] Issue type: ${issueType}${explicitType ? ' (explicit)' : ' (classified)'}`);
 
     // ── Feature 2: Duplicate detection ──────────
     // Scan thread for existing QABot tickets

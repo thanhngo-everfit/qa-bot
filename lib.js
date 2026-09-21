@@ -145,6 +145,20 @@ async function getActiveSprintId() {
   } catch { return null; }
 }
 
+// ── Jira: project issue types (cached, from Jira itself) ─────────────
+let _issueTypesCache = null, _issueTypesAt = 0;
+async function getProjectIssueTypes() {
+  if (_issueTypesCache && Date.now() - _issueTypesAt < 3600 * 1000) return _issueTypesCache;
+  try {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/project/${JIRA_PROJECT}`, {
+      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+    });
+    const types = (res.data?.issueTypes || []).filter(t => !t.subtask).map(t => t.name);
+    if (types.length) { _issueTypesCache = types; _issueTypesAt = Date.now(); }
+  } catch (_) {}
+  return _issueTypesCache || ['Bug', 'Task'];
+}
+
 // ── Jira: quick issue snapshot ───────────────────────────────────────
 async function getIssueSnapshot(issueKey) {
   try {
@@ -279,7 +293,7 @@ Rules:
 module.exports = {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiComplete, aiCall,
-  agentStatus, getActiveSprintId, getIssueSnapshot,
+  agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes,
   resolveUserName, resolveInlineMentions, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
   slackify,
