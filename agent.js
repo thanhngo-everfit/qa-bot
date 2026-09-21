@@ -176,6 +176,12 @@ async function execTool(name, args, ctx) {
                  description: flat.join(' ').substring(0, 2500), comments };
       }
       case 'jira_create_issue': {
+        // Guardrail: a weaker model must not be ABLE to create duplicates.
+        // Creation is allowed only if the user used creation language, or
+        // the thread has no tickets yet (bare-tag logging).
+        if (!ctx.allowCreate) {
+          return { error: 'BLOCKED: the user did not ask for a new ticket and this thread already has ticket(s). Use register_followup / jira_assign / jira_comment on the existing ticket instead. If a new ticket is genuinely needed, tell the user to say "create ticket" or "force log".' };
+        }
         const fields = {
           project: { key: JIRA_PROJECT },
           summary: (args.summary || '').substring(0, 250),
@@ -269,8 +275,13 @@ Rules:
 - If the thread already has a ticket for the SAME issue, don't duplicate — check it, follow up, or say so. Create new tickets only for genuinely uncovered issues or when explicitly told ("force log", "new ticket anyway").
 - Multiple distinct issues + a request to log them → one ticket per issue, each registered for follow-up (jira_create_issue does that automatically).
 - Never invent tickets, links, statuses, or facts. If a tool errors, say what failed and what you did complete.
+- TOOL DISCIPLINE: call only the tools whose effect the user actually asked for. "follow up with @X every N days" → register_followup (and jira_assign ONLY if the ticket is not already assigned to that person) — NEVER jira_create_issue. Status/progress questions → read-only tools. Do not take extra actions "to be helpful".
 - Be decisive: for clear requests, act without asking permission. Ask at most one clarifying question and only when genuinely ambiguous.
 - Final reply = a concise first-person report of what you did/found, with ticket links. No preamble.`;
+
+  // Creation permission: explicit creation language, or a thread with no tickets yet
+  const allowCreate =
+    /\b(create|log|make|open|force|tạo|lên)\b/i.test(requestText) || existingKeys.length === 0;
 
   const messages = [
     { role: 'system', content: system },
@@ -291,7 +302,7 @@ Rules:
       try { args = JSON.parse(tc.function.arguments || '{}'); } catch (_) {}
       if (status) await status.update(`🤖 QA Agent ${TOOL_STATUS[tc.function.name] || `_running ${tc.function.name}…_`}`);
       logger?.info?.(`[Agent] tool ${tc.function.name} ${JSON.stringify(args).substring(0, 200)}`);
-      const out = await execTool(tc.function.name, args, { client, channelId, threadTs, registerFollowUp });
+      const out = await execTool(tc.function.name, args, { client, channelId, threadTs, registerFollowUp, allowCreate });
       messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(out).substring(0, 12000) });
     }
   }
