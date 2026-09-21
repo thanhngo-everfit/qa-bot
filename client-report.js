@@ -1624,6 +1624,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
         await agentSt.done();
   } catch (err) {
     try { await agentSt.done(); } catch (_) {} logger.warn('[Bot] Chat fallback failed:', err.message); }
+      reply = require('./lib').slackify(reply);
 
       await agentSt.done();
       await client.chat.postMessage({
