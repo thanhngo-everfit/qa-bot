@@ -1117,6 +1117,61 @@ function registerFollowUp({ channelId, threadTs, jiraKey, jiraUrl, squad }) {
   console.log(`[FollowUp] Registered ${jiraKey} (squad: ${squad || 'unknown'})`);
 }
 
+// ── Rebuild follow-up state from channel history ─────────────────
+// Follow-up state is in-memory: it is empty after every deploy, and
+// tickets tracked by the retired Client Report Bot are unknown to this
+// process. On boot we scan the last 14 days of each monitored channel,
+// find threads with live, not-yet-done tickets, and re-register them —
+// so follow-ups survive redeploys AND the old bot's uninstallation.
+async function rebuildFollowUpsFromHistory(client) {
+  const DONE_STATUSES = ['qa success', 'done', 'released', 'closed'];
+  const oldest = String((Date.now() - 14 * 24 * 3600 * 1000) / 1000);
+  let restored = 0;
+
+  const textOf = (m) => {
+    const parts = [m.text || ''];
+    for (const att of m.attachments || []) parts.push(att.title || '', att.text || '', att.fallback || '', att.title_link || '');
+    const walk = (blocks) => { for (const b of blocks || []) { if (b.text?.text) parts.push(b.text.text); if (b.url) parts.push(b.url); if (b.elements) walk(b.elements); } };
+    walk(m.blocks);
+    return parts.join(' ');
+  };
+
+  for (const [channelId, channelName] of Object.entries(MONITORED_CHANNELS)) {
+    try {
+      const history = await client.conversations.history({ channel: channelId, oldest, limit: 200 });
+      for (const msg of history.messages || []) {
+        if (msg.bot_id || !msg.reply_count) continue;           // parents with replies only
+        try {
+          const replies = await client.conversations.replies({ channel: channelId, ts: msg.ts, limit: 100 });
+          let jiraKey = null, squad = null;
+          const combined = [];
+          for (const r of replies.messages || []) {
+            const t = textOf(r);
+            combined.push(t);
+            if (!jiraKey) { const mm = t.match(/UP-\d+/); if (mm) jiraKey = mm[0]; }
+            if (!squad && r.bot_id) {
+              const sm = t.match(/(?:Squad|Related squad):\s*\*?([^*\n]+?)\*?\s*$/m);
+              if (sm) squad = sm[1].trim();
+            }
+          }
+          if (!jiraKey || followUpStore.has(jiraKey)) continue;
+
+          const details = await getJiraIssueDetails(jiraKey);
+          if (!details) continue;                                // deleted ticket
+          if (DONE_STATUSES.includes((details.status || '').toLowerCase())) continue;
+
+          if (!squad) squad = detectSquadFromKeywords(combined.join(' '));
+          registerFollowUp({ channelId, threadTs: msg.ts, jiraKey, jiraUrl: `${JIRA_HOST}/browse/${jiraKey}`, squad });
+          restored++;
+        } catch (_) {}
+      }
+    } catch (err) {
+      console.warn(`[FollowUp] History rebuild failed for #${channelName}:`, err.data?.error || err.message);
+    }
+  }
+  console.log(`[FollowUp] Rebuilt tracking for ${restored} open ticket(s) from channel history`);
+}
+
 // ── Scan thread for any UP-XXXXX links (bot or manual) ──
 async function scanThreadForTickets(client, channelId, threadTs) {
   try {
@@ -2328,6 +2383,7 @@ function register(realApp, realOpenai) {
   openai = realOpenai;
   loadKnowledgeBase();
   hydrateRosterIds(realApp.client).catch(() => {});
+  rebuildFollowUpsFromHistory(realApp.client).catch(err => console.warn('[FollowUp] Rebuild error:', err.message));
   for (const [name, handler] of _registrations) realApp.event(name, handler);
   startFollowUpScheduler(realApp.client);
   startWeeklyReportScheduler(realApp.client);
