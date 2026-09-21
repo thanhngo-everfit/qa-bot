@@ -611,13 +611,26 @@ async function addIssueToSprint(issueKey, sprintId) {
 const BOLD_HEADER_RE = /^(Slack thread|Squad|Severity|Reported by|Intercom link|Affected area|Steps to reproduce|Expected behavior|Actual behavior|Request details|Resolution Steps|Notes?)(:)(.*)$/i;
 
 function lineToAdfContent(line) {
-  const urlRegex = /(https?:\/\/[^\s]+)/g;
+  // Unwrap markdown-style angle-bracket links: <https://x> → https://x
+  line = line.replace(/<(https?:\/\/[^>\s]+)>/g, '$1');
+
+  // Tokenize inline **bold** and bare URLs into ADF text nodes with marks
+  const tokenRe = /\*\*([^*]+)\*\*|(https?:\/\/[^\s<>]+)/g;
   const parts = [];
   let last = 0, m;
-  while ((m = urlRegex.exec(line)) !== null) {
+  while ((m = tokenRe.exec(line)) !== null) {
     if (m.index > last) parts.push({ type: 'text', text: line.slice(last, m.index) });
-    parts.push({ type: 'text', text: m[1], marks: [{ type: 'link', attrs: { href: m[1] } }] });
-    last = m.index + m[1].length;
+    if (m[1] !== undefined) {
+      parts.push({ type: 'text', text: m[1], marks: [{ type: 'strong' }] });
+    } else {
+      // Trim trailing punctuation that isn't part of the URL
+      let url = m[2];
+      const trailing = url.match(/[).,;:!?]+$/);
+      if (trailing) url = url.slice(0, -trailing[0].length);
+      parts.push({ type: 'text', text: url, marks: [{ type: 'link', attrs: { href: url } }] });
+      if (trailing) parts.push({ type: 'text', text: trailing[0] });
+    }
+    last = m.index + m[0].length;
   }
   if (last < line.length) parts.push({ type: 'text', text: line.slice(last) });
   return parts.length ? parts : [{ type: 'text', text: line }];
