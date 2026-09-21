@@ -1396,6 +1396,43 @@ async function getParentFromChannelCanvas(client, channelId) {
   }
 }
 
+// ── Conversational intelligence for QA Bot mentions ─────────────────
+// Distinguishes "log this" from greetings/questions, and answers the
+// latter like an assistant instead of dumping boilerplate (or worse,
+// logging a ticket because someone said hello in a bug thread).
+const QA_CAPABILITIES = `Your abilities:
+• Tagged inside any bug/task thread → you read the whole thread and log it to Jira: Bug or Task auto-detected, correct Epic, Fix Version and the current Active Sprint set automatically
+• "create task" forces a Task · "force log" logs even when the thread already has a ticket · including an epic key (UP-xxxx / PLAN-xxxx) parents the ticket to it
+• In the client-report channels (bug_reporting-internal, enterprise_bug_reporting_internal, customer-request-discussion) you additionally auto-analyze every new report, create & assign cards from natural language ("assign to @dev", "giao cho @dev"), run follow-up tracking, and post weekly reports`;
+
+async function classifyQaMentionIntent(triggerText) {
+  try {
+    const res = await openai.chat.completions.create({
+      model: 'gpt-4o', max_tokens: 20,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: 'A user tagged a Jira-logging Slack bot. Decide if they want the bot to LOG/CREATE a Jira ticket from the thread ("log") or are just chatting/greeting/asking a question ("chat"). Vietnamese and English both occur. Requests like "log this", "tạo ticket", "lên card", "create bug" → log. Greetings, thanks, "what can you do", opinion/status questions → chat. Return ONLY JSON: {"intent":"log"} or {"intent":"chat"}' },
+        { role: 'user', content: triggerText.substring(0, 300) },
+      ],
+    });
+    const parsed = JSON.parse(res.choices[0].message.content || '{}');
+    return parsed.intent === 'chat' ? 'chat' : 'log';
+  } catch { return 'log'; } // on any failure, preserve original behavior
+}
+
+async function qaChatReply(context, userText) {
+  try {
+    const res = await openai.chat.completions.create({
+      model: 'gpt-4o', max_tokens: 350,
+      messages: [
+        { role: 'system', content: `You are QA Bot, Everfit's Jira assistant living in Slack.\n${QA_CAPABILITIES}\n\nAnswer the user conversationally and helpfully in ENGLISH only, 1-4 sentences. If they greet you or ask what you can do, summarize your abilities naturally (not as a bullet dump). Ground answers in the thread context when relevant. Never invent ticket numbers or statuses.` },
+        { role: 'user', content: `Thread context:\n${(context || '(no thread)').substring(0, 2500)}\n\nUser message: ${userText}` },
+      ],
+    });
+    return res.choices[0].message.content?.trim() || null;
+  } catch { return null; }
+}
+
 slackApp.event('app_mention', async ({ event, client, logger }) => {
   // Client-report channels are handled by the client-report module
   if (clientReport.MONITORED_CHANNELS[event.channel]) return;
@@ -1421,13 +1458,32 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     }
 
     if (!context || context.trim().length < 10) {
+      const reply = await qaChatReply('', event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
       await client.chat.postMessage({
-        channel: event.channel, thread_ts: event.ts,
-        text: '👋 Tag me *inside a thread* — I\'ll log the bug or task to Jira automatically!\n' +
-              'Use `create task` to create a Task, or just tag me to auto-detect.',
+        channel: event.channel, thread_ts: event.ts, unfurl_links: false,
+        text: reply || '👋 Tag me inside a bug/task thread and I\'ll log it to Jira — Bug or Task auto-detected, with Epic, Fix Version and Active Sprint set. Or just tell me what you need.',
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+      await client.reactions.add({ channel: event.channel, name: 'speech_balloon', timestamp: event.ts }).catch(() => {});
       return;
+    }
+
+    // Conversational mentions must not create tickets: if the trigger text
+    // is present and isn't an explicit log/task command, ask AI whether the
+    // user wants a ticket or is just talking. Bare tags keep logging as before.
+    if (triggerText && !isForceLog && !/^create\s?(task|ticket)/.test(triggerText)) {
+      const mentionIntent = await classifyQaMentionIntent(triggerText);
+      if (mentionIntent === 'chat') {
+        logger.info(`[QABot] Chat intent: "${triggerText.substring(0, 50)}"`);
+        const reply = await qaChatReply(context, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
+        await client.chat.postMessage({
+          channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+          text: reply || 'Just tell me what you need — e.g. tag me in a bug thread to log it, or say "create task".',
+        });
+        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+        await client.reactions.add({ channel: event.channel, name: 'speech_balloon', timestamp: event.ts }).catch(() => {});
+        return;
+      }
     }
 
     // Classify Bug vs Task — explicit keyword wins; otherwise AI decides from thread content
