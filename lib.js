@@ -335,11 +335,29 @@ async function resolveUserName(client, uid) {
   _userNameCache.set(uid, name);
   return name;
 }
+// Resolve MANY user IDs at once, in parallel, with a hard cap — sequential
+// users.info calls inside a long thread loop was hanging whole requests.
+async function warmUserNames(client, uids, { max = 60, concurrency = 8 } = {}) {
+  const todo = [...new Set(uids)].filter(u => u && !_userNameCache.has(u)).slice(0, max);
+  for (let i = 0; i < todo.length; i += concurrency) {
+    await Promise.all(todo.slice(i, i + concurrency).map(async (uid) => {
+      try {
+        const info = await client.users.info({ user: uid });
+        _userNameCache.set(uid, info.user?.real_name || uid);
+      } catch { _userNameCache.set(uid, uid); }
+    }));
+  }
+}
+
+// Synchronous replacement using only the warmed cache (no API calls)
+function replaceMentionsCached(text) {
+  return (text || '').replace(/<@([A-Z0-9]+)>/g, (m, uid) => `@${_userNameCache.get(uid) || 'member'}`);
+}
+
 async function resolveInlineMentions(client, text) {
   const uids = [...new Set([...(text || '').matchAll(/<@([A-Z0-9]+)>/g)].map(m => m[1]))];
-  let out = text || '';
-  for (const uid of uids) out = out.split(`<@${uid}>`).join(`@${await resolveUserName(client, uid)}`);
-  return out;
+  await warmUserNames(client, uids);
+  return replaceMentionsCached(text);
 }
 
 // ── Channel-scope context: recent threads + live Jira statuses ───────
@@ -495,7 +513,7 @@ module.exports = {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiComplete, aiCall, toolsSupported,
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient, getIssueEpic,
-  resolveUserName, resolveInlineMentions, qaTaskWork,
+  resolveUserName, resolveInlineMentions, warmUserNames, replaceMentionsCached, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
   slackify, FASTPATH, retractOwnMessages, isCreationRequest,
 };

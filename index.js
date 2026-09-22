@@ -58,19 +58,25 @@ async function getThreadReporterSlackId(client, channelId, threadTs) {
 }
 
 async function getThread(client, channelId, threadTs) {
+  const t0 = Date.now();
   const result   = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 200 });
-  const messages = result.messages || [];
-  const lines    = [];
+  const messages = (result.messages || []).filter(m => !(m.bot_id || m.subtype === 'bot_message'));
+
+  // Warm every author + inline-mention name in PARALLEL first. Previously
+  // this loop made 2+ sequential users.info calls per message (200 deep),
+  // which hung entire requests in long threads.
+  const uids = new Set();
   for (const msg of messages) {
-    // Skip bot messages — bot error/success replies from previous attempts
-    // poison the context and cause GPT to return empty results
-    if (msg.bot_id || msg.subtype === 'bot_message') continue;
-    let name = msg.username || msg.user || 'user';
-    try {
-      const info = await client.users.info({ user: msg.user });
-      name = info.user?.real_name || name;
-    } catch (_) {}
-    const text = (await resolveInlineMentions(client, msg.text || ''))
+    if (msg.user) uids.add(msg.user);
+    for (const m of (msg.text || '').matchAll(/<@([A-Z0-9]+)>/g)) uids.add(m[1]);
+  }
+  await lib.warmUserNames(client, [...uids]);
+  console.log(`[QABot] Thread context: ${messages.length} msgs, ${uids.size} users resolved in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+
+  const lines = [];
+  for (const msg of messages) {
+    const name = lib.replaceMentionsCached(`<@${msg.user}>`).replace(/^@/, '') || msg.username || 'user';
+    const text = lib.replaceMentionsCached(msg.text || '')
       // User-group / subteam mentions <!subteam^ID|display> or <!subteam^ID>
       .replace(/<!subteam\^[A-Z0-9]+\|([^>]+)>/g, '@$1')
       .replace(/<!subteam\^[A-Z0-9]+>/g, '')
@@ -1932,7 +1938,34 @@ const coreMentionHandler = async ({ event, client, logger }) => {
     await client.reactions.add({ channel: event.channel, name: 'x', timestamp: event.ts }).catch(() => {});
   }
 };
-slackApp.event('app_mention', coreMentionHandler);
+// Watchdog: a mention must ALWAYS produce a reply. If the handler hasn't
+// finished within the budget, post a failure notice and clear the status —
+// no more silent 'stuck with an hourglass' requests.
+const REQUEST_BUDGET_MS = parseInt(process.env.REQUEST_BUDGET_MS || '120000', 10);
+
+slackApp.event('app_mention', async (args) => {
+  const { event, client, logger } = args;
+  let finished = false;
+  const watchdog = setTimeout(async () => {
+    if (finished) return;
+    logger.warn(`[QAAgent] WATCHDOG fired after ${REQUEST_BUDGET_MS / 1000}s — request did not complete`);
+    try {
+      await client.chat.postMessage({
+        channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false,
+        text: `I couldn't finish this within ${Math.round(REQUEST_BUDGET_MS / 1000)}s and stopped so I don't leave you hanging. Nothing was created. Please try again — if it keeps happening, my Railway logs show which step stalled.`,
+      });
+      await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+      await client.reactions.add({ channel: event.channel, name: 'warning', timestamp: event.ts }).catch(() => {});
+    } catch (_) {}
+  }, REQUEST_BUDGET_MS);
+
+  try {
+    await coreMentionHandler(args);
+  } finally {
+    finished = true;
+    clearTimeout(watchdog);
+  }
+});
 
 // ── Core duplicate-guard button actions ──────────────────────────────
 function coreDupPayload(body) {

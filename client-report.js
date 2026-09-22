@@ -12,6 +12,7 @@ const {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiCall,
   agentStatus, getActiveSprintId, createJiraIssueResilient, FASTPATH, retractOwnMessages, isCreationRequest,
+  warmUserNames, replaceMentionsCached,
   resolveInlineMentions, qaTaskWork,
 } = require('./lib');
 
@@ -234,10 +235,16 @@ async function resolveJiraAccountId(slackClient, slackUserId) {
 async function getThread(client, channelId, threadTs) {
   const result = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 });
   const nowMs  = Date.now();
+  // Warm all author + mention names in PARALLEL before formatting
+  const _uids = new Set();
+  for (const msg of result.messages || []) {
+    if (msg.user) _uids.add(msg.user);
+    for (const m of (msg.text || '').matchAll(/<@([A-Z0-9]+)>/g)) _uids.add(m[1]);
+  }
+  await warmUserNames(client, [..._uids]);
   const lines  = await Promise.all((result.messages || []).map(async msg => {
-    let name = msg.username || msg.user || 'user';
-    try { name = (await client.users.info({ user: msg.user })).user?.real_name || name; } catch (_) {}
-    const text = await resolveInlineMentions(client, msg.text || '');
+    const name = (replaceMentionsCached(`<@${msg.user}>`).replace(/^@/, '') || msg.username || 'user');
+    const text = replaceMentionsCached(msg.text || '');
     // Include relative time so Claude knows how old each message is
     const msgMs   = parseFloat(msg.ts) * 1000;
     const hoursAgo = Math.round((nowMs - msgMs) / (60 * 60 * 1000));
