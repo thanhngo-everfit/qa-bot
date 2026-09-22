@@ -49,6 +49,11 @@ function _adaptParams(params) {
   return p;
 }
 
+// Hard per-call timeout: a hung gateway or a reasoning model chewing on a
+// huge prompt must never freeze the bot. On timeout, smart calls retry once
+// on the fast fallback model so the user still gets a result.
+const AI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '90000', 10);
+
 async function aiComplete(params) {
   const openai = getOpenAI();
   let model = params.model === 'gpt-4o' ? SMART_MODEL
@@ -57,9 +62,23 @@ async function aiComplete(params) {
   if (_smartModelBroken && model !== FALLBACK_MODEL) model = FALLBACK_MODEL;
 
   for (let attempt = 0; attempt < 3; attempt++) {
+    const t0 = Date.now();
     try {
-      return await openai.chat.completions.create({ ..._adaptParams(params), model });
+      const res = await openai.chat.completions.create({ ..._adaptParams(params), model }, { timeout: AI_TIMEOUT_MS });
+      const ms = Date.now() - t0;
+      if (ms > 20000) console.warn(`[AI] slow call: ${model} took ${(ms / 1000).toFixed(1)}s (max_tokens=${params.max_tokens || params.max_completion_tokens || '-'})`);
+      return res;
     } catch (err) {
+      const elapsed = Date.now() - t0;
+      const isTimeout = err?.name === 'APIConnectionTimeoutError' || /timed?\s?out/i.test(`${err?.message || ''}`);
+      if (isTimeout) {
+        if (model !== FALLBACK_MODEL) {
+          console.warn(`[AI] ${model} timed out after ${(elapsed / 1000).toFixed(0)}s — retrying on ${FALLBACK_MODEL}`);
+          model = FALLBACK_MODEL;
+          continue;
+        }
+        throw new Error(`AI call timed out after ${(elapsed / 1000).toFixed(0)}s on ${model}`);
+      }
       const msg = `${err?.message || ''}`;
       // Reasoning models / some gateways: max_tokens → max_completion_tokens
       if (!_useMaxCompletionTokens && /max_tokens.*not supported|use ['"]?max_completion_tokens/i.test(msg)) {
