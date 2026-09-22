@@ -1102,6 +1102,25 @@ async function resolveEmailToSlackId(client, email, displayName = null) {
   return null;
 }
 
+// ── Thread-level announcement guard ──────────────────────────────────
+// In-memory flags die with the process; the THREAD is durable. Before
+// announcing a milestone, check whether we already posted it there.
+// This is what actually stops repeat spam across redeploys.
+async function alreadyAnnouncedInThread(client, channelId, threadTs, jiraKey, marker) {
+  try {
+    const replies = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 100 });
+    const { user_id: botUid } = await client.auth.test();
+    return (replies.messages || []).some(m =>
+      (m.user === botUid || m.bot_id) &&
+      (m.text || '').includes(jiraKey) &&
+      (m.text || '').toLowerCase().includes(marker.toLowerCase())
+    );
+  } catch (err) {
+    console.warn('[FollowUp] Announcement guard read failed:', err.data?.error || err.message);
+    return true;   // fail CLOSED — never risk spamming when we cannot verify
+  }
+}
+
 // Startup grace: suppress scheduler ANNOUNCEMENTS for the first 10 minutes
 // after boot. Redeploys (we ship often) must never replay old transitions.
 const _bootAt = Date.now();
@@ -1377,21 +1396,25 @@ function startFollowUpScheduler(client) {
         }
 
         // ── QA Success → tag PC once, then close ──────
-        if (!inStartupGrace() && status === 'qa success') {
-          const pcMention = contacts?.pcMention || `<!subteam^${GROUP_SM}>`;
-          await client.chat.postMessage({
-            channel: item.channelId, thread_ts: item.threadTs, unfurl_links: false,
-            text:
-              `✅ <${item.jiraUrl}|${jiraKey}> has passed QA!\n` +
-              `${pcMention} — please let the CS team know so they can follow up with the coach/client and close the Intercom ticket.`,
-          });
-          item.done = true;
+        if (status === 'qa success') {
+          if (!inStartupGrace() && !(await alreadyAnnouncedInThread(client, item.channelId, item.threadTs, jiraKey, 'passed QA'))) {
+            // PC mention only — never fall back to the SM group here
+            const pcMention = contacts?.pcMention || contacts?.smMention || null;
+            await client.chat.postMessage({
+              channel: item.channelId, thread_ts: item.threadTs, unfurl_links: false,
+              text:
+                `✅ <${item.jiraUrl}|${jiraKey}> has passed QA!\n` +
+                `${pcMention ? `${pcMention} — please` : 'PC — please'} let the CS team know so they can follow up with the coach/client and close the Intercom ticket.`,
+            });
+          }
+          item.done = true;   // stop tracking either way
           continue;
         }
 
         // ── QA Ready → tag SM to assign QA (once) ─────
         if (status === 'qa ready') {
-          if (!item.notifiedQaReady && !inStartupGrace()) {
+          if (!item.notifiedQaReady && !inStartupGrace()
+              && !(await alreadyAnnouncedInThread(client, item.channelId, item.threadTs, jiraKey, 'QA Ready'))) {
             const smMention = contacts?.smMention || `<!subteam^${GROUP_SM}>`;
             await client.chat.postMessage({
               channel: item.channelId, thread_ts: item.threadTs, unfurl_links: false,
@@ -1401,6 +1424,8 @@ function startFollowUpScheduler(client) {
             });
             item.notifiedQaReady = true;
             item.lastPingAt = Date.now();
+          } else {
+            item.notifiedQaReady = true;   // suppressed → don't re-check every tick
           }
           continue;
         }
