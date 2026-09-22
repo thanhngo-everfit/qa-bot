@@ -35,23 +35,78 @@ const SMART_MODEL    = process.env.OPENAI_SMART_MODEL    || 'gpt-4o';
 const FALLBACK_MODEL = process.env.OPENAI_FALLBACK_MODEL || 'gpt-4o-mini';
 let _smartModelBroken = false;
 
+// Gateway quirk flags — learned once, applied to all subsequent calls
+let _useMaxCompletionTokens = false;
+let _stripResponseFormat = false;
+
+function _adaptParams(params) {
+  const p = { ...params };
+  if (_useMaxCompletionTokens && p.max_tokens !== undefined) {
+    p.max_completion_tokens = p.max_tokens;
+    delete p.max_tokens;
+  }
+  if (_stripResponseFormat) delete p.response_format;
+  return p;
+}
+
 async function aiComplete(params) {
   const openai = getOpenAI();
   let model = params.model === 'gpt-4o' ? SMART_MODEL
             : params.model === 'gpt-4o-mini' ? FALLBACK_MODEL
             : params.model;
   if (_smartModelBroken && model !== FALLBACK_MODEL) model = FALLBACK_MODEL;
-  try {
-    return await openai.chat.completions.create({ ...params, model });
-  } catch (err) {
-    const msg = `${err?.message || ''}`;
-    if (model !== FALLBACK_MODEL && (err?.status === 403 || err?.status === 404 || /does not have access to model|model.*not found/i.test(msg))) {
-      if (!_smartModelBroken) console.warn(`[AI] Model "${model}" unavailable on this endpoint — falling back to "${FALLBACK_MODEL}" for all smart calls. Fix model access or set OPENAI_SMART_MODEL / OPENAI_FALLBACK_MODEL.`);
-      _smartModelBroken = true;
-      return await getOpenAI().chat.completions.create({ ...params, model: FALLBACK_MODEL });
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await openai.chat.completions.create({ ..._adaptParams(params), model });
+    } catch (err) {
+      const msg = `${err?.message || ''}`;
+      // Reasoning models / some gateways: max_tokens → max_completion_tokens
+      if (!_useMaxCompletionTokens && /max_tokens.*not supported|use ['"]?max_completion_tokens/i.test(msg)) {
+        _useMaxCompletionTokens = true;
+        console.warn('[AI] Endpoint wants max_completion_tokens — adapting all calls.');
+        continue;
+      }
+      // Gateways without JSON mode: drop response_format (prompts already demand JSON)
+      if (!_stripResponseFormat && params.response_format && /response_format/i.test(msg)) {
+        _stripResponseFormat = true;
+        console.warn('[AI] Endpoint rejects response_format — stripping it for all calls.');
+        continue;
+      }
+      if (model !== FALLBACK_MODEL && (err?.status === 403 || err?.status === 404 || /does not have access to model|model.*not found/i.test(msg))) {
+        if (!_smartModelBroken) console.warn(`[AI] Model "${model}" unavailable on this endpoint — falling back to "${FALLBACK_MODEL}" for all smart calls. Fix model access or set OPENAI_SMART_MODEL / OPENAI_FALLBACK_MODEL.`);
+        _smartModelBroken = true;
+        model = FALLBACK_MODEL;
+        continue;
+      }
+      throw err;
     }
-    throw err;
   }
+  throw new Error('aiComplete: exhausted parameter-adaptation retries');
+}
+
+// ── Tool-calling support probe (once per process) ────────────────────
+// Some OpenAI-compatible gateways silently strip the tools parameter —
+// the agent loop then gets a plain answer and honestly claims it cannot
+// act. Detect that once so the loop can tell the truth about WHY.
+let _toolsSupported = null;
+async function toolsSupported() {
+  if (_toolsSupported !== null) return _toolsSupported;
+  try {
+    const res = await aiComplete({
+      model: 'gpt-4o-mini', max_tokens: 30,
+      messages: [{ role: 'user', content: 'Call the ping tool.' }],
+      tools: [{ type: 'function', function: { name: 'ping', description: 'test', parameters: { type: 'object', properties: {} } } }],
+      tool_choice: 'required',
+    });
+    _toolsSupported = !!res.choices?.[0]?.message?.tool_calls?.length;
+  } catch (err) {
+    _toolsSupported = false;
+    console.warn('[AI] Tools probe errored:', err.message);
+  }
+  if (!_toolsSupported) console.warn('[AI] ⚠️ THIS ENDPOINT DOES NOT SUPPORT FUNCTION CALLING — the agent loop cannot act (read/create/assign in Jira). Check the gateway or switch OPENAI_BASE_URL.');
+  else console.log('[AI] Tools probe OK — function calling supported.');
+  return _toolsSupported;
 }
 
 // Convenience wrapper (system + user → content string)
@@ -352,7 +407,7 @@ Rules:
 
 module.exports = {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
-  SMART_MODEL, aiComplete, aiCall,
+  SMART_MODEL, aiComplete, aiCall, toolsSupported,
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient,
   resolveUserName, resolveInlineMentions, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,

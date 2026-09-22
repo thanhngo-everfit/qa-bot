@@ -11,7 +11,7 @@ const axios = require('axios');
 const {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   aiComplete, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient,
-  resolveInlineMentions, resolveUserName, gatherChannelContext, slackify,
+  resolveInlineMentions, resolveUserName, gatherChannelContext, slackify, toolsSupported,
 } = require('./lib');
 
 // ── Tool schemas the model sees ──────────────────────────────────────
@@ -307,6 +307,12 @@ Rules:
   const allowCreate =
     /\b(create|log|make|open|force|tạo|lên)\b/i.test(requestText) || existingKeys.length === 0;
 
+  // If the AI endpoint strips the tools parameter, the loop cannot act —
+  // say so truthfully instead of letting the model improvise excuses.
+  if (!(await toolsSupported())) {
+    return "⚠️ My action tools aren't working on the current AI endpoint (it doesn't support function calling), so I can't read Jira or create/assign tickets through the smart loop right now. Direct commands still work — e.g. _\"create ticket …\"_ / _\"force log\"_ go through my standard pipeline. Thanh: check the gateway's function-calling support or OPENAI_BASE_URL.";
+  }
+
   const messages = [
     { role: 'system', content: system },
     { role: 'user', content: `Thread transcript:\n${(threadContext || '(no thread — direct channel mention)').substring(0, 9000)}\n\nRequest from ${requesterName}: ${requestText}` },
@@ -319,6 +325,7 @@ Rules:
     const res = await aiComplete({ model: 'gpt-4o', max_tokens: 1600, messages, tools: TOOLS, tool_choice: 'auto' });
     const msg = res.choices[0].message;
     messages.push(msg);
+    logger?.info?.(`[Agent] step ${step}: ${msg.tool_calls?.length || 0} tool call(s)`);
 
     if (!msg.tool_calls || !msg.tool_calls.length) {
       // Delete-only requests get a silent ack (✅ reaction), not a narration

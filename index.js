@@ -1498,6 +1498,7 @@ const coreMentionHandler = async ({ event, client, logger }) => {
         /\b(create|log|make|t\u1ea1o|l\u00ean)\b[^.]{0,40}\b(cards?|tickets?|bugs?|tasks?|issues?)\b/i.test(event.text) ||
         /\b(assign|giao)\s+(to\s+|cho\s+)?<@/i.test(event.text);
 
+      logger.info(`[QAAgent] route: wantsTicket=${wantsTicket} existing=[${existingKeys.join(',')}] text="${triggerText.substring(0, 70)}"`);
       if (!wantsTicket) {
         // ── THE AGENT LOOP ──
         // Everything that isn't an explicit create request goes to the real
