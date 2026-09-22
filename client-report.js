@@ -494,15 +494,22 @@ function resolveContactMentions(contacts) {
 
 // ─────────────────────────────────────────────
 
+const MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024;   // Jira chokes above this anyway
+const MAX_ATTACHMENTS      = 8;
+
 async function getAllThreadAttachments(client, channelId, threadTs) {
   try {
     const result = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 });
     const atts = [];
     for (const msg of result.messages || []) {
       for (const f of msg.files || []) {
-        if (f.url_private_download) {
-          atts.push({ name: f.name || 'attachment', url: f.url_private_download, mimetype: f.mimetype || 'application/octet-stream' });
+        if (!f.url_private_download) continue;
+        if ((f.size || 0) > MAX_ATTACHMENT_BYTES) {
+          console.log(`[Bot] Skipping large attachment ${f.name} (${Math.round((f.size || 0) / 1048576)}MB)`);
+          continue;
         }
+        atts.push({ name: f.name || 'attachment', url: f.url_private_download, mimetype: f.mimetype || 'application/octet-stream', size: f.size || 0 });
+        if (atts.length >= MAX_ATTACHMENTS) return atts;
       }
     }
     return atts;
@@ -513,6 +520,8 @@ async function downloadSlackFile(url) {
   const res = await axios.get(url, {
     headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
     responseType: 'arraybuffer',
+    timeout: 30000,
+    maxContentLength: MAX_ATTACHMENT_BYTES,
   });
   return Buffer.from(res.data);
 }
@@ -2015,12 +2024,15 @@ Max 8 steps total. Plain English only.`,
     logger.info('[Bot] Create card — analyzing thread...');
     await agentSt.start('⏳ _Dispatching to QA Agent — reading the thread…_');
     await agentSt.update('🧠 _QA Agent is analyzing and drafting the ticket(s)…_');
+    const tDraft = Date.now();
     let analysis;
     try {
       analysis = await draftTicketsLean(context, slackThreadUrl, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
+      logger.info(`[Bot] Lean draft: ${analysis.tickets.length} ticket(s) in ${((Date.now() - tDraft) / 1000).toFixed(1)}s`);
     } catch (err) {
-      logger.warn('[Bot] Lean draft failed, falling back to full analysis:', err.message);
+      logger.warn(`[Bot] Lean draft failed after ${((Date.now() - tDraft) / 1000).toFixed(1)}s, falling back to full analysis:`, err.message);
       analysis = await analyzeThread(context, slackThreadUrl, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
+      logger.info(`[Bot] Full analysis fallback done in ${((Date.now() - tDraft) / 1000).toFixed(1)}s total`);
     }
     await agentSt.update('📝 _QA Agent is creating the Jira card(s)…_');
     logger.info(`[Bot] Severity=${analysis.severity} · tickets=${analysis.tickets.length}`);
@@ -2172,7 +2184,14 @@ Max 8 steps total. Plain English only.`,
     }
 
     const sprintId          = await getActiveSprintId();
+    const tAtt = Date.now();
     const threadAttachments = await getAllThreadAttachments(client, event.channel, threadTs);
+    // Download each file ONCE — previously every ticket re-downloaded every file
+    for (const att of threadAttachments) {
+      try { att.buffer = await downloadSlackFile(att.url); }
+      catch (err) { logger.warn(`[Bot] Attachment download failed (${att.name}):`, err.message); }
+    }
+    logger.info(`[Bot] Attachments ready: ${threadAttachments.filter(a => a.buffer).length}/${threadAttachments.length} in ${((Date.now() - tAtt) / 1000).toFixed(1)}s`);
     const createdJiras      = [];
 
     for (const { ticket, assigneeSlackId } of ticketJobs) {
@@ -2183,7 +2202,8 @@ Max 8 steps total. Plain English only.`,
       let uploadedCount = 0;
       for (const att of threadAttachments) {
         try {
-          const buf = await downloadSlackFile(att.url);
+          const buf = att.buffer;
+          if (!buf) continue;
           if (await uploadAttachmentToJira(jira.key, att.name, buf, att.mimetype)) uploadedCount++;
         } catch (_) {}
       }

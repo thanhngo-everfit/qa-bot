@@ -13,6 +13,7 @@ const {
 } = lib;
 
 const clientReport = require('./client-report');
+console.log(`[Boot] QA Agent build ${(process.env.RAILWAY_GIT_COMMIT_SHA || 'local').substring(0, 7)} · node ${process.version}`);
 const { runAgent } = require('./agent');
 
 const slackApp = new App({
