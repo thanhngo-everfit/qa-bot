@@ -32,6 +32,8 @@ function getOpenAI() {
   return _openaiClient;
 }
 const SMART_MODEL    = process.env.OPENAI_SMART_MODEL    || 'gpt-4o';
+// One-line env truth at boot — ends 'which model/endpoint am I actually on?'
+console.log(`[Boot] AI endpoint=${process.env.OPENAI_BASE_URL ? new URL(process.env.OPENAI_BASE_URL).host : 'api.openai.com'} smart=${process.env.OPENAI_SMART_MODEL || 'gpt-4o'} fallback=${process.env.OPENAI_FALLBACK_MODEL || 'gpt-4o-mini'} timeout=${process.env.OPENAI_TIMEOUT_MS || '90000'}ms key=${(process.env.OPENAI_API_KEY || '').slice(0, 6)}…`);
 const FALLBACK_MODEL = process.env.OPENAI_FALLBACK_MODEL || 'gpt-4o-mini';
 let _smartModelBroken = false;
 
@@ -63,12 +65,17 @@ async function aiComplete(params) {
 
   for (let attempt = 0; attempt < 3; attempt++) {
     const t0 = Date.now();
+    const sysLen = (params.messages?.[0]?.content || '').length;
+    const usrLen = (params.messages?.[params.messages.length - 1]?.content || '').length;
+    console.log(`[AI] → ${model} max_tokens=${params.max_tokens || '-'} json=${!!params.response_format} tools=${params.tools ? params.tools.length : 0} sys=${sysLen}c user=${usrLen}c`);
+    const heartbeat = setInterval(() => console.log(`[AI] … still waiting on ${model} (${Math.round((Date.now() - t0) / 1000)}s)`), 20000);
     try {
       const res = await openai.chat.completions.create({ ..._adaptParams(params), model }, { timeout: AI_TIMEOUT_MS });
-      const ms = Date.now() - t0;
-      if (ms > 20000) console.warn(`[AI] slow call: ${model} took ${(ms / 1000).toFixed(1)}s (max_tokens=${params.max_tokens || params.max_completion_tokens || '-'})`);
+      clearInterval(heartbeat);
+      console.log(`[AI] ← ${model} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
       return res;
     } catch (err) {
+      clearInterval(heartbeat);
       const elapsed = Date.now() - t0;
       const isTimeout = err?.name === 'APIConnectionTimeoutError' || /timed?\s?out/i.test(`${err?.message || ''}`);
       if (isTimeout) {

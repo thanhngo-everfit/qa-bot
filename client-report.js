@@ -2030,7 +2030,18 @@ Max 8 steps total. Plain English only.`,
       analysis = await draftTicketsLean(context, slackThreadUrl, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
       logger.info(`[Bot] Lean draft: ${analysis.tickets.length} ticket(s) in ${((Date.now() - tDraft) / 1000).toFixed(1)}s`);
     } catch (err) {
-      logger.warn(`[Bot] Lean draft failed after ${((Date.now() - tDraft) / 1000).toFixed(1)}s, falling back to full analysis:`, err.message);
+      logger.warn(`[Bot] Lean draft failed after ${((Date.now() - tDraft) / 1000).toFixed(1)}s:`, err.message);
+      if (/timed out/i.test(err.message)) {
+        // Both models timed out — chaining into the heavier full analysis
+        // would just double the death. Tell the truth instead.
+        await agentSt.done();
+        await client.chat.postMessage({
+          channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+          text: `The AI endpoint timed out twice while drafting (${err.message}). Nothing was created — try again in a moment; if it keeps happening, the Railway logs now show exactly which model is stalling.`,
+        });
+        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+        return;
+      }
       analysis = await analyzeThread(context, slackThreadUrl, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
       logger.info(`[Bot] Full analysis fallback done in ${((Date.now() - tDraft) / 1000).toFixed(1)}s total`);
     }
