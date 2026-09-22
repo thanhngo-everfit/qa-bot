@@ -76,7 +76,8 @@ async function aiComplete(params) {
     console.log(`[AI] → ${model} max_tokens=${params.max_tokens || '-'} json=${!!params.response_format} tools=${params.tools ? params.tools.length : 0} sys=${sysLen}c user=${usrLen}c`);
     const heartbeat = setInterval(() => console.log(`[AI] … still waiting on ${model} (${Math.round((Date.now() - t0) / 1000)}s)`), 20000);
     try {
-      const res = await openai.chat.completions.create({ ..._adaptParams(params), model }, { timeout: AI_TIMEOUT_MS });
+      const { __timeoutMs, ...callParams } = params;
+      const res = await openai.chat.completions.create({ ..._adaptParams(callParams), model }, { timeout: __timeoutMs || AI_TIMEOUT_MS });
       clearInterval(heartbeat);
       console.log(`[AI] ← ${model} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
       return res;
@@ -142,8 +143,9 @@ async function toolsSupported() {
 }
 
 // Convenience wrapper (system + user → content string)
-async function aiCall(system, userContent, maxTokens = 1000, jsonMode = false, model = 'gpt-4o-mini') {
+async function aiCall(system, userContent, maxTokens = 1000, jsonMode = false, model = 'gpt-4o-mini', timeoutMs = null) {
   const res = await aiComplete({
+    ...(timeoutMs ? { __timeoutMs: timeoutMs } : {}),
     model,
     max_tokens: maxTokens,
     ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),

@@ -896,7 +896,15 @@ Do NOT include the Slack thread link in the description — it is appended autom
     : `Slack thread:\n\n${context}`;
   // Explicit user commands get the stronger model and a larger budget so
   // multi-ticket outputs (5-6 full descriptions) never truncate mid-JSON.
-  const rawResponse = await aiCall(systemPrompt, userContent, userDirective ? 6000 : 3500, true, userDirective ? 'gpt-4o' : 'gpt-4o-mini'); // jsonMode
+  // Auto-analysis runs on every new report: keep it lean and give it a
+  // short leash (45s) so a slow endpoint falls back fast instead of
+  // leaving 'I'm analyzing the report' hanging in the thread.
+  const rawResponse = await aiCall(
+    systemPrompt, userContent,
+    userDirective ? 6000 : 2500, true,
+    userDirective ? 'gpt-4o' : 'gpt-4o-mini',
+    userDirective ? null : 45000,
+  ); // jsonMode
 
   // Robust JSON extraction: strip fences, then take first { … last }
   let raw = rawResponse.replace(/```json|```/g, '').trim();
@@ -2495,7 +2503,29 @@ slackApp.action('qa_cr_dup_cancel', async ({ ack, body, client }) => {
 // AUTO-ANALYZE — fires on every new thread in monitored channels
 // ─────────────────────────────────────────────
 
-slackApp.event('message', async ({ event, client, logger }) => {
+// Watchdog wrapper: no client-report handler may run forever. On timeout
+// the status is cleared and the thread gets an honest note instead of a
+// permanent 'I'm analyzing the report'.
+function withWatchdog(name, handler, budgetMs) {
+  return async (args) => {
+    const { event, client, logger } = args;
+    let finished = false;
+    const timer = setTimeout(async () => {
+      if (finished) return;
+      logger.warn(`[Bot] WATCHDOG ${name} exceeded ${budgetMs / 1000}s`);
+      try {
+        await client.chat.postMessage({
+          channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false,
+          text: `I couldn't finish analyzing this in time — tag me with _"analyze"_ to retry, or just describe what you need.`,
+        });
+      } catch (_) {}
+    }, budgetMs);
+    try { await handler(args); }
+    finally { finished = true; clearTimeout(timer); }
+  };
+}
+
+slackApp.event('message', withWatchdog('auto-analysis', async ({ event, client, logger }) => {
   // Only monitored channels
   if (!MONITORED_CHANNELS[event.channel]) return;
 
@@ -2558,7 +2588,7 @@ slackApp.event('message', async ({ event, client, logger }) => {
     logger.error('[Bot] Auto-analyze error:', err.message);
     await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
   }
-});
+}, 150000));
 
 // ─────────────────────────────────────────────
 // WEEKLY REPORT SCHEDULER
