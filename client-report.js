@@ -201,6 +201,19 @@ process.on('SIGHUP', loadKnowledgeBase); // hot-reload KB without restart
 function nowVN() { return new Date(Date.now() + 7 * 60 * 60 * 1000); }
 function isWorkingHours() { const h = nowVN().getUTCHours(); return h >= 9 && h < 18; }
 
+// ── Business-hours gate for ALL proactive pings ──────────────────────
+// Nobody should be pinged at 00:31 or on a weekend. Mon–Fri only, VN
+// time, within working hours (tunable via FOLLOWUP_HOUR_START/END).
+function isBusinessTime() {
+  const vn    = nowVN();
+  const day   = vn.getUTCDay();                 // 0=Sun … 6=Sat
+  const hour  = vn.getUTCHours();
+  const start = parseInt(process.env.FOLLOWUP_HOUR_START || '9', 10);
+  const end   = parseInt(process.env.FOLLOWUP_HOUR_END   || '18', 10);
+  if (day === 0 || day === 6) return false;
+  return hour >= start && hour < end;
+}
+
 // ─────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────
@@ -1355,7 +1368,15 @@ function startFollowUpScheduler(client) {
     if (!followUpStore.size) return;
     console.log(`[FollowUp] Scheduler tick — ${followUpStore.size} tracked ticket(s)`);
 
-    for (const [jiraKey, item] of followUpStore.entries()) {
+    // Proactive follow-ups are suppressed outside Mon–Fri working hours —
+  // status changes are still picked up on the next business-hours tick.
+  if (!isBusinessTime()) {
+    const vn = nowVN();
+    console.log(`[FollowUp] Outside business hours (VN ${vn.getUTCHours()}:${String(vn.getUTCMinutes()).padStart(2, '0')}, day ${vn.getUTCDay()}) — skipping this tick`);
+    return;
+  }
+
+  for (const [jiraKey, item] of followUpStore.entries()) {
       if (item.done) { followUpStore.delete(jiraKey); continue; }
 
       try {
@@ -1435,10 +1456,7 @@ function startFollowUpScheduler(client) {
         const DEV_STATUSES = ['to do', 'in progress', 'in review'];
         if (!DEV_STATUSES.includes(status)) continue;
 
-        // Skip weekends — VN timezone (UTC+7)
-        if (!isWorkingHours()) continue;
-        const vnDay = nowVN().getUTCDay(); // 0=Sun, 6=Sat
-        if (vnDay === 0 || vnDay === 6) continue;
+        // Business-hours gate already applied at tick level
 
         const hoursSinceLastPing = item.lastPingAt
           ? (Date.now() - item.lastPingAt) / (60 * 60 * 1000)
