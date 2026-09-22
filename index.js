@@ -1918,7 +1918,7 @@ const coreMentionHandler = async ({ event, client, logger }) => {
         });
       }
 
-      createdJiras.push({ jira, ticket, assigneeSlackIds, uploaded, acCount });
+      createdJiras.push({ jira, ticket, assigneeSlackIds, uploaded, acCount, sprintAdded });
     }
 
     // ── Build Slack response ──────────────────
@@ -1926,7 +1926,11 @@ const coreMentionHandler = async ({ event, client, logger }) => {
     // Release attachment buffers as soon as uploads are done
     for (const att of attachments) att.buffer = null;
 
-    const lines = createdJiras.map(({ jira, ticket, assigneeSlackIds, uploaded, acCount }) => {
+    // The tickets EXIST at this point — a formatting error must never
+    // swallow the confirmation. Fall back to a minimal reply on throw.
+    let lines;
+    try {
+    lines = createdJiras.map(({ jira, ticket, assigneeSlackIds, uploaded, acCount, sprintAdded }) => {
       const assigneeLine = assigneeSlackIds.length > 0
         ? `assigned to ${assigneeSlackIds.map(id => `<@${id}>`).join(', ')}`
         : "_I couldn't match an assignee — please assign in Jira_";
@@ -1948,6 +1952,11 @@ const coreMentionHandler = async ({ event, client, logger }) => {
         })()
       );
     });
+    } catch (fmtErr) {
+      logger.warn('[QABot] Reply formatting failed, using minimal confirmation:', fmtErr.message);
+      lines = createdJiras.map(({ jira, ticket }) =>
+        `✅ <${jira.url}|${jira.key}> — ${ticket.summary}`);
+    }
 
     const epicLine = epicKey ? `\nEpic: <${JIRA_HOST}/browse/${epicKey}|${epicKey}>` : '';
 
