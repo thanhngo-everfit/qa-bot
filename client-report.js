@@ -1642,7 +1642,8 @@ const crMentionHandler = async ({ event, client, logger }) => {
     FASTPATH.creation.test(event.text) ||
     FASTPATH.assignMention.test(event.text);
   const isRetract        = FASTPATH.retract.test(event.text);
-  const isFollowup       = /^(followup|follow[- ]up|check\s?status|update)/.test(triggerText);
+  const isFollowup       = /^(followup|follow[- ]up|check\s?status|update)/.test(triggerText)
+                        || FASTPATH.followup.test(event.text);
   const isTroubleshoot   = /^(troubleshoot|trouble\s?shoot|debug|how\s?to\s?fix)/.test(triggerText);
   const isCancel         = /^(cancel|stop|close)/.test(triggerText);
   const isChangeAssignee = /^(reassign|change\s?assignee|assign\s?this\s?to|move\s?to)/.test(triggerText);
@@ -1898,6 +1899,72 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
     // ═══════════════════════════════════════════
     if (doFollowup) {
       await agentSt.start('⏳ _QA Agent is checking ticket status…_');
+
+      // ── Mention-aware follow-up ───────────────────────────────────
+      // "follow up with @Thanh Tran until his task is finished" must
+      // track THAT person's ticket and ping THAT person — not the first
+      // ticket in the thread and not its current Jira assignee.
+      const mentionedIds = (event.text.match(/<@([A-Z0-9]+)>/g) || [])
+        .map(m => m.replace(/<@|>/g, ''))
+        .filter(id => id !== botUserId && !ASSIGNEE_BLOCKLIST.has(id));
+
+      if (mentionedIds.length) {
+        const targetId = mentionedIds[0];
+        let targetEmail = null, targetName = null;
+        try {
+          const info = await client.users.info({ user: targetId });
+          targetEmail = info.user?.profile?.email || null;
+          targetName  = info.user?.real_name || null;
+        } catch (_) {}
+
+        const threadKeys = await scanThreadForTickets(client, event.channel, threadTs);
+        const matches = [];
+        for (const key of (threadKeys || []).slice(0, 12)) {
+          const d = await getJiraIssueDetails(key);
+          if (!d) continue;
+          const sameEmail = targetEmail && d.assigneeEmail && d.assigneeEmail.toLowerCase() === targetEmail.toLowerCase();
+          const sameName  = targetName && d.assigneeDisplay &&
+            d.assigneeDisplay.toLowerCase().replace(/\s+/g, ' ') === targetName.toLowerCase().replace(/\s*\([^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
+          if (sameEmail || sameName) matches.push({ key, details: d });
+        }
+
+        const done = s => ['qa success', 'done', 'released', 'closed'].includes((s || '').toLowerCase());
+        const open = matches.filter(m => !done(m.details.status));
+        const chosen = open.length ? open : matches;
+
+        await agentSt.done();
+        if (!chosen.length) {
+          await client.chat.postMessage({
+            channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+            text: threadKeys?.length
+              ? `I couldn't find a ticket in this thread assigned to <@${targetId}> (I checked ${threadKeys.slice(0, 6).map(k => `<${JIRA_HOST}/browse/${k}|${k}>`).join(', ')}). Tell me the ticket key and I'll track it.`
+              : `There's no Jira ticket in this thread yet — say _"create card"_ and I'll log one, then I can track it.`,
+          });
+        } else {
+          const lines = [];
+          for (const { key, details } of chosen.slice(0, 5)) {
+            registerFollowUp({
+              channelId: event.channel, threadTs, jiraKey: key,
+              jiraUrl: `${JIRA_HOST}/browse/${key}`, squad: null,
+              assigneeSlackHint: targetId,        // ping the person actually mentioned
+              seedStatus: details.status, alreadyAnnounced: true,
+            });
+            const t = followUpStore.get(key);
+            if (t) { t.assigneeSlackHint = targetId; t.done = false; }
+            lines.push(`🔎 <${JIRA_HOST}/browse/${key}|${key}> — *${details.status}*`);
+          }
+          await client.chat.postMessage({
+            channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+            text:
+              `Tracking <@${targetId}>'s ticket${lines.length > 1 ? 's' : ''} until closed:\n${lines.join('\n')}\n` +
+              `_I'll nudge <@${targetId}> every 2 business days (Mon–Fri, working hours) and tag SM at QA Ready._`,
+          });
+        }
+        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+        await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
+        return;
+      }
+
       const tracked = await findOrRegisterTracked(client, event.channel, threadTs, botBotId, botUserId);
 
       // ── No ticket yet → tag SM/PC to review and assign ──

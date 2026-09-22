@@ -424,6 +424,7 @@ const FASTPATH = {
   creation:      /\b(create|log|make|tạo|lên)\b[^.]{0,40}\b(cards?|tickets?|bugs?|tasks?|issues?)\b/i,
   assignMention: /\b(assign|giao)\s+(to\s+|cho\s+)?<@/i,
   retract:       /\b(delete|remove|xóa|xoá)\b[^.]{0,40}\b(responses?|messages?|repl(y|ies)|tin nhắn)\b/i,
+  followup:      /\b(follow[\s-]?up|theo\s?dõi|nhắc|check\s?(status|progress|tiến độ)|any\s?update)\b/i,
   retractAll:    /\ball\b|tất cả|hết|mọi tin/i,
   retractLastN:  /\blast\s+(\d+)\b/i,
 };
