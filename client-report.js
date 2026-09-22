@@ -1470,6 +1470,45 @@ async function findOrRegisterTracked(client, channelId, threadTs, botBotId, botU
 // ── Agent status: live progress message that updates through phases ──
 // Gives the "an agent is working" feel: one message posted immediately,
 // edited as work progresses, deleted when the real reply lands.
+// ── Lean ticket drafting for DIRECTED creates ────────────────────────
+// The full analyzeThread mega-prompt (squad rubric, severity narrative,
+// platform rules, both templates, analysis schema) exists for
+// auto-analysis. For explicit "create card" commands it made the smart
+// model grind for minutes on the gateway. This is the core-style lean
+// draft: small prompt, same ticket shape, squad/severity backfilled by
+// code. 5-10x faster, same downstream pipeline.
+async function draftTicketsLean(context, slackThreadUrl, userDirective) {
+  const system = `You draft Jira tickets from an Everfit Slack support thread. Return ONLY JSON:
+{"severity":"Low|Medium|High|Critical","tickets":[{"summary":"...","type":"Bug|Task","platform":"iOS Client|iOS Coach|Android Client|Android Coach|Web|API","assignee_names":[],"description":"..."}]}
+
+RULES:
+- summary: "[Client Report|Request][<platform>][<Feature>] Clear English title" — <=100 chars. Broken behavior → Bug + "Client Report"; data fix/config/account/enable/export/request → Task + "Request".
+- description (markdown, real newlines):
+  Bug: ## Bug Description / ## Report Info (- **Reported by:** name+email, - **Intercom:** url if any, - **Severity:** X — why) / ## Root Cause / ## Expected Behavior / ## Steps to Reproduce
+  Task: ## Context / ## Report Info (same bullets) / ## Requirements (numbered, **bold labels**)
+  Build them from the thread's actual details. Do NOT include the Slack thread link.
+- TICKET COUNT: one reported problem → 1 ticket. Multiple distinct issues, or the directive asks per-issue/N tickets → one ticket per issue (up to 6). Never collapse distinct issues into one generic ticket.
+- English only. Never invent facts.`;
+  const user = `REQUESTER DIRECTIVE (obey this): ${userDirective}\n\nSlack thread:\n\n${(context || '').substring(0, 7000)}`;
+  const raw = (await aiCall(system, user, 4000, true, 'gpt-4o')).trim();
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.substring(raw.indexOf('{'), raw.lastIndexOf('}') + 1));
+  } catch (e) {
+    throw new Error(`lean draft JSON parse failed: ${e.message}`);
+  }
+  parsed.severity = ['Low', 'Medium', 'High', 'Critical'].includes(parsed.severity) ? parsed.severity : 'Medium';
+  parsed.tickets = (parsed.tickets || []).slice(0, 6).map(t => {
+    const norm = normalizeTicketSummary(t, parsed);
+    // squad backfilled by keyword detection — no need to burden the prompt
+    norm.squad = norm.squad || detectSquadFromKeywords(`${norm.summary} ${norm.description || ''} ${context.substring(0, 2000)}`);
+    norm.slackThreadUrl = slackThreadUrl;
+    return norm;
+  });
+  if (!parsed.tickets.length) throw new Error('lean draft returned no tickets');
+  return parsed;
+}
+
 // ── AI intent router: understand natural language commands ──
 // Lets people talk to the bot naturally in English or Vietnamese instead
 // of memorizing exact command prefixes.
@@ -1976,7 +2015,13 @@ Max 8 steps total. Plain English only.`,
     logger.info('[Bot] Create card — analyzing thread...');
     await agentSt.start('⏳ _Dispatching to QA Agent — reading the thread…_');
     await agentSt.update('🧠 _QA Agent is analyzing and drafting the ticket(s)…_');
-    const analysis = await analyzeThread(context, slackThreadUrl, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
+    let analysis;
+    try {
+      analysis = await draftTicketsLean(context, slackThreadUrl, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
+    } catch (err) {
+      logger.warn('[Bot] Lean draft failed, falling back to full analysis:', err.message);
+      analysis = await analyzeThread(context, slackThreadUrl, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
+    }
     await agentSt.update('📝 _QA Agent is creating the Jira card(s)…_');
     logger.info(`[Bot] Severity=${analysis.severity} · tickets=${analysis.tickets.length}`);
 
