@@ -1104,10 +1104,18 @@ async function resolveEmailToSlackId(client, email, displayName = null) {
       let cursor;
       do {
         const res = await client.users.list({ limit: 200, ...(cursor ? { cursor } : {}) });
+        // EXACT matching only. Substring matching caused real damage:
+        // "Thanh Tran".includes("Hanh Tran") === true, so Hanh Tran's
+        // tickets pinged Thanh Tran for weeks.
+        const norm = s => (s || '').toLowerCase().replace(/\s*\(.*?\)\s*/g, ' ').replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+        const target = norm(base);
+        const tokens = new Set(target.split(' ').filter(Boolean));
         const match = (res.members || []).find(u => {
-          const real    = (u.real_name || '').toLowerCase();
-          const display = (u.profile?.display_name || '').toLowerCase();
-          return real.includes(base) || display.includes(base);
+          if (u.deleted || u.is_bot) return false;
+          const cands = [u.real_name, u.profile?.real_name, u.profile?.display_name].map(norm).filter(Boolean);
+          // exact normalized equality, or identical token SETS (order-insensitive)
+          return cands.some(c => c === target ||
+            (c.split(' ').length === tokens.size && c.split(' ').every(t => tokens.has(t))));
         });
         if (match) {
           console.log(`[Bot] Resolved "${displayName}" by name fallback → ${match.id}`);
@@ -1924,14 +1932,21 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
           targetName  = info.user?.real_name || null;
         } catch (_) {}
 
-        const threadKeys = await scanThreadForTickets(client, event.channel, threadTs);
+        const threadTickets = await scanThreadForTickets(client, event.channel, threadTs);
+        const threadKeys = (threadTickets || []).map(t => (typeof t === 'string' ? t : t.key)).filter(Boolean);
+
+        // An explicit ticket key in the request wins over any matching
+        // ("do follow up with @Hanh for UP-79009").
+        const explicitKey = (event.text.match(/\bUP-\d+\b/i) || [])[0]?.toUpperCase() || null;
+
         const matches = [];
-        for (const key of (threadKeys || []).slice(0, 12)) {
+        for (const key of (explicitKey ? [explicitKey] : threadKeys).slice(0, 12)) {
           const d = await getJiraIssueDetails(key);
           if (!d) continue;
+          if (explicitKey) { matches.push({ key, details: d }); continue; }   // user named the ticket
+          const nrm = s => (s || '').toLowerCase().replace(/\s*\(.*?\)\s*/g, ' ').replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
           const sameEmail = targetEmail && d.assigneeEmail && d.assigneeEmail.toLowerCase() === targetEmail.toLowerCase();
-          const sameName  = targetName && d.assigneeDisplay &&
-            d.assigneeDisplay.toLowerCase().replace(/\s+/g, ' ') === targetName.toLowerCase().replace(/\s*\([^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
+          const sameName  = targetName && d.assigneeDisplay && nrm(d.assigneeDisplay) === nrm(targetName);
           if (sameEmail || sameName) matches.push({ key, details: d });
         }
 
@@ -1943,7 +1958,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
         if (!chosen.length) {
           await client.chat.postMessage({
             channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-            text: threadKeys?.length
+            text: threadKeys.length
               ? `I couldn't find a ticket in this thread assigned to <@${targetId}> (I checked ${threadKeys.slice(0, 6).map(k => `<${JIRA_HOST}/browse/${k}|${k}>`).join(', ')}). Tell me the ticket key and I'll track it.`
               : `There's no Jira ticket in this thread yet — say _"create card"_ and I'll log one, then I can track it.`,
           });
