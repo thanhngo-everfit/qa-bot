@@ -1832,6 +1832,11 @@ const coreMentionHandler = async ({ event, client, logger }) => {
         ticket.description = `${ticket.description}\n\n## Reference\n- Slack thread: ${slackThreadUrl}`;
       }
 
+      // Client-report channels: enforce the [Client Report]/[Client Request]
+      // title convention (bug vs task) before creating.
+      if (clientReport.MONITORED_CHANNELS[event.channel]) {
+        ticket.summary = lib.clientReportSummary(ticket.summary, issueType);
+      }
       logger.info(`[QABot] Creating ${issueType}: ${ticket.summary} epic=${epicKey || 'none'} parent=${parentKey || 'none'}`);
       await agentSt.update('📝 _QA Agent is creating the Jira ticket(s)…_');
       const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId, issueType);

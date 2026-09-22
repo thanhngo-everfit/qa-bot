@@ -507,6 +507,19 @@ async function retractOwnMessages(client, channelId, threadTs, requestText, { be
   return deleted;
 }
 
+// ── Client-report title convention ───────────────────────────────────
+// Tickets logged from the client-report channels carry a leading tag so
+// they're identifiable in Jira: [Client Report] for bugs,
+// [Client Request] for tasks/requests. Applied deterministically in code
+// (never left to the model) and idempotent.
+function clientReportSummary(summary, issueType) {
+  let s = (summary || '').trim();
+  // strip any existing variant, however many times it appears
+  s = s.replace(/^(?:\[(?:client\s*report|client\s*request|request)\]\s*)+/i, '').trim();
+  const tag = /^bug$/i.test(issueType || '') ? '[Client Report]' : '[Client Request]';
+  return `${tag}${s.startsWith('[') ? '' : ' '}${s}`.substring(0, 250);
+}
+
 // ── slackify: normalize AI output for Slack ──────────────────────────
 // Models (especially gpt-4o-mini) leak markdown: **bold**, ### headers,
 // [text](url). Slack needs *bold* and <url|text>. Also auto-link every
@@ -550,5 +563,5 @@ module.exports = {
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient, getIssueEpic,
   resolveUserName, resolveInlineMentions, warmUserNames, replaceMentionsCached, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
-  slackify, FASTPATH, retractOwnMessages, isCreationRequest,
+  slackify, FASTPATH, retractOwnMessages, isCreationRequest, clientReportSummary,
 };
