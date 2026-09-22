@@ -1451,7 +1451,13 @@ async function qaChatReply(context, userText) {
 
 const coreMentionHandler = async ({ event, client, logger }) => {
   // Client-report channels are handled by the client-report module
-  if (clientReport.MONITORED_CHANNELS[event.channel]) return;
+  // Monitored (client-report) channels own their specialised flows —
+  // EXCEPT ticket creation, which runs through this one proven pipeline in
+  // every channel. Same prompt, same parsers, same behavior everywhere.
+  if (clientReport.MONITORED_CHANNELS[event.channel] && !lib.isCreationRequest(event.text)) return;
+  if (clientReport.MONITORED_CHANNELS[event.channel]) {
+    logger.info(`[QAAgent] Creation request in monitored channel ${clientReport.MONITORED_CHANNELS[event.channel]} — using core pipeline`);
+  }
 
   const authRes   = await client.auth.test();
   const botUserId = authRes.user_id;
@@ -1792,6 +1798,16 @@ const coreMentionHandler = async ({ event, client, logger }) => {
         }
       }
       logger.info(`[QABot] Uploaded ${uploaded}/${attachments.length} attachments to ${jira.key}`);
+
+      // Register follow-up tracking for tickets created in the
+      // client-report channels (assignee nudges, QA Ready → SM,
+      // QA Success → PC) — same as the module's own creates did.
+      if (clientReport.MONITORED_CHANNELS[event.channel]) {
+        clientReport.registerFollowUp({
+          channelId: event.channel, threadTs, jiraKey: jira.key, jiraUrl: jira.url,
+          squad: null, assigneeSlackHint: assigneeSlackIds[0] || null,
+        });
+      }
 
       createdJiras.push({ jira, ticket, assigneeSlackIds, uploaded, acCount });
     }

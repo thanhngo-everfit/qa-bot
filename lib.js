@@ -397,6 +397,15 @@ async function gatherChannelContext(client, channelId, { days = 14, maxThreads =
 // ── Deterministic fast-path triggers (shared by BOTH handlers) ───────
 // Critical verbs must never depend on a model or gateway: creation,
 // assignment, retraction. One source of truth — no more parity drift.
+// Is this mention a ticket-creation request? ONE definition, used by both
+// handlers to route creation to the single working pipeline.
+function isCreationRequest(rawText) {
+  const t = (rawText || '').replace(/<@[A-Z0-9]+>/g, '').trim().toLowerCase();
+  return /^(force\s?log|create\s?(card|ticket|task)|log\s?(bug|this)|assign\s?to)/.test(t)
+      || FASTPATH.creation.test(rawText || '')
+      || FASTPATH.assignMention.test(rawText || '');
+}
+
 const FASTPATH = {
   creation:      /\b(create|log|make|tạo|lên)\b[^.]{0,40}\b(cards?|tickets?|bugs?|tasks?|issues?)\b/i,
   assignMention: /\b(assign|giao)\s+(to\s+|cho\s+)?<@/i,
@@ -473,5 +482,5 @@ module.exports = {
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient,
   resolveUserName, resolveInlineMentions, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
-  slackify, FASTPATH, retractOwnMessages,
+  slackify, FASTPATH, retractOwnMessages, isCreationRequest,
 };

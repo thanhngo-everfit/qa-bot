@@ -11,7 +11,7 @@ const path = require('path');
 const {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiCall,
-  agentStatus, getActiveSprintId, createJiraIssueResilient, FASTPATH, retractOwnMessages,
+  agentStatus, getActiveSprintId, createJiraIssueResilient, FASTPATH, retractOwnMessages, isCreationRequest,
   resolveInlineMentions, qaTaskWork,
 } = require('./lib');
 
@@ -1618,6 +1618,15 @@ JSON only, no other text.`,
 
 const crMentionHandler = async ({ event, client, logger }) => {
   if (!MONITORED_CHANNELS[event.channel]) return;
+
+  // Ticket creation is handled by the core pipeline (index.js) in ALL
+  // channels — one prompt, one mechanism, no parity drift. This module
+  // keeps what it uniquely owns: auto-analysis, follow-ups, weekly
+  // reports, troubleshooting, reassignment, retraction.
+  if (isCreationRequest(event.text)) {
+    logger.info('[Bot] Creation request → deferring to core pipeline');
+    return;
+  }
 
   const { user_id: botUserId, bot_id: botBotId } = await client.auth.test();
   const triggerText = event.text.replace(/<@[A-Z0-9]+>/g, '').trim().toLowerCase();
