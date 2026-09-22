@@ -809,7 +809,14 @@ async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, pa
     }
   }
 
-  return { key: issueKey, url: `${JIRA_HOST}/browse/${issueKey}`, notes: createNotes };
+  return {
+    key: issueKey, url: `${JIRA_HOST}/browse/${issueKey}`, notes: createNotes,
+    applied: {
+      // what Jira actually accepted (resilient creator may have dropped fields)
+      epic:       fields.customfield_10014 || fields.parent?.key || null,
+      fixVersion: !!fields.fixVersions,
+    },
+  };
 }
 
 // ── Fetch Jira issue title ────────────────────
@@ -1030,7 +1037,11 @@ async function addIssueToSprint(issueKey, sprintId) {
       { issues: [issueKey] },
       { headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' } }
     );
-  } catch (_) {}
+    return true;
+  } catch (err) {
+    console.warn(`[QABot] Sprint add failed for ${issueKey}:`, err.response?.status || err.message);
+    return false;
+  }
 }
 
 // ── Add acceptance criteria checklist items to a Jira issue ──
@@ -1677,7 +1688,22 @@ const coreMentionHandler = async ({ event, client, logger }) => {
     // Parse Epic from trigger message (PLAN-XXX or UP-XXX)
     const epicExplicit = event.text.match(/\b(?:epic|under|parent)\s+(?:epic\s+)?(PLAN-\d+|UP-\d+)\b/i);
     const epicAny      = event.text.match(/\b(PLAN-\d+|UP-\d+)\b/i);
-    const epicKey      = (epicExplicit ? epicExplicit[1] : epicAny ? epicAny[1] : null)?.toUpperCase() || null;
+    let epicKey        = (epicExplicit ? epicExplicit[1] : epicAny ? epicAny[1] : null)?.toUpperCase() || null;
+
+    // "same epic as that previous bug/ticket" → inherit the epic from a
+    // ticket already in this thread (no key typed in the message).
+    if (!epicKey && /\b(same|previous|that|existing|cùng)\b[^.]{0,40}\b(epic|bug|ticket|card|task)\b/i.test(event.text)) {
+      const threadKeys = await scanThreadTicketKeys(client, event.channel, threadTs);
+      for (const k of threadKeys) {
+        const inherited = await lib.getIssueEpic(k);
+        if (inherited) {
+          epicKey = inherited.toUpperCase();
+          logger.info(`[QABot] Inherited epic ${epicKey} from ${k} in thread`);
+          break;
+        }
+      }
+      if (!epicKey) logger.info('[QABot] Epic inheritance requested but no epic found on thread tickets');
+    }
 
     // Hardcoded fix version = "To be confirmed" (ID 12023)
     const fixVersionId = '12023';
@@ -1771,8 +1797,10 @@ const coreMentionHandler = async ({ event, client, logger }) => {
       logger.info(`[QABot] Creating ${issueType}: ${ticket.summary} epic=${epicKey || 'none'} parent=${parentKey || 'none'}`);
       await agentSt.update('📝 _QA Agent is creating the Jira ticket(s)…_');
       const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId, issueType);
+      if (epicKey && !jira.applied?.epic) jira.notes = [...(jira.notes || []), `couldn't attach to epic ${epicKey} — please link it in Jira`];
+      if (!epicKey) jira.notes = [...(jira.notes || []), 'no epic set'];
 
-      if (sprintId) await addIssueToSprint(jira.key, sprintId);
+      const sprintAdded = sprintId ? await addIssueToSprint(jira.key, sprintId) : false;
 
       // ── Feature 3: Add acceptance criteria checklist ──
       let acCount = 0;
@@ -1824,9 +1852,16 @@ const coreMentionHandler = async ({ event, client, logger }) => {
         `${headline} → <${jira.url}|${jira.key}>\n` +
         `*${ticket.summary}*\n` +
         `*${ticket.priority}* priority · *${ticket.platform}* · ${assigneeLine}${attachLine}${acLine}\n` +
-        (jira.notes && jira.notes.length
-          ? `_${jira.notes.join(' · ')}. Active Sprint is set — tag me anytime to follow up._`
-          : `_Epic, Fix Version and Active Sprint are set. Tag me anytime to follow up._`)
+        // Report ONLY what was actually applied — never a hardcoded claim
+        (() => {
+          const bits = [];
+          if (jira.applied?.epic) bits.push(`Epic ${jira.applied.epic}`);
+          if (jira.applied?.fixVersion) bits.push('Fix Version');
+          if (sprintAdded) bits.push('Active Sprint');
+          const set = bits.length ? `${bits.join(', ')} set` : 'no epic/sprint set';
+          const problems = (jira.notes || []).filter(n => n !== 'no epic set');
+          return `_${set}${problems.length ? ` · ${problems.join(' · ')}` : ''}${jira.notes?.includes('no epic set') ? ' · no epic — mention one to link it' : ''}. Tag me anytime to follow up._`;
+        })()
       );
     });
 

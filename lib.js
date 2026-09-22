@@ -300,6 +300,20 @@ async function createJiraIssueResilient(fields) {
   throw e;
 }
 
+// ── Jira: an issue's epic / parent link ──────────────────────────────
+// Supports "same epic as that previous ticket" by inheriting the link
+// from a ticket already in the thread. Checks both mechanisms.
+async function getIssueEpic(issueKey) {
+  try {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/issue/${issueKey}`, {
+      params: { fields: 'customfield_10014,parent' },
+      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+    });
+    const f = res.data?.fields || {};
+    return (typeof f.customfield_10014 === 'string' ? f.customfield_10014 : null) || f.parent?.key || null;
+  } catch { return null; }
+}
+
 // ── Jira: quick issue snapshot ───────────────────────────────────────
 async function getIssueSnapshot(issueKey) {
   try {
@@ -479,7 +493,7 @@ Rules:
 module.exports = {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiComplete, aiCall, toolsSupported,
-  agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient,
+  agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient, getIssueEpic,
   resolveUserName, resolveInlineMentions, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
   slackify, FASTPATH, retractOwnMessages, isCreationRequest,
