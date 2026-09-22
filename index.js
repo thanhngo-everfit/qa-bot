@@ -13,7 +13,21 @@ const {
 } = lib;
 
 const clientReport = require('./client-report');
-console.log(`[Boot] QA Agent build ${(process.env.RAILWAY_GIT_COMMIT_SHA || 'local').substring(0, 7)} · node ${process.version}`);
+console.log(`[Boot] QA Agent build ${(process.env.RAILWAY_GIT_COMMIT_SHA || 'local').substring(0, 7)} · node ${process.version} · mem limit ${Math.round(require('os').totalmem() / 1048576)}MB`);
+
+// Survive unexpected errors: Node exits on unhandled rejections by default,
+// which would take the whole bot down for every user until a restart.
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL-GUARD] Unhandled rejection:', reason?.stack || reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL-GUARD] Uncaught exception:', err?.stack || err);
+});
+setInterval(() => {
+  const m = process.memoryUsage();
+  const rssMB = Math.round(m.rss / 1048576);
+  if (rssMB > 300) console.warn(`[Mem] rss=${rssMB}MB heap=${Math.round(m.heapUsed / 1048576)}MB — watch for OOM`);
+}, 60000).unref();
 const { runAgent } = require('./agent');
 
 const slackApp = new App({
@@ -1737,12 +1751,15 @@ const coreMentionHandler = async ({ event, client, logger }) => {
     const slackThreadUrl = buildSlackThreadUrl(event.channel, threadTs);
     const tAtt = Date.now();
     const { attachments, skipped: skippedAtts } = await getAllThreadAttachments(client, event.channel, threadTs);
-    // Download each file ONCE, in parallel, and reuse across tickets —
-    // previously every ticket re-downloaded every file serially.
-    await Promise.all(attachments.map(async (att) => {
-      try { att.buffer = await downloadSlackFile(att.url); }
-      catch (err) { logger.warn(`[QABot] Attachment download failed (${att.name}):`, err.message); }
-    }));
+    // Download each file ONCE, max 2 at a time. Fully parallel downloads of
+    // up to 8 x 15MB files can OOM a small container and kill the bot for
+    // everyone — bounded concurrency keeps peak memory predictable.
+    for (let i = 0; i < attachments.length; i += 2) {
+      await Promise.all(attachments.slice(i, i + 2).map(async (att) => {
+        try { att.buffer = await downloadSlackFile(att.url); }
+        catch (err) { logger.warn(`[QABot] Attachment download failed (${att.name}):`, err.message); }
+      }));
+    }
     logger.info(`[QABot] Attachments ready: ${attachments.filter(a => a.buffer).length}/${attachments.length} in ${((Date.now() - tAtt) / 1000).toFixed(1)}s${skippedAtts.length ? ` · ${skippedAtts.length} skipped (too large)` : ''}`);
     const sprintId       = await getActiveSprintId();
     logger.info(`[QABot] Active sprint: ${sprintId || 'none found — ticket will not be added to a sprint'}`);
@@ -1906,6 +1923,9 @@ const coreMentionHandler = async ({ event, client, logger }) => {
 
     // ── Build Slack response ──────────────────
     const headline = isTask ? "📋 Done — I've created a Task" : "🐛 Done — I've logged this bug";
+    // Release attachment buffers as soon as uploads are done
+    for (const att of attachments) att.buffer = null;
+
     const lines = createdJiras.map(({ jira, ticket, assigneeSlackIds, uploaded, acCount }) => {
       const assigneeLine = assigneeSlackIds.length > 0
         ? `assigned to ${assigneeSlackIds.map(id => `<@${id}>`).join(', ')}`
