@@ -368,6 +368,42 @@ async function gatherChannelContext(client, channelId, { days = 14, maxThreads =
   return { context: context.substring(0, 30000), note: null };
 }
 
+// ── Deterministic fast-path triggers (shared by BOTH handlers) ───────
+// Critical verbs must never depend on a model or gateway: creation,
+// assignment, retraction. One source of truth — no more parity drift.
+const FASTPATH = {
+  creation:      /\b(create|log|make|tạo|lên)\b[^.]{0,40}\b(cards?|tickets?|bugs?|tasks?|issues?)\b/i,
+  assignMention: /\b(assign|giao)\s+(to\s+|cho\s+)?<@/i,
+  retract:       /\b(delete|remove|xóa|xoá)\b[^.]{0,40}\b(responses?|messages?|repl(y|ies)|tin nhắn)\b/i,
+  retractAll:    /\ball\b|tất cả|hết|mọi tin/i,
+  retractLastN:  /\blast\s+(\d+)\b/i,
+};
+
+// Shared retract executor: delete the agent's own message(s) in a thread.
+// excludeTs protects a live status message; only messages older than
+// beforeTs (the request) are eligible; thread root untouchable.
+async function retractOwnMessages(client, channelId, threadTs, requestText, { beforeTs = null, excludeTs = null } = {}) {
+  const { user_id: botUid } = await client.auth.test();
+  const replies = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 100 });
+  const mine = (replies.messages || [])
+    .filter(m => m.user === botUid && m.ts !== threadTs && m.ts !== excludeTs
+              && (!beforeTs || parseFloat(m.ts) < parseFloat(beforeTs)))
+    .sort((a, b) => parseFloat(b.ts) - parseFloat(a.ts));
+  if (!mine.length) return 0;
+  const nMatch = (requestText || '').match(FASTPATH.retractLastN);
+  const targets = FASTPATH.retractAll.test(requestText || '') ? mine.slice(0, 50)
+                : mine.slice(0, nMatch ? Math.min(parseInt(nMatch[1], 10), 50) : 1);
+  let deleted = 0;
+  for (const m of targets) {
+    try {
+      await client.chat.delete({ channel: channelId, ts: m.ts });
+      deleted++;
+      if (targets.length > 3) await new Promise(r => setTimeout(r, 350));
+    } catch (_) {}
+  }
+  return deleted;
+}
+
 // ── slackify: normalize AI output for Slack ──────────────────────────
 // Models (especially gpt-4o-mini) leak markdown: **bold**, ### headers,
 // [text](url). Slack needs *bold* and <url|text>. Also auto-link every
@@ -411,5 +447,5 @@ module.exports = {
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient,
   resolveUserName, resolveInlineMentions, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
-  slackify,
+  slackify, FASTPATH, retractOwnMessages,
 };

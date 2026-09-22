@@ -11,7 +11,7 @@ const path = require('path');
 const {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiCall,
-  agentStatus, getActiveSprintId, createJiraIssueResilient,
+  agentStatus, getActiveSprintId, createJiraIssueResilient, FASTPATH, retractOwnMessages,
   resolveInlineMentions, qaTaskWork,
 } = require('./lib');
 
@@ -1516,13 +1516,14 @@ const crMentionHandler = async ({ event, client, logger }) => {
   // reinterpreted by the AI router as a summary/task.
   const isCreateCard     =
     /^(force\s?log|create\s?(card|ticket)|log\s?(bug|this)|assign\s?to)/.test(triggerText) ||
-    /\b(create|log|make|tạo|lên)\b[^.]{0,40}\b(cards?|tickets?|bugs?|tasks?|issues?)\b/i.test(event.text) ||
-    /\b(assign|giao)\s+(to\s+|cho\s+)?<@/i.test(event.text);
+    FASTPATH.creation.test(event.text) ||
+    FASTPATH.assignMention.test(event.text);
+  const isRetract        = FASTPATH.retract.test(event.text);
   const isFollowup       = /^(followup|follow[- ]up|check\s?status|update)/.test(triggerText);
   const isTroubleshoot   = /^(troubleshoot|trouble\s?shoot|debug|how\s?to\s?fix)/.test(triggerText);
   const isCancel         = /^(cancel|stop|close)/.test(triggerText);
   const isChangeAssignee = /^(reassign|change\s?assignee|assign\s?this\s?to|move\s?to)/.test(triggerText);
-  const matchedFastPath  = isAnalyze || isWeeklyReport || isCreateCard || isFollowup || isTroubleshoot || isCancel || isChangeAssignee;
+  const matchedFastPath  = isAnalyze || isWeeklyReport || isCreateCard || isFollowup || isTroubleshoot || isCancel || isChangeAssignee || isRetract;
 
   try { await client.reactions.add({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }); } catch (_) {}
 
@@ -1547,27 +1548,16 @@ const crMentionHandler = async ({ event, client, logger }) => {
     const doReassign = isChangeAssignee || aiAction === 'reassign';
     const aiWantsAssign = aiAction === 'assign' || triggerText.startsWith('assign to');
 
-    if (aiAction === 'retract') {
+    if (isRetract || aiAction === 'retract') {
       try {
-        const replies = await client.conversations.replies({ channel: event.channel, ts: event.thread_ts || event.ts, limit: 100 });
-        const mine = (replies.messages || [])
-          .filter(m => m.user === botUserId && m.ts !== (event.thread_ts || event.ts) && parseFloat(m.ts) < parseFloat(event.ts))
-          .sort((a, b) => parseFloat(b.ts) - parseFloat(a.ts));
-        if (!mine.length) {
+        const deleted = await retractOwnMessages(client, event.channel, event.thread_ts || event.ts, event.text, { beforeTs: event.ts });
+        if (!deleted) {
           await client.chat.postMessage({
             channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false,
             text: "I don't have a message of mine in this thread to delete.",
           });
         } else {
-          const wantAll = /\ball\b|tất cả|hết|mọi tin/i.test(event.text);
-          const targets = wantAll ? mine.slice(0, 50) : [mine[0]];
-          for (const m of targets) {
-            try {
-              await client.chat.delete({ channel: event.channel, ts: m.ts });
-              if (targets.length > 3) await new Promise(r => setTimeout(r, 350));
-            } catch (_) {}
-          }
-          logger.info(`[Bot] Retracted ${targets.length} own message(s)`);
+          logger.info(`[Bot] Retracted ${deleted} own message(s)`);
         }
       } catch (err) {
         logger.warn('[Bot] Retract failed:', err.data?.error || err.message);
