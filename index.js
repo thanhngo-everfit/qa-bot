@@ -1498,6 +1498,40 @@ const coreMentionHandler = async ({ event, client, logger }) => {
         /\b(create|log|make|t\u1ea1o|l\u00ean)\b[^.]{0,40}\b(cards?|tickets?|bugs?|tasks?|issues?)\b/i.test(event.text) ||
         /\b(assign|giao)\s+(to\s+|cho\s+)?<@/i.test(event.text);
 
+      // Deterministic retract fast-path: deleting my own messages must never
+      // depend on a model or on the gateway supporting tools.
+      if (/\b(delete|remove|xóa|xoá)\b[^.]{0,40}\b(responses?|messages?|repl(y|ies)|tin nhắn)\b/i.test(event.text)) {
+        try {
+          const { user_id: botUid } = await client.auth.test();
+          const replies = await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 100 });
+          const mine = (replies.messages || [])
+            .filter(m => m.user === botUid && m.ts !== threadTs && parseFloat(m.ts) < parseFloat(event.ts))
+            .sort((a, b) => parseFloat(b.ts) - parseFloat(a.ts));
+          if (mine.length) {
+            const wantAll = /\ball\b|tất cả|hết|mọi tin/i.test(event.text);
+            const nMatch = event.text.match(/\blast\s+(\d+)\b/i);
+            const targets = wantAll ? mine.slice(0, 50) : mine.slice(0, nMatch ? Math.min(parseInt(nMatch[1], 10), 50) : 1);
+            for (const m of targets) {
+              try {
+                await client.chat.delete({ channel: event.channel, ts: m.ts });
+                if (targets.length > 3) await new Promise(r => setTimeout(r, 350));
+              } catch (_) {}
+            }
+            logger.info(`[QAAgent] Retract fast-path: deleted ${targets.length} own message(s)`);
+          } else {
+            await client.chat.postMessage({
+              channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+              text: "I don't have a message of mine in this thread to delete.",
+            });
+          }
+        } catch (err) {
+          logger.warn('[QAAgent] Retract fast-path failed:', err.data?.error || err.message);
+        }
+        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+        await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
+        return;
+      }
+
       logger.info(`[QAAgent] route: wantsTicket=${wantsTicket} existing=[${existingKeys.join(',')}] text="${triggerText.substring(0, 70)}"`);
       if (!wantsTicket) {
         // ── THE AGENT LOOP ──
