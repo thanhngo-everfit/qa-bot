@@ -1785,19 +1785,28 @@ const coreMentionHandler = async ({ event, client, logger }) => {
       // ── Parent lookup: sprint-based (live Jira) takes priority over canvas ──
       // Canvas content can be stale when epics are created mid-sprint and not
       // yet added to the canvas. Querying the active sprint directly is reliable.
+      // Parent resolution is a NICE-TO-HAVE: it must never delay the ticket.
+      // (Sprint JQL search + canvas fallback used to run unbounded — this is
+      // the 'created the ticket but stuck adding parent' phase.)
+      const tParent = Date.now();
       let parentKey = null;
       try {
-        const channelInfo = await client.conversations.info({ channel: event.channel });
-        const channelName = channelInfo.channel?.name || '';
-        parentKey = await findSprintParent(sprintId, ticket.platform, channelName);
-        if (parentKey) {
-          logger.info(`[QABot] Parent from active sprint: ${parentKey} (channel: ${channelName})`);
-        }
+        parentKey = await Promise.race([
+          (async () => {
+            const channelInfo = await client.conversations.info({ channel: event.channel });
+            const channelName = channelInfo.channel?.name || '';
+            const found = await findSprintParent(sprintId, ticket.platform, channelName);
+            if (found) logger.info(`[QABot] Parent from active sprint: ${found} (channel: ${channelName})`);
+            return found;
+          })(),
+          new Promise(resolve => setTimeout(() => resolve(null), 20000)),
+        ]);
       } catch (e) {
         console.warn('[QABot] Sprint parent lookup failed:', e.message);
       }
+      logger.info(`[QABot] Parent resolution: ${parentKey || 'none'} in ${((Date.now() - tParent) / 1000).toFixed(1)}s`);
       // Fall back to canvas-based lookup if sprint search found nothing
-      if (!parentKey) {
+      if (!parentKey && Date.now() - tParent < 20000) {
         parentKey = await pickParentFromCanvas(client, event.channel, ticket.platform);
         logger.info(`[QABot] Parent from canvas: ${parentKey || 'none'} for platform=${ticket.platform}`);
       }

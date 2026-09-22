@@ -246,6 +246,20 @@ async function getProjectIssueTypes() {
 // helper retries, dropping or swapping the offending fields (Epic Link
 // falls back to the modern parent link), so a valid ticket still gets
 // created — and reports exactly what was adjusted.
+// Find an issue created in the last few minutes with this exact summary —
+// used to detect a create that succeeded despite a client-side timeout.
+async function findRecentIssueBySummary(summary) {
+  try {
+    const safe = (summary || '').replace(/["\\]/g, ' ').substring(0, 180);
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
+      params: { jql: `project = ${JIRA_PROJECT} AND created >= -10m AND summary ~ "${safe}" ORDER BY created DESC`, maxResults: 1, fields: 'summary' },
+      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+      timeout: 15000,
+    });
+    return res.data?.issues?.[0]?.key || null;
+  } catch { return null; }
+}
+
 async function createJiraIssueResilient(fields) {
   const notes = [];
   let lastErr = null;
@@ -270,6 +284,18 @@ async function createJiraIssueResilient(fields) {
       const data = err.response?.data || {};
       const fieldErrors = data.errors || {};
       lastErr = { status, fieldErrors, messages: data.errorMessages || [] };
+
+      // A client-side timeout does NOT mean Jira didn't create the issue.
+      // Look for it by summary before retrying, so we never duplicate.
+      if (!status && /timeout|timed out|ECONNABORTED/i.test(`${err.message || ''}`)) {
+        console.warn('[Jira] create timed out client-side — checking whether it landed');
+        const found = await findRecentIssueBySummary(fields.summary);
+        if (found) {
+          notes.push('Jira was slow to respond, but the ticket was created');
+          return { key: found, notes };
+        }
+        throw new Error(`Jira create timed out and no matching issue was found: ${err.message}`);
+      }
       if (status !== 400 || !Object.keys(fieldErrors).length) break;
       let fixed = false;
       for (const bad of Object.keys(fieldErrors)) {
