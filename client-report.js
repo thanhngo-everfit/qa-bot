@@ -639,12 +639,14 @@ async function createJiraIssue(ticket, jiraAccountIds) {
   const fields = {
     project:     { key: JIRA_PROJECT },
     summary:     ticket.summary,
-    issuetype:   { name: ticket.type === 'Task' ? 'Task' : 'Bug' },
+    issuetype:   { name: ticket.type && !/^(bug|task)$/i.test(ticket.type) ? ticket.type : (ticket.type === 'Task' ? 'Task' : 'Bug') },
     priority:    { name: sevMeta.jiraPriority },   // derived from severity
     description: buildAdfDescription(descText),
     fixVersions: [{ id: '27643' }],
   };
-  const parentKey = PLATFORM_PARENTS[ticket.platform];
+  // An explicit parent from the request ("under this parent UP-x") beats
+  // the default platform parent
+  const parentKey = ticket.explicitParent || PLATFORM_PARENTS[ticket.platform];
   if (parentKey) fields.parent = { key: parentKey };
   if (jiraAccountIds.length) fields.assignee = { accountId: jiraAccountIds[0] };
 
@@ -1509,7 +1511,13 @@ const crMentionHandler = async ({ event, client, logger }) => {
   // Fast path: exact command prefixes (no AI cost, instant)
   const isAnalyze        = /^(analyze|analysis|phân tích|phan tich)/.test(triggerText);
   const isWeeklyReport   = /^(weekly report|weekly|báo cáo tuần)/.test(triggerText);
-  const isCreateCard     = /^(force\s?log|create\s?(card|ticket)|log\s?(bug|this)|assign\s?to)/.test(triggerText);
+  // Broad creation-language fast-path (parity with the core handler):
+  // 'create a product task…', 'log 3 bugs…', 'assign to @X' must NEVER be
+  // reinterpreted by the AI router as a summary/task.
+  const isCreateCard     =
+    /^(force\s?log|create\s?(card|ticket)|log\s?(bug|this)|assign\s?to)/.test(triggerText) ||
+    /\b(create|log|make|tạo|lên)\b[^.]{0,40}\b(cards?|tickets?|bugs?|tasks?|issues?)\b/i.test(event.text) ||
+    /\b(assign|giao)\s+(to\s+|cho\s+)?<@/i.test(event.text);
   const isFollowup       = /^(followup|follow[- ]up|check\s?status|update)/.test(triggerText);
   const isTroubleshoot   = /^(troubleshoot|trouble\s?shoot|debug|how\s?to\s?fix)/.test(triggerText);
   const isCancel         = /^(cancel|stop|close)/.test(triggerText);
@@ -1981,6 +1989,23 @@ Max 8 steps total. Plain English only.`,
     const analysis = await analyzeThread(context, slackThreadUrl, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
     await agentSt.update('📝 _QA Agent is creating the Jira card(s)…_');
     logger.info(`[Bot] Severity=${analysis.severity} · tickets=${analysis.tickets.length}`);
+
+    // Honor explicit issue type ("create a product task…") and explicit
+    // parent ("under this parent UP-x") from the request — same semantics
+    // as the core handler.
+    try {
+      const availableTypes = await require('./lib').getProjectIssueTypes();
+      const explicitType = availableTypes
+        .filter(t => !/^(bug|task)$/i.test(t))
+        .sort((a, b) => b.length - a.length)
+        .find(t => new RegExp(`\\b${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(event.text));
+      const parentMatch = event.text.match(/\b(?:epic|under|parent)\s+(?:this\s+)?(?:epic\s+|parent\s+)?(UP-\d+)\b/i);
+      for (const t of analysis.tickets) {
+        if (explicitType) t.type = explicitType;
+        if (parentMatch) t.explicitParent = parentMatch[1].toUpperCase();
+      }
+      if (explicitType || parentMatch) logger.info(`[Bot] Explicit overrides: type=${explicitType || '-'} parent=${parentMatch ? parentMatch[1] : '-'}`);
+    } catch (_) {}
 
     const squad = analysis.tickets[0]?.squad || detectSquadFromKeywords(context);
 
