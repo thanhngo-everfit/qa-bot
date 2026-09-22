@@ -1102,9 +1102,21 @@ async function resolveEmailToSlackId(client, email, displayName = null) {
   return null;
 }
 
+// Startup grace: suppress scheduler ANNOUNCEMENTS for the first 10 minutes
+// after boot. Redeploys (we ship often) must never replay old transitions.
+const _bootAt = Date.now();
+function inStartupGrace() {
+  const grace = parseInt(process.env.FOLLOWUP_STARTUP_GRACE_MS || '600000', 10);
+  if (Date.now() - _bootAt < grace) {
+    console.log('[FollowUp] Startup grace — suppressing announcement');
+    return true;
+  }
+  return false;
+}
+
 // ── Register a thread+ticket for follow-up ────
 // Called after create card, or when scanning a thread with any UP-XXXXX
-function registerFollowUp({ channelId, threadTs, jiraKey, jiraUrl, squad, assigneeSlackHint = null }) {
+function registerFollowUp({ channelId, threadTs, jiraKey, jiraUrl, squad, assigneeSlackHint = null, seedStatus = null, alreadyAnnounced = false }) {
   if (followUpStore.has(jiraKey)) return; // already tracked
   followUpStore.set(jiraKey, {
     channelId,
@@ -1113,13 +1125,18 @@ function registerFollowUp({ channelId, threadTs, jiraKey, jiraUrl, squad, assign
     jiraUrl,
     assigneeSlackHint,   // Slack ID we assigned at creation — exact, no name-search ambiguity
     squad:           squad || null,
-    lastStatus:      null,
+    // Seeded on rebuild with the ticket's CURRENT status so the first tick
+    // after a deploy doesn't treat every long-standing status as a fresh
+    // transition and re-announce it (the QA Ready spam).
+    lastStatus:      seedStatus,
     lastStatusAt:    Date.now(),
-    lastPingAt:      null,
-    notifiedQaReady: false,
+    // A rebuilt ticket that is ALREADY in QA Ready was announced in a
+    // previous process life — never re-tag SM for it.
+    lastPingAt:      alreadyAnnounced ? Date.now() : null,
+    notifiedQaReady: alreadyAnnounced,
     done:            false,
   });
-  console.log(`[FollowUp] Registered ${jiraKey} (squad: ${squad || 'unknown'})`);
+  console.log(`[FollowUp] Registered ${jiraKey} (squad: ${squad || 'unknown'}${seedStatus ? `, seeded at "${seedStatus}"` : ''}${alreadyAnnounced ? ', announcements suppressed' : ''})`);
 }
 
 // ── Rebuild follow-up state from Jira (authoritative, any age) ────
@@ -1169,6 +1186,8 @@ async function rebuildFollowUpsFromJira() {
           jiraKey,
           jiraUrl:   `${JIRA_HOST}/browse/${jiraKey}`,
           squad,
+          seedStatus: status,                       // current status — not a new transition
+          alreadyAnnounced: true,                   // rebuilt = already handled in a previous life
         });
         restored++;
       }
@@ -1225,7 +1244,11 @@ async function rebuildFollowUpsFromHistory(client) {
           if (DONE_STATUSES.includes((details.status || '').toLowerCase())) continue;
 
           if (!squad) squad = detectSquadFromKeywords(combined.join(' '));
-          registerFollowUp({ channelId, threadTs: msg.ts, jiraKey, jiraUrl: `${JIRA_HOST}/browse/${jiraKey}`, squad });
+          registerFollowUp({
+            channelId, threadTs: msg.ts, jiraKey, jiraUrl: `${JIRA_HOST}/browse/${jiraKey}`, squad,
+            seedStatus: details.status || null,
+            alreadyAnnounced: true,
+          });
           restored++;
         } catch (_) {}
       }
@@ -1354,7 +1377,7 @@ function startFollowUpScheduler(client) {
         }
 
         // ── QA Success → tag PC once, then close ──────
-        if (status === 'qa success') {
+        if (!inStartupGrace() && status === 'qa success') {
           const pcMention = contacts?.pcMention || `<!subteam^${GROUP_SM}>`;
           await client.chat.postMessage({
             channel: item.channelId, thread_ts: item.threadTs, unfurl_links: false,
@@ -1368,7 +1391,7 @@ function startFollowUpScheduler(client) {
 
         // ── QA Ready → tag SM to assign QA (once) ─────
         if (status === 'qa ready') {
-          if (!item.notifiedQaReady) {
+          if (!item.notifiedQaReady && !inStartupGrace()) {
             const smMention = contacts?.smMention || `<!subteam^${GROUP_SM}>`;
             await client.chat.postMessage({
               channel: item.channelId, thread_ts: item.threadTs, unfurl_links: false,
