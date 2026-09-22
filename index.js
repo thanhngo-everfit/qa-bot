@@ -89,30 +89,45 @@ async function getThread(client, channelId, threadTs) {
 }
 
 // ── Collect attachments from ALL messages in a thread ──
+// Attachment bounds: a single screen recording must never eat the whole
+// request window (this caused 'stuck' creates in threads with videos).
+const MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024;   // Jira rejects big files anyway
+const MAX_ATTACHMENTS      = 8;
+
 async function getAllThreadAttachments(client, channelId, threadTs) {
   try {
     const result = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 });
     const messages = result.messages || [];
     const attachments = [];
+    const skipped = [];
     for (const msg of messages) {
       // Skip bot messages — don't re-upload bot's own posts
       if (msg.bot_id) continue;
       const files = msg.files || [];
       for (const f of files) {
         if (!f.url_private_download) continue;
+        if ((f.size || 0) > MAX_ATTACHMENT_BYTES) {
+          console.log(`[QABot] Skipping large attachment ${f.name} (${Math.round((f.size || 0) / 1048576)}MB > ${MAX_ATTACHMENT_BYTES / 1048576}MB cap)`);
+          skipped.push({ name: f.name || 'file', size: f.size || 0 });
+          continue;
+        }
         attachments.push({
           name:     f.name || f.title || 'attachment',
           url:      f.url_private_download,
           mimetype: f.mimetype || 'application/octet-stream',
           size:     f.size || 0,
         });
+        if (attachments.length >= MAX_ATTACHMENTS) {
+          console.log(`[QABot] Attachment cap reached (${MAX_ATTACHMENTS})`);
+          return { attachments, skipped };
+        }
       }
     }
-    console.log(`[QABot] Thread has ${attachments.length} attachment(s) total`);
-    return attachments;
+    console.log(`[QABot] Thread has ${attachments.length} attachment(s), ${skipped.length} skipped as too large`);
+    return { attachments, skipped };
   } catch (err) {
     console.warn('[QABot] Could not get attachments:', err.message);
-    return [];
+    return { attachments: [], skipped: [] };
   }
 }
 
@@ -120,9 +135,9 @@ async function downloadSlackFile(url) {
   const res = await axios.get(url, {
     headers:      { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
     responseType: 'arraybuffer',
-    timeout:      120000,   // 2 minutes — screen recordings can be large
-    maxContentLength: 100 * 1024 * 1024,  // 100MB max
-    maxBodyLength:    100 * 1024 * 1024,
+    timeout:      30000,    // 30s — beyond this the request is effectively hung
+    maxContentLength: MAX_ATTACHMENT_BYTES,
+    maxBodyLength:    MAX_ATTACHMENT_BYTES,
   });
   return Buffer.from(res.data);
 }
@@ -1714,7 +1729,15 @@ const coreMentionHandler = async ({ event, client, logger }) => {
     logger.info(`[QABot] Reporter/QA set to: ${reporterSlackId} → Jira ${reporterJiraId || 'not found'}`);
 
     const slackThreadUrl = buildSlackThreadUrl(event.channel, threadTs);
-    const attachments    = await getAllThreadAttachments(client, event.channel, threadTs);
+    const tAtt = Date.now();
+    const { attachments, skipped: skippedAtts } = await getAllThreadAttachments(client, event.channel, threadTs);
+    // Download each file ONCE, in parallel, and reuse across tickets —
+    // previously every ticket re-downloaded every file serially.
+    await Promise.all(attachments.map(async (att) => {
+      try { att.buffer = await downloadSlackFile(att.url); }
+      catch (err) { logger.warn(`[QABot] Attachment download failed (${att.name}):`, err.message); }
+    }));
+    logger.info(`[QABot] Attachments ready: ${attachments.filter(a => a.buffer).length}/${attachments.length} in ${((Date.now() - tAtt) / 1000).toFixed(1)}s${skippedAtts.length ? ` · ${skippedAtts.length} skipped (too large)` : ''}`);
     const sprintId       = await getActiveSprintId();
     logger.info(`[QABot] Active sprint: ${sprintId || 'none found — ticket will not be added to a sprint'}`);
 
@@ -1799,6 +1822,7 @@ const coreMentionHandler = async ({ event, client, logger }) => {
       const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId, issueType);
       if (epicKey && !jira.applied?.epic) jira.notes = [...(jira.notes || []), `couldn't attach to epic ${epicKey} — please link it in Jira`];
       if (!epicKey) jira.notes = [...(jira.notes || []), 'no epic set'];
+      if (skippedAtts.length) jira.notes = [...(jira.notes || []), `${skippedAtts.length} file(s) too large to attach (${skippedAtts.map(s => s.name).join(', ')})`];
 
       const sprintAdded = sprintId ? await addIssueToSprint(jira.key, sprintId) : false;
 
@@ -1811,10 +1835,9 @@ const coreMentionHandler = async ({ event, client, logger }) => {
       // Upload attachments
       let uploaded = 0;
       for (const att of attachments) {
-        const sizeMB = (att.size / 1024 / 1024).toFixed(1);
-        logger.info(`[QABot] Downloading ${att.name} (${sizeMB}MB)...`);
         try {
-          const buf = await downloadSlackFile(att.url);
+          const buf = att.buffer;
+          if (!buf) continue;
           logger.info(`[QABot] Uploading ${att.name} to ${jira.key}...`);
           const ok  = await uploadAttachmentToJira(jira.key, att.name, buf, att.mimetype);
           if (ok) { uploaded++; logger.info(`[QABot] ✓ ${att.name}`); }
