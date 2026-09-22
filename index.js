@@ -161,9 +161,9 @@ async function uploadAttachmentToJira(issueKey, filename, fileBuffer, mimetype) 
           Authorization:       jiraAuth(),
           'X-Atlassian-Token': 'no-check',
         },
-        timeout:          120000,
-        maxContentLength: 100 * 1024 * 1024,
-        maxBodyLength:    100 * 1024 * 1024,
+        timeout:          30000,
+        maxContentLength: MAX_ATTACHMENT_BYTES,
+        maxBodyLength:    MAX_ATTACHMENT_BYTES,
       }
     );
     return true;
@@ -1830,12 +1830,32 @@ const coreMentionHandler = async ({ event, client, logger }) => {
       if (!epicKey) jira.notes = [...(jira.notes || []), 'no epic set'];
       if (skippedAtts.length) jira.notes = [...(jira.notes || []), `${skippedAtts.length} file(s) too large to attach (${skippedAtts.map(s => s.name).join(', ')})`];
 
-      const sprintAdded = sprintId ? await addIssueToSprint(jira.key, sprintId) : false;
+      // Post-create steps are BEST EFFORT: a slow/failed sprint, AC or
+      // attachment step must never block the ticket confirmation.
+      const withBudget = async (label, ms, fn, fallback) => {
+        const t = Date.now();
+        try {
+          const out = await Promise.race([
+            fn(),
+            new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} exceeded ${ms}ms`)), ms)),
+          ]);
+          logger.info(`[QABot] ${label} ok in ${((Date.now() - t) / 1000).toFixed(1)}s`);
+          return out;
+        } catch (err) {
+          logger.warn(`[QABot] ${label} skipped: ${err.message}`);
+          return fallback;
+        }
+      };
+
+      const sprintAdded = sprintId
+        ? await withBudget('sprint add', 20000, () => addIssueToSprint(jira.key, sprintId), false)
+        : false;
 
       // ── Feature 3: Add acceptance criteria checklist ──
       let acCount = 0;
       if (ticket.acceptance_criteria.length > 0) {
-        acCount = await addAcceptanceCriteria(jira.key, ticket.acceptance_criteria);
+        acCount = await withBudget('acceptance criteria', 25000,
+          () => addAcceptanceCriteria(jira.key, ticket.acceptance_criteria), 0);
       }
 
       // Upload attachments
@@ -1845,7 +1865,8 @@ const coreMentionHandler = async ({ event, client, logger }) => {
           const buf = att.buffer;
           if (!buf) continue;
           logger.info(`[QABot] Uploading ${att.name} to ${jira.key}...`);
-          const ok  = await uploadAttachmentToJira(jira.key, att.name, buf, att.mimetype);
+          const ok  = await withBudget(`upload ${att.name}`, 30000,
+            () => uploadAttachmentToJira(jira.key, att.name, buf, att.mimetype), false);
           if (ok) { uploaded++; logger.info(`[QABot] ✓ ${att.name}`); }
           else     { logger.warn(`[QABot] ✗ ${att.name} failed to upload`); }
           await agentSt.done();

@@ -6,6 +6,12 @@
 const OpenAI = require('openai');
 const axios  = require('axios');
 
+// Every Jira/Slack HTTP call gets a hard timeout. axios defaults to NO
+// timeout, so one slow Jira response could hang a request forever — this
+// was the 'stuck at creating tickets' failure. axios is a shared module
+// instance, so this applies across all files.
+axios.defaults.timeout = parseInt(process.env.HTTP_TIMEOUT_MS || '30000', 10);
+
 const JIRA_HOST    = 'https://everfit.atlassian.net';
 const JIRA_PROJECT = 'UP';
 
@@ -252,9 +258,12 @@ async function createJiraIssueResilient(fields) {
   let triedParent = !!fields.parent;
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
+      const tCreate = Date.now();
       const res = await axios.post(`${JIRA_HOST}/rest/api/3/issue`, { fields }, {
         headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' },
+        timeout: parseInt(process.env.HTTP_TIMEOUT_MS || '30000', 10),
       });
+      console.log(`[Jira] created ${res.data.key} in ${((Date.now() - tCreate) / 1000).toFixed(1)}s`);
       return { key: res.data.key, notes };
     } catch (err) {
       const status = err.response?.status;
