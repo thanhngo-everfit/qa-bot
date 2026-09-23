@@ -17,10 +17,22 @@ console.log(`[Boot] QA Agent build ${(process.env.RAILWAY_GIT_COMMIT_SHA || 'loc
 
 // Survive unexpected errors: Node exits on unhandled rejections by default,
 // which would take the whole bot down for every user until a restart.
+// Rolling record of recent failures — surfaced via '@QA Agent status'
+// and /health so problems are diagnosable from Slack without Railway.
+const RECENT_ERRORS = [];
+function recordError(where, err) {
+  RECENT_ERRORS.unshift({ at: new Date().toISOString(), where, msg: (err?.message || String(err)).substring(0, 300) });
+  RECENT_ERRORS.length = Math.min(RECENT_ERRORS.length, 10);
+}
+const BOOT_AT = Date.now();
+const BUILD   = (process.env.RAILWAY_GIT_COMMIT_SHA || 'local').substring(0, 7);
+
 process.on('unhandledRejection', (reason) => {
+  recordError('unhandledRejection', reason);
   console.error('[FATAL-GUARD] Unhandled rejection:', reason?.stack || reason);
 });
 process.on('uncaughtException', (err) => {
+  recordError('uncaughtException', err);
   console.error('[FATAL-GUARD] Uncaught exception:', err?.stack || err);
 });
 setInterval(() => {
@@ -1505,6 +1517,29 @@ const coreMentionHandler = async ({ event, client, logger }) => {
     logger.info(`[QAAgent] Creation request in monitored channel ${clientReport.MONITORED_CHANNELS[event.channel]} — using core pipeline`);
   }
 
+  // Health self-report: '@QA Agent status' / 'are you alive'
+  if (/^(status|health|are you (alive|ok|up)|ping)\b/i.test((event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim())) {
+    const up = Math.round((Date.now() - BOOT_AT) / 1000);
+    const mem = process.memoryUsage();
+    const upStr = up > 3600 ? `${Math.floor(up / 3600)}h ${Math.floor((up % 3600) / 60)}m` : `${Math.floor(up / 60)}m ${up % 60}s`;
+    const errs = RECENT_ERRORS.slice(0, 3).map(e => `• ${e.at.substring(11, 19)} ${e.where}: ${e.msg.substring(0, 120)}`).join('\n');
+    await client.chat.postMessage({
+      channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false,
+      text:
+        `I'm alive.\n` +
+        `• build \`${BUILD}\` · up ${upStr} · rss ${Math.round(mem.rss / 1048576)}MB\n` +
+        `• AI: ${process.env.OPENAI_BASE_URL ? new URL(process.env.OPENAI_BASE_URL).host : 'api.openai.com'} · smart ${process.env.OPENAI_SMART_MODEL || 'gpt-4o'} · fallback ${process.env.OPENAI_FALLBACK_MODEL || 'gpt-4o-mini'}\n` +
+        (errs ? `• recent errors:\n${errs}` : `• no errors recorded since boot`),
+    });
+    return;
+  }
+
+  // Post the live status FIRST — before auth.test / thread reads — so a
+  // silent thread always means "the handler never ran" (event not
+  // delivered, or the process is down), never "it ran and vanished".
+  const bootSt = agentStatus(client, event.channel, event.thread_ts || event.ts);
+  await bootSt.start("I'm on it");
+
   const authRes   = await client.auth.test();
   const botUserId = authRes.user_id;
   const botBotId  = authRes.bot_id;
@@ -1609,6 +1644,7 @@ const coreMentionHandler = async ({ event, client, logger }) => {
       logger.info('[QAAgent] Fast-path: ticket-creation language detected → creation pipeline');
     }
 
+    await bootSt.done();
     const agentSt = agentStatus(client, event.channel, threadTs);
     await agentSt.start('⏳ _Dispatching to QA Agent — reading the thread…_');
 
@@ -2025,6 +2061,15 @@ slackApp.event('app_mention', async (args) => {
 
   try {
     await coreMentionHandler(args);
+  } catch (err) {
+    recordError('mention-handler', err);
+    logger.error('[QAAgent] Handler threw:', err?.stack || err);
+    try {
+      await client.chat.postMessage({
+        channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false,
+        text: `I hit an unexpected error and stopped: \`${(err?.message || 'unknown').substring(0, 200)}\`\nNothing may have been created — please retry.`,
+      });
+    } catch (_) {}
   } finally {
     finished = true;
     clearTimeout(watchdog);
