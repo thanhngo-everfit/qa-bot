@@ -55,7 +55,14 @@ function _adaptParams(params) {
   if (p.response_format?.type === 'json_object' && Array.isArray(p.messages)) {
     const hasJson = p.messages.some(m => typeof m.content === 'string' && m.content.includes('json'));
     if (!hasJson) {
-      p.messages = [...p.messages, { role: 'system', content: 'Respond with a single valid json object and nothing else.' }];
+      // Append to the LAST USER message: some gateways only scan user
+      // content for the required lowercase 'json' token.
+      p.messages = p.messages.map((m, i) =>
+        i === p.messages.length - 1 && m.role === 'user' && typeof m.content === 'string'
+          ? { ...m, content: `${m.content}\n\nReturn the result as a json object.` }
+          : m);
+      const stillMissing = !p.messages.some(m => typeof m.content === 'string' && m.content.includes('json'));
+      if (stillMissing) p.messages = [...p.messages, { role: 'user', content: 'Return the result as a json object.' }];
     }
   }
   if (_useMaxCompletionTokens && p.max_tokens !== undefined) {
@@ -71,7 +78,8 @@ function _adaptParams(params) {
 // on the fast fallback model so the user still gets a result.
 const AI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '90000', 10);
 
-async function aiComplete(params) {
+async function aiComplete(paramsIn) {
+  let params = paramsIn;
   const openai = getOpenAI();
   let model = params.model === 'gpt-4o' ? SMART_MODEL
             : params.model === 'gpt-4o-mini' ? FALLBACK_MODEL
@@ -85,7 +93,7 @@ async function aiComplete(params) {
     console.log(`[AI] → ${model} max_tokens=${params.max_tokens || '-'} json=${!!params.response_format} tools=${params.tools ? params.tools.length : 0} sys=${sysLen}c user=${usrLen}c`);
     const heartbeat = setInterval(() => console.log(`[AI] … still waiting on ${model} (${Math.round((Date.now() - t0) / 1000)}s)`), 20000);
     try {
-      const { __timeoutMs, ...callParams } = params;
+      const { __timeoutMs, __jsonWordRetried, ...callParams } = params;
       const res = await openai.chat.completions.create({ ..._adaptParams(callParams), model }, { timeout: __timeoutMs || AI_TIMEOUT_MS });
       clearInterval(heartbeat);
       console.log(`[AI] ← ${model} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -109,8 +117,21 @@ async function aiComplete(params) {
         console.warn('[AI] Endpoint wants max_completion_tokens — adapting all calls.');
         continue;
       }
-      // Gateways without JSON mode: drop response_format (prompts already demand JSON)
-      if (!_stripResponseFormat && params.response_format && /response_format/i.test(msg)) {
+      // Endpoint demands the literal word 'json' in the messages: inject it
+      // into the user content and retry once, before giving up on JSON mode.
+      if (params.response_format && /must contain the word\s+'?json'?/i.test(msg) && !params.__jsonWordRetried) {
+        console.warn('[AI] Endpoint requires the literal word json in messages — injecting and retrying');
+        params = {
+          ...params,
+          __jsonWordRetried: true,
+          messages: [...params.messages, { role: 'user', content: 'Return the result as a json object.' }],
+        };
+        continue;
+      }
+      // Still refused → drop JSON mode entirely; prompts already demand json
+      // and every caller brace-slices the response.
+      if (!_stripResponseFormat && params.response_format &&
+          (/must contain the word\s+'?json'?/i.test(msg) || /response_format|text\.format/i.test(msg))) {
         _stripResponseFormat = true;
         console.warn('[AI] Endpoint rejects response_format — stripping it for all calls.');
         continue;
