@@ -204,6 +204,32 @@ function _cleanStatus(text) {
   return t;
 }
 
+// Every live status message is tracked so a graceful shutdown (Railway
+// sends SIGTERM on each deploy) can clean them up and tell people to
+// retry, instead of leaving 'I'm analyzing…' in threads forever.
+const LIVE_STATUSES = new Map();   // ts → { client, channel, threadTs }
+let _shuttingDown = false;
+
+async function shutdownLiveStatuses(reason = 'restart') {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
+  const entries = [...LIVE_STATUSES.entries()];
+  if (!entries.length) return;
+  console.warn(`[Shutdown] ${reason}: cleaning ${entries.length} in-flight status message(s)`);
+  await Promise.race([
+    Promise.all(entries.map(async ([ts, { client, channel, threadTs }]) => {
+      try { await client.chat.delete({ channel, ts }); } catch (_) {}
+      try {
+        await client.chat.postMessage({
+          channel, thread_ts: threadTs, unfurl_links: false,
+          text: "I was restarted for an update in the middle of this — nothing was lost on your side, but please tag me again (or I'll pick new reports up automatically).",
+        });
+      } catch (_) {}
+    })),
+    new Promise(r => setTimeout(r, 4000)),     // never block shutdown > 4s
+  ]);
+}
+
 function agentStatus(client, channel, threadTs) {
   // One italic line describing the CURRENT step, truthfully — it changes
   // whenever the work moves to a new step (per tool call in the agent
@@ -214,6 +240,7 @@ function agentStatus(client, channel, threadTs) {
     killer = null;
     if (!ts) return;
     const t = ts; ts = null;
+    LIVE_STATUSES.delete(t);
     try { await client.chat.delete({ channel, ts: t }); } catch (_) {}
   };
   return {
@@ -221,6 +248,7 @@ function agentStatus(client, channel, threadTs) {
       try {
         const r = await client.chat.postMessage({ channel, thread_ts: threadTs, unfurl_links: false, text: `_${_cleanStatus(text)}_` });
         ts = r.ts;
+        LIVE_STATUSES.set(ts, { client, channel, threadTs });
         killer = setTimeout(del, 4 * 60 * 1000);   // safety net: a status can never orphan
       } catch (_) {}
     },
@@ -694,6 +722,7 @@ module.exports = {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiComplete, aiCall, toolsSupported,
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient, getIssueEpic,
+  shutdownLiveStatuses, LIVE_STATUSES,
   resolveUserName, resolveInlineMentions, warmUserNames, replaceMentionsCached, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
   slackify, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, clientReportSummary,

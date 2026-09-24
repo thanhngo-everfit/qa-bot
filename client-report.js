@@ -2525,7 +2525,7 @@ function withWatchdog(name, handler, budgetMs) {
   };
 }
 
-slackApp.event('message', withWatchdog('auto-analysis', async ({ event, client, logger }) => {
+const autoAnalysisHandler = withWatchdog('auto-analysis', async ({ event, client, logger }) => {
   // Only monitored channels
   if (!MONITORED_CHANNELS[event.channel]) return;
 
@@ -2588,7 +2588,8 @@ slackApp.event('message', withWatchdog('auto-analysis', async ({ event, client, 
     logger.error('[Bot] Auto-analyze error:', err.message);
     await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
   }
-}, 150000));
+}, 150000);
+slackApp.event('message', autoAnalysisHandler);
 
 // ─────────────────────────────────────────────
 // WEEKLY REPORT SCHEDULER
@@ -2943,6 +2944,50 @@ function startWeeklyReportScheduler(client) {
 // ─────────────────────────────────────────────
 // MODULE REGISTRATION
 // ─────────────────────────────────────────────
+// ── Boot recovery: finish what a killed process left behind ──────────
+// A deploy / OOM / crash kills in-flight work; its status message stays
+// ('I'm analyzing the report') and in-memory watchdogs die with it. On
+// boot, find those orphans in the monitored channels, remove them, and
+// re-run the auto-analysis for reports that never got one.
+async function recoverOrphanedAnalyses(client) {
+  const STATUS_RE = /^_I['’]m .+_$/;
+  const oldest = String((Date.now() - 3 * 3600 * 1000) / 1000);
+  const { user_id: botUid } = await client.auth.test();
+  const log = { info: console.log, warn: console.warn, error: console.error };
+  let cleaned = 0, rerun = 0;
+
+  for (const channelId of Object.keys(MONITORED_CHANNELS)) {
+    let history;
+    try { history = await client.conversations.history({ channel: channelId, oldest, limit: 50 }); }
+    catch (err) { console.warn(`[Recovery] history failed for ${channelId}:`, err.data?.error || err.message); continue; }
+
+    for (const parent of history.messages || []) {
+      if (parent.bot_id || !parent.reply_count) continue;
+      let replies;
+      try { replies = (await client.conversations.replies({ channel: channelId, ts: parent.ts, limit: 30 })).messages || []; }
+      catch (_) { continue; }
+      const mine = replies.filter(m => m.user === botUid && m.ts !== parent.ts);
+      const orphans = mine.filter(m => STATUS_RE.test((m.text || '').trim()));
+      if (!orphans.length) continue;
+
+      for (const o of orphans) {
+        try { await client.chat.delete({ channel: channelId, ts: o.ts }); cleaned++; } catch (_) {}
+      }
+      const hasAnalysis = mine.some(m => (m.text || '').includes('*Summary:*'));
+      const humanReplies = replies.filter(m => !m.bot_id && m.ts !== parent.ts).length;
+      // Re-run only if the report never got its analysis and nobody has
+      // replied since (if humans are already handling it, stay quiet).
+      if (!hasAnalysis && humanReplies === 0 && rerun < 5) {
+        rerun++;
+        console.log(`[Recovery] Re-running auto-analysis for ${channelId}/${parent.ts}`);
+        try { await autoAnalysisHandler({ event: { ...parent, channel: channelId }, client, logger: log }); }
+        catch (err) { console.warn('[Recovery] re-run failed:', err.message); }
+      }
+    }
+  }
+  console.log(`[Recovery] Boot sweep done — ${cleaned} orphaned status(es) removed, ${rerun} analysis re-run(s)`);
+}
+
 function register(realApp, realOpenai) {
   openai = realOpenai;
   loadKnowledgeBase();
@@ -2953,6 +2998,8 @@ function register(realApp, realOpenai) {
   for (const [kind, name, handler] of _registrations) realApp[kind](name, handler);
   startFollowUpScheduler(realApp.client);
   startWeeklyReportScheduler(realApp.client);
+  // Give the app a moment to finish booting, then recover interrupted work
+  setTimeout(() => recoverOrphanedAnalyses(realApp.client).catch(err => console.warn('[Recovery] failed:', err.message)), 15000);
   console.log('✅ [ClientReport] module active (gpt-4o-mini) — monitoring:', Object.values(MONITORED_CHANNELS).join(', '));
 }
 

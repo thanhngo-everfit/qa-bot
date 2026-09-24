@@ -27,6 +27,16 @@ function recordError(where, err) {
 const BOOT_AT = Date.now();
 const BUILD   = (process.env.RAILWAY_GIT_COMMIT_SHA || 'local').substring(0, 7);
 
+// Graceful shutdown: Railway sends SIGTERM on every deploy. Clean up any
+// in-flight status messages and tell people to retry, then exit.
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, async () => {
+    console.warn(`[Shutdown] ${sig} received`);
+    try { await lib.shutdownLiveStatuses(sig); } catch (_) {}
+    process.exit(0);
+  });
+}
+
 process.on('unhandledRejection', (reason) => {
   recordError('unhandledRejection', reason);
   console.error('[FATAL-GUARD] Unhandled rejection:', reason?.stack || reason);
