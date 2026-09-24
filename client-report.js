@@ -828,7 +828,9 @@ REMINDER: every string value below must be in ENGLISH — translate all Vietname
 
 {
   "issue_summary": "2–3 sentence plain-English summary of what happened and who is affected",
-  "root_cause_hypothesis": "1-sentence hypothesis from KB patterns, or null",
+  "root_cause_hypothesis": "1-sentence SPECIFIC hypothesis tied to this report's details (from KB patterns or the symptoms), or null. Never generic ('may be a sync issue').",
+  "checks": ["0-3 concrete things a dev should check FIRST, specific to THIS report — e.g. a gap with hard start/end dates → check whether other clients have the same gap from that date (systemic?), check logs in that exact window. EMPTY ARRAY if nothing specific stands out — never generic advice."],
+  "missing_info": ["0-3 questions CS should answer — facts the report omits that block investigation (e.g. which integration: Apple Health / Google Fit / Fitbit / Garmin; device; app version; whether data exists in the source app). EMPTY ARRAY if the report is complete."],
   "impact": "concise impact statement (e.g. '1 coach on iOS, cannot complete check-in')",
   "severity": "Critical|High|Medium|Low|Trivial",
   "severity_rationale": "1 sentence explaining WHY this severity, citing the standard above",
@@ -1000,17 +1002,32 @@ function buildAnalysisReply(analysis, squad, contacts) {
 
   const platforms = [...new Set((tickets || []).map(t => t.platform).filter(Boolean))];
 
+  const checks  = (analysis.checks || []).filter(s => s && s.trim()).slice(0, 3);
+  const missing = (analysis.missing_info || []).filter(s => s && s.trim()).slice(0, 3);
+
+  // Sections are separated by a blank line so the reply is scannable.
   lines.push(`*Summary:* ${issue_summary}`);
-  lines.push(`*Affected Platform:* ${platforms.length ? platforms.join(', ') : 'Unknown'}`);
-  lines.push(`*Priority:* ${sev.emoji} ${sev.label}`);
+  lines.push('');
+  lines.push(`*Platform:* ${platforms.length ? platforms.join(', ') : 'Unknown'} · *Priority:* ${sev.emoji} ${sev.label} · *Squad:* ${squad || '_could not detect — please route manually_'}`);
   if (isBug && root_cause_hypothesis) {
-    lines.push(`*Root cause:* ${root_cause_hypothesis}`);
+    lines.push('');
+    lines.push(`*Likely cause:* ${root_cause_hypothesis}`);
   }
-  lines.push(`*Related squad:* ${squad || '_could not detect — please route manually_'}`);
+  if (checks.length) {
+    lines.push('');
+    lines.push('*Worth checking first*');
+    for (const c of checks) lines.push(`• ${c}`);
+  }
+  if (missing.length) {
+    lines.push('');
+    lines.push('*Missing from the report (CS)*');
+    for (const q of missing) lines.push(`• ${q}`);
+  }
 
   // Next action — differentiated per ticket type
   lines.push('');
   lines.push(`*Next action:*`);
+  const askCsFirst = missing.length ? ' — ideally after CS answers the questions above' : '';
   const smPc = contacts ? `${contacts.smMention} ${contacts.pcMention}` : `<!subteam^${GROUP_SM}>`;
 
   if (tickets?.length) {
@@ -1018,9 +1035,9 @@ function buildAnalysisReply(analysis, squad, contacts) {
       const role   = roleOf(t.platform);
       const action = t.summary.replace(/\[[^\]]*\]/g, '').trim(); // text after brackets
       if (t.type === 'Bug') {
-        lines.push(`• ${smPc} — review and assign to a *${role}* dev to investigate & fix "${action}"`);
+        lines.push(`• ${smPc} — assign a *${role}* dev to investigate & fix "${action}"${askCsFirst}`);
       } else {
-        lines.push(`• ${smPc} — review and assign to a *${role}* dev to "${action}"`);
+        lines.push(`• ${smPc} — assign a *${role}* dev to "${action}"${askCsFirst}`);
       }
     }
   } else {
