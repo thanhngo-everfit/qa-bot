@@ -1597,7 +1597,7 @@ const coreMentionHandler = async ({ event, client, logger }) => {
 
         const participants = [...new Set((context.match(/^\[([^\]]+)\]/gm) || []).map(s => s.replace(/^\[|\]$/g, '')))].slice(0, 8);
         const draftRaw = await lib.aiCall(
-          `You turn a Slack product discussion into a Jira Product Discovery item. Return ONLY JSON:
+          `You turn a Slack product discussion into a Jira Product Discovery item. Return ONLY a json object:
 {"summary":"concise English title, <=90 chars","description":"markdown"}
 
 description format (markdown, real newlines):

@@ -49,6 +49,15 @@ let _stripResponseFormat = false;
 
 function _adaptParams(params) {
   const p = { ...params };
+  // JSON mode requires the literal lowercase word "json" somewhere in the
+  // messages (stricter models/gateways enforce this — gpt-6-astra returns
+  // 400 otherwise, even when the prompt says "JSON" in caps).
+  if (p.response_format?.type === 'json_object' && Array.isArray(p.messages)) {
+    const hasJson = p.messages.some(m => typeof m.content === 'string' && m.content.includes('json'));
+    if (!hasJson) {
+      p.messages = [...p.messages, { role: 'system', content: 'Respond with a single valid json object and nothing else.' }];
+    }
+  }
   if (_useMaxCompletionTokens && p.max_tokens !== undefined) {
     p.max_completion_tokens = p.max_tokens;
     delete p.max_tokens;
