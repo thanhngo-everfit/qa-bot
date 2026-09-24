@@ -2297,6 +2297,87 @@ slackApp.action('qa_core_dup_follow', async ({ ack, body, client, logger }) => {
       : `🔍 I couldn't find live tickets in this thread anymore.`);
 });
 
+// ── Assign button on the analysis → member picker → create + assign ──
+slackApp.action('qa_assign_open', async ({ ack, body, client, logger }) => {
+  await ack();
+  let p = {};
+  try { p = JSON.parse(body.actions[0].value || '{}'); } catch (_) {}
+  try {
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: 'modal',
+        callback_id: 'qa_assign_submit',
+        private_metadata: JSON.stringify({ c: p.c, t: p.t, m: body.message?.ts || null }),
+        title:  { type: 'plain_text', text: 'Assign' },
+        submit: { type: 'plain_text', text: 'Create & assign' },
+        close:  { type: 'plain_text', text: 'Cancel' },
+        blocks: [
+          {
+            type: 'input', block_id: 'assignee_block',
+            label: { type: 'plain_text', text: 'Assign to' },
+            element: { type: 'users_select', action_id: 'assignee', placeholder: { type: 'plain_text', text: 'Pick a member' } },
+          },
+          {
+            type: 'context',
+            elements: [{ type: 'mrkdwn', text: "I'll create the Jira card from this thread and assign it to them." }],
+          },
+        ],
+      },
+    });
+  } catch (err) {
+    logger.warn('[QAAgent] Could not open assign modal:', err.data?.error || err.message);
+  }
+});
+
+slackApp.view('qa_assign_submit', async ({ ack, body, view, client, logger }) => {
+  await ack();   // close the modal immediately; the work continues in the thread
+  let meta = {};
+  try { meta = JSON.parse(view.private_metadata || '{}'); } catch (_) {}
+  const assignee = view.state?.values?.assignee_block?.assignee?.selected_user;
+  const clicker  = body.user?.id;
+  if (!meta.c || !meta.t || !assignee) return;
+
+  // Visible audit line in the thread — also the anchor for status/reactions
+  let anchorTs = meta.t;
+  try {
+    const posted = await client.chat.postMessage({
+      channel: meta.c, thread_ts: meta.t, unfurl_links: false,
+      text: `<@${clicker}> asked me to create a Jira card and assign it to <@${assignee}>.`,
+    });
+    anchorTs = posted.ts;
+  } catch (_) {}
+
+  // Replace the Assign button so it can't be clicked twice
+  if (meta.m) {
+    try {
+      const rr = await client.conversations.replies({ channel: meta.c, ts: meta.t, limit: 100 });
+      const msg = (rr.messages || []).find(x => x.ts === meta.m);
+      if (msg) {
+        const blocks = (msg.blocks || []).filter(b => b.type !== 'actions');
+        blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Assigned to <@${assignee}> by <@${clicker}>` }] });
+        await client.chat.update({ channel: meta.c, ts: meta.m, text: msg.text || 'Analysis', blocks });
+      }
+    } catch (err) { logger.warn('[QAAgent] Could not update analysis message:', err.data?.error || err.message); }
+  }
+
+  // Same pipeline as typing "create ticket and assign to @X" in the thread
+  try {
+    await coreMentionHandler({
+      event: { channel: meta.c, thread_ts: meta.t, ts: anchorTs, user: clicker, text: `create ticket and assign to <@${assignee}>` },
+      client, logger,
+    });
+  } catch (err) {
+    logger.error('[QAAgent] Assign-modal create failed:', err?.stack || err);
+    try {
+      await client.chat.postMessage({
+        channel: meta.c, thread_ts: meta.t, unfurl_links: false,
+        text: `I hit an error creating the card: \`${(err?.message || 'unknown').substring(0, 200)}\` — please retry.`,
+      });
+    } catch (_) {}
+  }
+});
+
 slackApp.action('qa_core_dup_cancel', async ({ ack, body, client }) => {
   await ack();
   await coreMarkChoice(client, body, `✖️ <@${body.user.id}> cancelled — nothing created.`);

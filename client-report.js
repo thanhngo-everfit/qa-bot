@@ -985,6 +985,33 @@ Do NOT include the Slack thread link in the description — it is appended autom
 // ─────────────────────────────────────────────
 
 // Analysis reply — used by auto-analyze and @QA Bot analyze
+// Analysis reply as Block Kit: the same text (kept in `text` too, so every
+// parser that reads bot replies keeps working) plus an Assign button that
+// opens a member picker and creates + assigns the Jira card.
+function analysisBlocks(text, channelId, threadTs) {
+  const blocks = [];
+  let chunk = '';
+  for (const para of (text || '').split('\n\n')) {
+    // section text limit is 3000 chars — pack paragraphs under it
+    if ((chunk + '\n\n' + para).length > 2800 && chunk) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: chunk } });
+      chunk = para;
+    } else {
+      chunk = chunk ? `${chunk}\n\n${para}` : para;
+    }
+  }
+  if (chunk) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: chunk } });
+  blocks.push({
+    type: 'actions',
+    elements: [{
+      type: 'button', style: 'primary', action_id: 'qa_assign_open',
+      text: { type: 'plain_text', text: 'Assign', emoji: true },
+      value: JSON.stringify({ c: channelId, t: threadTs }),
+    }],
+  });
+  return blocks;
+}
+
 function buildAnalysisReply(analysis, squad, contacts, reporterId = null) {
   const { issue_summary, root_cause_hypothesis, severity, tickets } = analysis;
   const sev = SEVERITY_META[severity] || SEVERITY_META.Medium;
@@ -1839,9 +1866,11 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
         if (parent && !parent.bot_id) reporterId = parent.user || null;
       } catch (_) {}
       await agentSt.done();
+      const manualReply = buildAnalysisReply(analysis, squad, contacts, reporterId);
       await client.chat.postMessage({
         channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-        text: buildAnalysisReply(analysis, squad, contacts, reporterId),
+        text: manualReply,
+        blocks: analysisBlocks(manualReply, event.channel, threadTs),
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       await client.reactions.add({ channel: event.channel, name: 'mag_right', timestamp: event.ts }).catch(() => {});
@@ -2598,6 +2627,7 @@ const autoAnalysisHandler = withWatchdog('auto-analysis', async ({ event, client
       thread_ts: event.ts,
       unfurl_links: false,
       text: replyText,
+      blocks: analysisBlocks(replyText, event.channel, event.ts),
     });
 
     // Auto-register any existing UP-XXXXX in this thread for follow-up
