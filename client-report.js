@@ -1000,17 +1000,17 @@ function buildAnalysisReply(analysis, squad, contacts) {
 
   const platforms = [...new Set((tickets || []).map(t => t.platform).filter(Boolean))];
 
-  lines.push(`📝 *Summary:* ${issue_summary}`);
-  lines.push(`📱 *Affected Platform:* ${platforms.length ? platforms.join(', ') : 'Unknown'}`);
-  lines.push(`⚡ *Priority:* ${sev.emoji} ${sev.label}`);
+  lines.push(`*Summary:* ${issue_summary}`);
+  lines.push(`*Affected Platform:* ${platforms.length ? platforms.join(', ') : 'Unknown'}`);
+  lines.push(`*Priority:* ${sev.emoji} ${sev.label}`);
   if (isBug && root_cause_hypothesis) {
-    lines.push(`🔍 *Root cause:* ${root_cause_hypothesis}`);
+    lines.push(`*Root cause:* ${root_cause_hypothesis}`);
   }
-  lines.push(`🏢 *Related squad:* ${squad || '_could not detect — please route manually_'}`);
+  lines.push(`*Related squad:* ${squad || '_could not detect — please route manually_'}`);
 
   // Next action — differentiated per ticket type
   lines.push('');
-  lines.push(`🎯 *Next action:*`);
+  lines.push(`*Next action:*`);
   const smPc = contacts ? `${contacts.smMention} ${contacts.pcMention}` : `<!subteam^${GROUP_SM}>`;
 
   if (tickets?.length) {
