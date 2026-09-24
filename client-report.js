@@ -985,7 +985,7 @@ Do NOT include the Slack thread link in the description — it is appended autom
 // ─────────────────────────────────────────────
 
 // Analysis reply — used by auto-analyze and @QA Bot analyze
-function buildAnalysisReply(analysis, squad, contacts) {
+function buildAnalysisReply(analysis, squad, contacts, reporterId = null) {
   const { issue_summary, root_cause_hypothesis, severity, tickets } = analysis;
   const sev = SEVERITY_META[severity] || SEVERITY_META.Medium;
   const lines = [];
@@ -1022,14 +1022,15 @@ function buildAnalysisReply(analysis, squad, contacts) {
   }
   if (missing.length) {
     lines.push('');
-    lines.push('*Missing from the report (CS)*');
+    // Tag whoever posted the report — they're the one who can answer
+    lines.push(reporterId ? `*Missing from the report* <@${reporterId}>` : '*Missing from the report*');
     for (const q of missing) lines.push(`• ${q}`);
   }
 
   // Next action — differentiated per ticket type
   lines.push('');
   lines.push(`*Next action:*`);
-  const askCsFirst = missing.length ? ' — ideally after CS answers the questions above' : '';
+  const askCsFirst = missing.length ? ' — ideally after the reporter answers the questions above' : '';
   const smPc = contacts ? `${contacts.smMention} ${contacts.pcMention}` : `<!subteam^${GROUP_SM}>`;
 
   if (tickets?.length) {
@@ -1831,10 +1832,16 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
       const analysis = await analyzeThread(context, slackThreadUrl);
       const squad    = analysis.tickets[0]?.squad || detectSquadFromKeywords(context);
       const contacts = resolveContactMentions(squad ? getSquadContacts(squad) : null);
+      // The reporter is whoever started the thread (not whoever typed 'analyze')
+      let reporterId = null;
+      try {
+        const parent = (await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 1 })).messages?.[0];
+        if (parent && !parent.bot_id) reporterId = parent.user || null;
+      } catch (_) {}
       await agentSt.done();
       await client.chat.postMessage({
         channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-        text: buildAnalysisReply(analysis, squad, contacts),
+        text: buildAnalysisReply(analysis, squad, contacts, reporterId),
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       await client.reactions.add({ channel: event.channel, name: 'mag_right', timestamp: event.ts }).catch(() => {});
@@ -2584,7 +2591,7 @@ const autoAnalysisHandler = withWatchdog('auto-analysis', async ({ event, client
     const squad    = analysis.tickets[0]?.squad || detectSquadFromKeywords(context);
     const contacts = resolveContactMentions(squad ? getSquadContacts(squad) : null);
 
-    const replyText = buildAnalysisReply(analysis, squad, contacts);
+    const replyText = buildAnalysisReply(analysis, squad, contacts, event.user || null);
     await status.done();
     await client.chat.postMessage({
       channel: event.channel,
