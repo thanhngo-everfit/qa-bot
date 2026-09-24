@@ -1551,6 +1551,10 @@ const coreMentionHandler = async ({ event, client, logger }) => {
 
   try { await client.reactions.add({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }); } catch (_) {}
 
+  // Declared OUTSIDE the try so catch blocks can always clean the status up
+  // (a catch referencing a try-scoped const threw 'agentSt is not defined'
+  // and MASKED every real error).
+  let agentSt = null;
   try {
     // Fetch thread context first — needed for AI classification below
     let context;
@@ -1645,7 +1649,7 @@ const coreMentionHandler = async ({ event, client, logger }) => {
     }
 
     await bootSt.done();
-    const agentSt = agentStatus(client, event.channel, threadTs);
+    agentSt = agentStatus(client, event.channel, threadTs);
     await agentSt.start('⏳ _Dispatching to QA Agent — reading the thread…_');
 
     // Classify Bug vs Task — explicit keyword wins; otherwise AI decides from thread content
@@ -1936,9 +1940,7 @@ const coreMentionHandler = async ({ event, client, logger }) => {
             () => uploadAttachmentToJira(jira.key, att.name, buf, att.mimetype), false);
           if (ok) { uploaded++; logger.info(`[QABot] ✓ ${att.name}`); }
           else     { logger.warn(`[QABot] ✗ ${att.name} failed to upload`); }
-          await agentSt.done();
-  } catch (err) {
-    try { await agentSt.done(); } catch (_) {}
+        } catch (err) {
           logger.warn(`[QABot] ✗ ${att.name}: ${err.message}`);
         }
       }
@@ -2011,7 +2013,7 @@ const coreMentionHandler = async ({ event, client, logger }) => {
     if (err.code === 'slack_webapi_platform_error' && err.data?.error === 'missing_scope') {
       const needed = err.data?.needed || 'unknown';
       logger.error(`[QABot] Missing Slack scope: ${needed} (provided: ${err.data?.provided})`);
-      await agentSt.done();
+      await agentSt?.done();
       await client.chat.postMessage({
         channel: event.channel, thread_ts: event.thread_ts || event.ts,
         text:
@@ -2029,7 +2031,7 @@ const coreMentionHandler = async ({ event, client, logger }) => {
       ? Object.entries(jiraErrors).map(([f, m]) => `${f}: ${m}`).join(', ')
       : (jiraMessages || []).join(', ') || err.message;
     logger.error('[QABot]', err.response?.data ?? err.message);
-    await agentSt.done();
+    await agentSt?.done();
       await client.chat.postMessage({
       channel: event.channel, thread_ts: event.thread_ts || event.ts,
       text: `I hit an error while working on this and couldn't finish: \`${errDetail}\`\nGive it another try in a moment — if it keeps failing, my logs have the details.`,
