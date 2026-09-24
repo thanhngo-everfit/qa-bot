@@ -1008,7 +1008,9 @@ function buildAnalysisReply(analysis, squad, contacts) {
   // Sections are separated by a blank line so the reply is scannable.
   lines.push(`*Summary:* ${issue_summary}`);
   lines.push('');
-  lines.push(`*Platform:* ${platforms.length ? platforms.join(', ') : 'Unknown'} · *Priority:* ${sev.emoji} ${sev.label} · *Squad:* ${squad || '_could not detect — please route manually_'}`);
+  lines.push(`*Platform:* ${platforms.length ? platforms.join(', ') : 'Unknown'}`);
+  lines.push(`*Priority:* ${sev.emoji} ${sev.label}`);
+  lines.push(`*Squad:* ${squad || '_could not detect — please route manually_'}`);
   if (isBug && root_cause_hypothesis) {
     lines.push('');
     lines.push(`*Likely cause:* ${root_cause_hypothesis}`);
