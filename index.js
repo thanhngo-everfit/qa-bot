@@ -1625,37 +1625,51 @@ const coreMentionHandler = async ({ event, client, logger }) => {
           .filter(l => !/@QA Agent|^\[QA Agent\]/i.test(l))
           .join('\n');
 
-        const draftRaw = await lib.aiCall(
-          `You write Everfit Product Items for the Jira Product Discovery board. Everfit is a B2B coaching platform: coaches (paying customers) manage clients, programs, inbox messaging/video, habits, nutrition, payments. A Product Item is a DISCOVERY-stage overview — help the team decide whether/when to build, not how.
+        // Paste-through: if the request (or the latest thread message) already
+        // contains a written product item (markdown headings), file it as-is.
+        // Authoring happens with Claude; the agent only files it.
+        const reqBody = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
+        let pasted = null;
+        if (/##\s+\S/.test(reqBody) && reqBody.length > 300) {
+          pasted = reqBody.substring(reqBody.indexOf('##'));
+        } else if (/\b(with this|use this|this draft|draft above|the above)\b/i.test(reqBody)) {
+          try {
+            const rr = await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 100 });
+            const cand = (rr.messages || [])
+              .filter(m => !m.bot_id && m.ts !== event.ts && /##\s+\S/.test(m.text || '') && (m.text || '').length > 300)
+              .sort((a, b) => parseFloat(b.ts) - parseFloat(a.ts))[0];
+            if (cand) pasted = cand.text.substring(cand.text.indexOf('##'));
+          } catch (_) {}
+        }
 
-Return ONLY a json object: {"summary":"...","description":"..."}
+        let draftRaw;
+        if (pasted) {
+          const titleLine = (pasted.match(/^#\s+(.+)$/m) || [])[1];
+          draftRaw = JSON.stringify({ summary: titleLine || null, description: pasted, thin: false, verbatim: true });
+          logger.info('[QAAgent] Discovery: filing pasted draft verbatim');
+        } else draftRaw = await lib.aiCall(
+          `You CAPTURE a product signal from a Slack thread into an Everfit Product Item skeleton for the Jira Product Discovery board. You are NOT the author — a PM will write the full item later. Your only job is to record faithfully what the thread actually says.
 
-summary: concise outcome-oriented title, <=80 chars (e.g. "Loom integration for coach video feedback").
+Return ONLY a json object: {"summary":"...","description":"...","thin":true|false}
 
-description — markdown with EXACTLY these five sections, in order:
+summary: short neutral title of the idea, <=80 chars (e.g. "Loom integration").
+
+description — markdown with these five headings, in order:
 ## Problem / Context
-- the user pain / business signal / strategic driver, who is affected, and the evidence from the thread
-- the CURRENT WORKAROUND if mentioned (e.g. "currently done via in-chat")
-- never circular ("because we want X"); if the real trigger is unclear, add a "[To confirm] …" bullet
 ## Goals
-- 2–4 OUTCOMES (not features) that would be true if this succeeds
 ## Desired outcome
-- what would ship, per actor/platform where known (e.g. **Coach: Web** — …); what it is NOT; any stated priority signal
 ## References
-- **Design:**
-- **Technical Solution Document:**
-- **PRD:**
-- **Specification:**
 ## Open Questions
-| Questions | Owner | Answer |
-|---|---|---|
-| … | | |
-(at least 2 real unknowns; leave Owner/Answer blank unless obvious)
 
-STRICT RULES:
-- IGNORE every message that is an instruction to a bot or about logging/creating/assigning tickets. Those are not product content and must never appear.
-- Record stakeholder signals faithfully: "Medium since it is currently done via in-chat" is a PRIORITY signal justified by an existing workaround — not an effort estimate.
-- English only. Never invent facts, metrics, names or scope beyond the transcript — mark gaps with [To confirm].`,
+HARD RULES — follow exactly:
+- Fill a section ONLY with information explicitly stated in the thread. Attribute it ("Long Nguyen: …"), keep the speaker's meaning, quote short phrases where useful.
+- If the thread does not support a section, put exactly one bullet under it: "- [To be written]". Do NOT infer, generalize, or write plausible-sounding goals/outcomes. An honest gap beats invented content.
+- Record signals exactly as stated: "Medium since it is currently done via in-chat" = priority Medium, reason: existing in-chat workaround. Never convert priority into effort or vice versa.
+- References: always render "- **Design:**", "- **Technical Solution Document:**", "- **PRD:**", "- **Specification:**" (empty values unless a link is in the thread).
+- Open Questions: a table "| Questions | Owner | Answer |" listing what the thread leaves unknown (at least 2).
+- IGNORE any message that is an instruction to a bot or about logging/creating/assigning tickets.
+- thin: true if Goals or Desired outcome is "[To be written]".
+- English only.`,
           `Thread transcript (bot commands removed):\n${productContext.substring(0, 8000)}`,
           2000, true, 'gpt-4o', 60000,
         );
@@ -1688,9 +1702,12 @@ STRICT RULES:
           await bootSt.done();
           await client.chat.postMessage({
             channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-            text: `📝 Updated <${JIRA_HOST}/browse/${existingPlan}|${existingPlan}> from this thread — description refreshed and a summary comment added.`,
+            text: draft.verbatim
+              ? `📝 Updated <${JIRA_HOST}/browse/${existingPlan}|${existingPlan}> with your draft — filed verbatim, plus a comment linking this thread.`
+              : `📝 Updated <${JIRA_HOST}/browse/${existingPlan}|${existingPlan}> from this thread — description refreshed and a summary comment added.${draft.thin ? ' Some sections are [To be written] — the thread doesn\'t cover them.' : ''}`,
           });
         } else {
+          if (!draft.summary) draft.summary = (productContext.split('\n')[0] || 'Product idea').replace(/^\[[^\]]+\]:\s*/, '').substring(0, 80);
           const created = await lib.createDiscoveryItem({ summary: draft.summary, descriptionMarkdown: body });
           await lib.addIssueComment(created.key, commentMd).catch(() => {});
           await bootSt.done();
@@ -1699,6 +1716,9 @@ STRICT RULES:
             text:
               `💡 Logged to the discovery board → <${created.url}|${created.key}>\n` +
               `*${draft.summary}*\n` +
+              (draft.thin
+                ? `_I captured what the thread says; Goals / Desired outcome are marked [To be written] — the thread doesn't cover them. Draft the full item with Claude, then paste it here with "update ${created.key} with this" and I'll file it verbatim._\n`
+                : '') +
               `_${created.type} in ${lib.DISCOVERY_PROJECT}${created.notes?.length ? ` · ${created.notes.join(' · ')}` : ''}. Mention ${created.key} anytime to update it from a thread._`,
           });
         }
