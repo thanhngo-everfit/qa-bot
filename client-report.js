@@ -11,7 +11,7 @@ const path = require('path');
 const {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiCall,
-  agentStatus, getActiveSprintId, createJiraIssueResilient, FASTPATH, retractOwnMessages, isCreationRequest,
+  agentStatus, getActiveSprintId, createJiraIssueResilient, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest,
   warmUserNames, replaceMentionsCached,
   resolveInlineMentions, qaTaskWork,
 } = require('./lib');
@@ -1646,8 +1646,8 @@ const crMentionHandler = async ({ event, client, logger }) => {
   // channels — one prompt, one mechanism, no parity drift. This module
   // keeps what it uniquely owns: auto-analysis, follow-ups, weekly
   // reports, troubleshooting, reassignment, retraction.
-  if (isCreationRequest(event.text)) {
-    logger.info('[Bot] Creation request → deferring to core pipeline');
+  if (isCreationRequest(event.text) || isDiscoveryRequest(event.text)) {
+    logger.info('[Bot] Creation/discovery request → deferring to core pipeline');
     return;
   }
 

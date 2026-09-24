@@ -1512,7 +1512,7 @@ const coreMentionHandler = async ({ event, client, logger }) => {
   // Monitored (client-report) channels own their specialised flows —
   // EXCEPT ticket creation, which runs through this one proven pipeline in
   // every channel. Same prompt, same parsers, same behavior everywhere.
-  if (clientReport.MONITORED_CHANNELS[event.channel] && !lib.isCreationRequest(event.text)) return;
+  if (clientReport.MONITORED_CHANNELS[event.channel] && !lib.isCreationRequest(event.text) && !lib.isDiscoveryRequest(event.text)) return;
   if (clientReport.MONITORED_CHANNELS[event.channel]) {
     logger.info(`[QAAgent] Creation request in monitored channel ${clientReport.MONITORED_CHANNELS[event.channel]} — using core pipeline`);
   }
@@ -1587,6 +1587,70 @@ const coreMentionHandler = async ({ event, client, logger }) => {
       // goes straight to the battle-tested creation pipeline (multi-ticket,
       // dedup buttons, epic parenting, attachments).
       const wantsTicket = lib.FASTPATH.creation.test(event.text) || lib.FASTPATH.assignMention.test(event.text);
+
+      // ── Discovery board (PLAN / product discovery) ──────────────
+      // "log this into the Core Discovery board", "create a PLAN item",
+      // "update this into PLAN-123" — deterministic, never model-routed.
+      if (lib.isDiscoveryRequest(event.text)) {
+        const existingPlan = (event.text.match(/\bPLAN-\d+\b/i) || [])[0]?.toUpperCase() || null;
+        await bootSt.update(existingPlan ? `I'm updating ${existingPlan}` : "I'm drafting the discovery item");
+
+        const participants = [...new Set((context.match(/^\[([^\]]+)\]/gm) || []).map(s => s.replace(/^\[|\]$/g, '')))].slice(0, 8);
+        const draftRaw = await lib.aiCall(
+          `You turn a Slack product discussion into a Jira Product Discovery item. Return ONLY JSON:
+{"summary":"concise English title, <=90 chars","description":"markdown"}
+
+description format (markdown, real newlines):
+## Context
+what was raised and by whom, 2-4 sentences from the thread
+## Discussion
+- key points, one bullet each, attributed to the person who made them
+## Open questions / Next steps
+- concrete follow-ups agreed in the thread (omit the section if none)
+
+English only. Never invent facts or names beyond the transcript.`,
+          `Thread transcript:\n${(context || '').substring(0, 8000)}\n\nRequest: ${event.text.replace(/<@[A-Z0-9]+>/g, '').trim()}`,
+          1500, true, 'gpt-4o', 60000,
+        );
+        let draft;
+        try {
+          const j = draftRaw.substring(draftRaw.indexOf('{'), draftRaw.lastIndexOf('}') + 1);
+          draft = JSON.parse(j);
+        } catch (e) {
+          throw new Error(`couldn't draft the discovery item: ${e.message}`);
+        }
+
+        const threadUrl = buildSlackThreadUrl(event.channel, threadTs);
+        const body = `${draft.description || ''}\n\n## Reference\n- Slack thread: ${threadUrl}`;
+        const commentMd =
+          `Updated from the Slack thread discussion.\n` +
+          (participants.length ? participants.map(p => `- ${p}`).join('\n') + '\n' : '') +
+          `${(draft.description || '').split('\n').filter(l => l.trim() && !l.startsWith('#')).slice(0, 3).join(' ')}`.substring(0, 900);
+
+        if (existingPlan) {
+          await lib.updateIssueDescription(existingPlan, body);
+          await lib.addIssueComment(existingPlan, commentMd);
+          await bootSt.done();
+          await client.chat.postMessage({
+            channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+            text: `📝 Updated <${JIRA_HOST}/browse/${existingPlan}|${existingPlan}> from this thread — description refreshed and a summary comment added.`,
+          });
+        } else {
+          const created = await lib.createDiscoveryItem({ summary: draft.summary, descriptionMarkdown: body });
+          await lib.addIssueComment(created.key, commentMd).catch(() => {});
+          await bootSt.done();
+          await client.chat.postMessage({
+            channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+            text:
+              `💡 Logged to the discovery board → <${created.url}|${created.key}>\n` +
+              `*${draft.summary}*\n` +
+              `_${created.type} in ${lib.DISCOVERY_PROJECT}${created.notes?.length ? ` · ${created.notes.join(' · ')}` : ''}. Mention ${created.key} anytime to update it from a thread._`,
+          });
+        }
+        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+        await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
+        return;
+      }
 
       // Deterministic retract fast-path: deleting my own messages must never
       // depend on a model or on the gateway supporting tools.

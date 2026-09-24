@@ -229,16 +229,88 @@ async function getActiveSprintId() {
 
 // ── Jira: project issue types (cached, from Jira itself) ─────────────
 let _issueTypesCache = null, _issueTypesAt = 0;
-async function getProjectIssueTypes() {
-  if (_issueTypesCache && Date.now() - _issueTypesAt < 3600 * 1000) return _issueTypesCache;
+async function getProjectIssueTypes(projectKey = JIRA_PROJECT) {
+  const hit = _issueTypesCache && _issueTypesCache[projectKey];
+  if (hit && Date.now() - _issueTypesAt < 3600 * 1000) return hit;
   try {
-    const res = await axios.get(`${JIRA_HOST}/rest/api/3/project/${JIRA_PROJECT}`, {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/project/${projectKey}`, {
       headers: { Authorization: jiraAuth(), Accept: 'application/json' },
     });
     const types = (res.data?.issueTypes || []).filter(t => !t.subtask).map(t => t.name);
-    if (types.length) { _issueTypesCache = types; _issueTypesAt = Date.now(); }
+    if (types.length) {
+      _issueTypesCache = { ...(_issueTypesCache || {}), [projectKey]: types };
+      _issueTypesAt = Date.now();
+      return types;
+    }
   } catch (_) {}
-  return _issueTypesCache || ['Bug', 'Task'];
+  return (hit) || (projectKey === JIRA_PROJECT ? ['Bug', 'Task'] : ['Idea']);
+}
+
+// ── Jira Product Discovery: create / update a discovery item ─────────
+// Discovery boards (e.g. PLAN) use their own issue types ('Idea') and do
+// NOT accept sprint / fixVersion / priority fields.
+const DISCOVERY_PROJECT = process.env.DISCOVERY_PROJECT || 'PLAN';
+
+async function createDiscoveryItem({ summary, descriptionMarkdown, projectKey = DISCOVERY_PROJECT }) {
+  const types = await getProjectIssueTypes(projectKey);
+  const type  = types.find(t => /idea/i.test(t)) || types[0] || 'Idea';
+  const { key, notes } = await createJiraIssueResilient({
+    project:     { key: projectKey },
+    summary:     (summary || '').substring(0, 250),
+    issuetype:   { name: type },
+    description: mdToAdfDoc(descriptionMarkdown || ''),
+  });
+  return { key, url: `${JIRA_HOST}/browse/${key}`, type, notes };
+}
+
+async function updateIssueDescription(issueKey, descriptionMarkdown) {
+  await axios.put(`${JIRA_HOST}/rest/api/3/issue/${issueKey}`,
+    { fields: { description: mdToAdfDoc(descriptionMarkdown || '') } },
+    { headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json' } });
+  return true;
+}
+
+async function addIssueComment(issueKey, markdown) {
+  await axios.post(`${JIRA_HOST}/rest/api/3/issue/${issueKey}/comment`,
+    { body: mdToAdfDoc(markdown || '') },
+    { headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json' } });
+  return true;
+}
+
+// Minimal markdown → ADF (headings, bullets, numbered, bold, links)
+function mdToAdfDoc(text) {
+  const lines = (text || '').split('\n').filter(l => l.trim() !== '');
+  const inline = (line) => {
+    line = line.replace(/<(https?:\/\/[^>\s]+)>/g, '$1');
+    const re = /\*\*([^*]+)\*\*|(https?:\/\/[^\s<>]+)/g;
+    const parts = []; let last = 0, m;
+    while ((m = re.exec(line)) !== null) {
+      if (m.index > last) parts.push({ type: 'text', text: line.slice(last, m.index) });
+      if (m[1] !== undefined) parts.push({ type: 'text', text: m[1], marks: [{ type: 'strong' }] });
+      else parts.push({ type: 'text', text: m[2], marks: [{ type: 'link', attrs: { href: m[2] } }] });
+      last = m.index + m[0].length;
+    }
+    if (last < line.length) parts.push({ type: 'text', text: line.slice(last) });
+    return parts.length ? parts : [{ type: 'text', text: line }];
+  };
+  const content = []; let i = 0;
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    if (/^\d+\.\s/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\d+\.\s/.test(lines[i].trim())) { items.push({ type: 'listItem', content: [{ type: 'paragraph', content: inline(lines[i].trim().replace(/^\d+\.\s+/, '')) }] }); i++; }
+      content.push({ type: 'orderedList', content: items }); continue;
+    }
+    if (/^[-•]\s/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^[-•]\s/.test(lines[i].trim())) { items.push({ type: 'listItem', content: [{ type: 'paragraph', content: inline(lines[i].trim().replace(/^[-•]\s+/, '')) }] }); i++; }
+      content.push({ type: 'bulletList', content: items }); continue;
+    }
+    const h = line.match(/^(#{2,4})\s+(.*)$/);
+    if (h) { content.push({ type: 'heading', attrs: { level: Math.min(h[1].length, 3) }, content: [{ type: 'text', text: h[2].trim() }] }); i++; continue; }
+    content.push({ type: 'paragraph', content: inline(line) }); i++;
+  }
+  return { type: 'doc', version: 1, content: content.length ? content : [{ type: 'paragraph', content: [{ type: 'text', text: ' ' }] }] };
 }
 
 // ── Jira: resilient issue creation ───────────────────────────────────
@@ -468,6 +540,13 @@ async function gatherChannelContext(client, channelId, { days = 14, maxThreads =
 // assignment, retraction. One source of truth — no more parity drift.
 // Is this mention a ticket-creation request? ONE definition, used by both
 // handlers to route creation to the single working pipeline.
+// A discovery-board request: "log this into the Core Discovery board",
+// "create a PLAN item", "update this into PLAN-123".
+function isDiscoveryRequest(rawText) {
+  const t = rawText || '';
+  return FASTPATH.discovery.test(t) || /\bPLAN-\d+\b/i.test(t);
+}
+
 function isCreationRequest(rawText) {
   const t = (rawText || '').replace(/<@[A-Z0-9]+>/g, '').trim().toLowerCase();
   return /^(force\s?log|create\s?(card|ticket|task)|log\s?(bug|this)|assign\s?to)/.test(t)
@@ -479,6 +558,7 @@ const FASTPATH = {
   creation:      /\b(create|log|make|tạo|lên)\b[^.]{0,40}\b(cards?|tickets?|bugs?|tasks?|issues?)\b/i,
   assignMention: /\b(assign|giao)\s+(to\s+|cho\s+)?<@/i,
   retract:       /\b(delete|remove|xóa|xoá)\b[^.]{0,40}\b(responses?|messages?|repl(y|ies)|tin nhắn)\b/i,
+  discovery:     /\b(discovery|product\s+item|plan\s+item|idea|discovery\s+board|product\s+discovery)\b/i,
   followup:      /\b(follow[\s-]?up|theo\s?dõi|nhắc|check\s?(status|progress|tiến độ)|any\s?update)\b/i,
   retractAll:    /\ball\b|tất cả|hết|mọi tin/i,
   retractLastN:  /\blast\s+(\d+)\b/i,
@@ -565,5 +645,6 @@ module.exports = {
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient, getIssueEpic,
   resolveUserName, resolveInlineMentions, warmUserNames, replaceMentionsCached, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
-  slackify, FASTPATH, retractOwnMessages, isCreationRequest, clientReportSummary,
+  slackify, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, clientReportSummary,
+  DISCOVERY_PROJECT, createDiscoveryItem, updateIssueDescription, addIssueComment, mdToAdfDoc,
 };
