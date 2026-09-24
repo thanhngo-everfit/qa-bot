@@ -1537,6 +1537,29 @@ const coreMentionHandler = async ({ event, client, logger }) => {
   // Post the live status FIRST — before auth.test / thread reads — so a
   // silent thread always means "the handler never ran" (event not
   // delivered, or the process is down), never "it ran and vanished".
+  // Retract runs BEFORE any status is posted: it's instant, and a status
+  // message here would either be deleted as "my last message" or left
+  // orphaned in the thread.
+  if (lib.FASTPATH.retract.test(event.text)) {
+    const tTs = event.thread_ts || event.ts;
+    try {
+      const deleted = await lib.retractOwnMessages(client, event.channel, tTs, event.text, { beforeTs: event.ts });
+      if (!deleted) {
+        await client.chat.postMessage({
+          channel: event.channel, thread_ts: tTs, unfurl_links: false,
+          text: "I don't have a message of mine in this thread to delete.",
+        });
+      } else {
+        logger.info(`[QAAgent] Retract: deleted ${deleted} own message(s)`);
+      }
+    } catch (err) {
+      logger.warn('[QAAgent] Retract failed:', err.data?.error || err.message);
+    }
+    await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+    await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
+    return;
+  }
+
   const bootSt = agentStatus(client, event.channel, event.thread_ts || event.ts);
   await bootSt.start("I'm on it");
 
@@ -1654,25 +1677,6 @@ English only. Never invent facts or names beyond the transcript.`,
 
       // Deterministic retract fast-path: deleting my own messages must never
       // depend on a model or on the gateway supporting tools.
-      if (lib.FASTPATH.retract.test(event.text)) {
-        try {
-          const deleted = await lib.retractOwnMessages(client, event.channel, threadTs, event.text, { beforeTs: event.ts });
-          if (!deleted) {
-            await client.chat.postMessage({
-              channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-              text: "I don't have a message of mine in this thread to delete.",
-            });
-          } else {
-            logger.info(`[QAAgent] Retract fast-path: deleted ${deleted} own message(s)`);
-          }
-        } catch (err) {
-          logger.warn('[QAAgent] Retract fast-path failed:', err.data?.error || err.message);
-        }
-        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
-        await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
-        return;
-      }
-
       logger.info(`[QAAgent] route: wantsTicket=${wantsTicket} existing=[${existingKeys.join(',')}] text="${triggerText.substring(0, 70)}"`);
       if (!wantsTicket) {
         // ── THE AGENT LOOP ──
@@ -2078,6 +2082,7 @@ English only. Never invent facts or names beyond the transcript.`,
       const needed = err.data?.needed || 'unknown';
       logger.error(`[QABot] Missing Slack scope: ${needed} (provided: ${err.data?.provided})`);
       await agentSt?.done();
+      await bootSt?.done();
       await client.chat.postMessage({
         channel: event.channel, thread_ts: event.thread_ts || event.ts,
         text:
@@ -2096,6 +2101,7 @@ English only. Never invent facts or names beyond the transcript.`,
       : (jiraMessages || []).join(', ') || err.message;
     logger.error('[QABot]', err.response?.data ?? err.message);
     await agentSt?.done();
+    await bootSt?.done();
       await client.chat.postMessage({
       channel: event.channel, thread_ts: event.thread_ts || event.ts,
       text: `I hit an error while working on this and couldn't finish: \`${errDetail}\`\nGive it another try in a moment — if it keeps failing, my logs have the details.`,
