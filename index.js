@@ -1619,21 +1619,45 @@ const coreMentionHandler = async ({ event, client, logger }) => {
         await bootSt.update(existingPlan ? `I'm updating ${existingPlan}` : "I'm drafting the discovery item");
 
         const participants = [...new Set((context.match(/^\[([^\]]+)\]/gm) || []).map(s => s.replace(/^\[|\]$/g, '')))].slice(0, 8);
+        // Strip everything addressed to/from the agent — commands like
+        // "log this", "create a task", "assign to me" are NOT product content.
+        const productContext = (context || '').split('\n')
+          .filter(l => !/@QA Agent|^\[QA Agent\]/i.test(l))
+          .join('\n');
+
         const draftRaw = await lib.aiCall(
-          `You turn a Slack product discussion into a Jira Product Discovery item. Return ONLY a json object:
-{"summary":"concise English title, <=90 chars","description":"markdown"}
+          `You write Everfit Product Items for the Jira Product Discovery board. Everfit is a B2B coaching platform: coaches (paying customers) manage clients, programs, inbox messaging/video, habits, nutrition, payments. A Product Item is a DISCOVERY-stage overview — help the team decide whether/when to build, not how.
 
-description format (markdown, real newlines):
-## Context
-what was raised and by whom, 2-4 sentences from the thread
-## Discussion
-- key points, one bullet each, attributed to the person who made them
-## Open questions / Next steps
-- concrete follow-ups agreed in the thread (omit the section if none)
+Return ONLY a json object: {"summary":"...","description":"..."}
 
-English only. Never invent facts or names beyond the transcript.`,
-          `Thread transcript:\n${(context || '').substring(0, 8000)}\n\nRequest: ${event.text.replace(/<@[A-Z0-9]+>/g, '').trim()}`,
-          1500, true, 'gpt-4o', 60000,
+summary: concise outcome-oriented title, <=80 chars (e.g. "Loom integration for coach video feedback").
+
+description — markdown with EXACTLY these five sections, in order:
+## Problem / Context
+- the user pain / business signal / strategic driver, who is affected, and the evidence from the thread
+- the CURRENT WORKAROUND if mentioned (e.g. "currently done via in-chat")
+- never circular ("because we want X"); if the real trigger is unclear, add a "[To confirm] …" bullet
+## Goals
+- 2–4 OUTCOMES (not features) that would be true if this succeeds
+## Desired outcome
+- what would ship, per actor/platform where known (e.g. **Coach: Web** — …); what it is NOT; any stated priority signal
+## References
+- **Design:**
+- **Technical Solution Document:**
+- **PRD:**
+- **Specification:**
+## Open Questions
+| Questions | Owner | Answer |
+|---|---|---|
+| … | | |
+(at least 2 real unknowns; leave Owner/Answer blank unless obvious)
+
+STRICT RULES:
+- IGNORE every message that is an instruction to a bot or about logging/creating/assigning tickets. Those are not product content and must never appear.
+- Record stakeholder signals faithfully: "Medium since it is currently done via in-chat" is a PRIORITY signal justified by an existing workaround — not an effort estimate.
+- English only. Never invent facts, metrics, names or scope beyond the transcript — mark gaps with [To confirm].`,
+          `Thread transcript (bot commands removed):\n${productContext.substring(0, 8000)}`,
+          2000, true, 'gpt-4o', 60000,
         );
         let draft;
         try {
@@ -1644,7 +1668,15 @@ English only. Never invent facts or names beyond the transcript.`,
         }
 
         const threadUrl = buildSlackThreadUrl(event.channel, threadTs);
-        const body = `${draft.description || ''}\n\n## Reference\n- Slack thread: ${threadUrl}`;
+        // Put the Slack thread under References as extra evidence (the
+        // template keeps the four fixed labels first).
+        let body = draft.description || '';
+        if (/## References/i.test(body)) {
+          body = body.replace(/(## References[\s\S]*?\*\*Specification:\*\*[^\n]*)/i, `$1\n- **Slack discussion:** ${threadUrl}`);
+          if (!body.includes(threadUrl)) body = body.replace(/(## References[^\n]*\n)/i, `$1- **Slack discussion:** ${threadUrl}\n`);
+        } else {
+          body += `\n\n## References\n- **Slack discussion:** ${threadUrl}`;
+        }
         const commentMd =
           `Updated from the Slack thread discussion.\n` +
           (participants.length ? participants.map(p => `- ${p}`).join('\n') + '\n' : '') +

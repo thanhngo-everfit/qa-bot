@@ -324,8 +324,29 @@ function mdToAdfDoc(text) {
     return parts.length ? parts : [{ type: 'text', text: line }];
   };
   const content = []; let i = 0;
+  const cellsOf = (row) => row.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+  const isSep   = (row) => /^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?$/.test(row.trim());
   while (i < lines.length) {
     const line = lines[i].trim();
+
+    // Markdown table → ADF table (header row + separator + body rows)
+    if (line.startsWith('|') && i + 1 < lines.length && isSep(lines[i + 1])) {
+      const header = cellsOf(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].trim().startsWith('|')) { rows.push(cellsOf(lines[i])); i++; }
+      const cell = (type, text) => ({ type, content: [{ type: 'paragraph', content: text ? inline(text) : [] }] });
+      content.push({
+        type: 'table',
+        attrs: { isNumberColumnEnabled: false, layout: 'default' },
+        content: [
+          { type: 'tableRow', content: header.map(h => cell('tableHeader', h)) },
+          ...rows.map(r => ({ type: 'tableRow', content: header.map((_, c) => cell('tableCell', r[c] || '')) })),
+        ],
+      });
+      continue;
+    }
+
     if (/^\d+\.\s/.test(line)) {
       const items = [];
       while (i < lines.length && /^\d+\.\s/.test(lines[i].trim())) { items.push({ type: 'listItem', content: [{ type: 'paragraph', content: inline(lines[i].trim().replace(/^\d+\.\s+/, '')) }] }); i++; }
