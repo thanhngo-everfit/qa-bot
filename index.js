@@ -1697,9 +1697,32 @@ HARD RULES — follow exactly:
           `${(draft.description || '').split('\n').filter(l => l.trim() && !l.startsWith('#')).slice(0, 3).join(' ')}`.substring(0, 900);
 
         if (existingPlan) {
-          await lib.updateIssueDescription(existingPlan, body);
-          await lib.addIssueComment(existingPlan, commentMd);
+          // Jira Product Discovery: only 'Creator' roles can edit ideas.
+          // Contributors can create + comment, but the description is not
+          // on their edit screen ("Field 'description' cannot be set").
+          // Fall back to posting the content as a comment, honestly.
+          let descUpdated = true;
+          try {
+            await lib.updateIssueDescription(existingPlan, body);
+          } catch (e) {
+            const msg = JSON.stringify(e.response?.data || e.message);
+            if (/cannot be set|not on the appropriate screen/i.test(msg)) {
+              descUpdated = false;
+              logger.warn(`[QAAgent] ${existingPlan} description not editable (JPD permissions) — posting as comment`);
+              await lib.addIssueComment(existingPlan, `Proposed description (couldn't edit it directly — my account can't edit discovery ideas):\n\n${body}`);
+            } else throw e;
+          }
+          if (descUpdated) await lib.addIssueComment(existingPlan, commentMd);
           await bootSt.done();
+          if (!descUpdated) {
+            await client.chat.postMessage({
+              channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+              text: `I couldn't edit <${JIRA_HOST}/browse/${existingPlan}|${existingPlan}>'s description — on discovery boards only *Creator* roles can edit ideas, and my Jira account is a Contributor. I posted the new content as a comment instead so you can copy it into the description. A JPD admin can grant my account the Creator role to fix this permanently.`,
+            });
+            await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+            await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
+            return;
+          }
           await client.chat.postMessage({
             channel: event.channel, thread_ts: threadTs, unfurl_links: false,
             text: draft.verbatim
