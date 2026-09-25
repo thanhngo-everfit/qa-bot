@@ -2140,7 +2140,7 @@ HARD RULES — follow exactly:
           if (sprintAdded) bits.push('Active Sprint');
           const set = bits.length ? `${bits.join(', ')} set` : 'no epic/sprint set';
           const problems = (jira.notes || []).filter(n => n !== 'no epic set');
-          return `_${set}${problems.length ? ` · ${problems.join(' · ')}` : ''}${jira.notes?.includes('no epic set') ? ' · no epic — mention one to link it' : ''}. Tag me anytime to follow up._`;
+          return `_${set}${problems.length ? ` · ${problems.join(' · ')}` : ''}${jira.notes?.includes('no epic set') ? ' · no epic — mention one to link it' : ''}._`;
         })()
       );
     });
@@ -2154,9 +2154,24 @@ HARD RULES — follow exactly:
 
     const responseText = lines.join('\n\n') + epicLine;
     await agentSt.done();
-      await client.chat.postMessage({
+
+    // One "Follow up" button per created ticket — starts (or confirms) the
+    // follow-up tracking flow instead of asking people to tag me.
+    const followButtons = createdJiras.slice(0, 5).map(({ jira, assigneeSlackIds }) => ({
+      type: 'button',
+      action_id: `qa_followup_start_${jira.key}`,
+      text: { type: 'plain_text', text: createdJiras.length > 1 ? `Follow up ${jira.key}` : 'Follow up', emoji: true },
+      value: JSON.stringify({ k: jira.key, c: event.channel, t: threadTs, a: assigneeSlackIds?.[0] || null }),
+    }));
+    const replyBlocks = responseText ? [
+      { type: 'section', text: { type: 'mrkdwn', text: responseText.substring(0, 2900) } },
+      ...(followButtons.length ? [{ type: 'actions', elements: followButtons }] : []),
+    ] : undefined;
+
+    await client.chat.postMessage({
       channel: event.channel, thread_ts: threadTs, unfurl_links: false,
       text: responseText || "Something went wrong on my side — I wasn't able to create the ticket this time. Try tagging me again in a moment.",
+      ...(replyBlocks ? { blocks: replyBlocks } : {}),
     });
 
     await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
@@ -2296,6 +2311,51 @@ slackApp.action('qa_core_dup_follow', async ({ ack, body, client, logger }) => {
     lines.length
       ? `🔍 <@${body.user.id}> chose *follow up on existing*:\n${lines.join('\n')}\n_I'm tracking the open ones — I'll follow up every 2 business days until closed._`
       : `🔍 I couldn't find live tickets in this thread anymore.`);
+});
+
+// ── Follow up button on the ticket confirmation ──────────────────────
+slackApp.action(/^qa_followup_start_/, async ({ ack, body, client, logger }) => {
+  await ack();
+  let p = {};
+  try { p = JSON.parse(body.actions[0].value || '{}'); } catch (_) {}
+  if (!p.k || !p.c || !p.t) return;
+  const clicker = body.user?.id;
+  const url = `${JIRA_HOST}/browse/${p.k}`;
+
+  const snap = await lib.getIssueSnapshot(p.k);
+  const status = (snap?.status || 'Unknown');
+  const statusLc = status.toLowerCase();
+  const alreadyTracked = clientReport.isTracked(p.k);
+
+  if (!alreadyTracked && !['qa success', 'done', 'released', 'closed'].includes(statusLc)) {
+    clientReport.registerFollowUp({
+      channelId: p.c, threadTs: p.t, jiraKey: p.k, jiraUrl: url, squad: null,
+      assigneeSlackHint: p.a || null,
+      seedStatus: statusLc,
+      alreadyAnnounced: ['qa ready'].includes(statusLc),
+    });
+  }
+  if (p.a) clientReport.setTrackedAssignee(p.k, p.a);
+
+  // Replace this ticket's button so it can't be clicked twice
+  try {
+    const blocks = (body.message?.blocks || []).map(b => {
+      if (b.type !== 'actions') return b;
+      const remaining = (b.elements || []).filter(el => el.action_id !== body.actions[0].action_id);
+      return remaining.length ? { ...b, elements: remaining } : null;
+    }).filter(Boolean);
+    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Follow-up on ${p.k} started by <@${clicker}>` }] });
+    await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: body.message.text || p.k, blocks });
+  } catch (err) { logger.warn('[QAAgent] Could not update ticket message:', err.data?.error || err.message); }
+
+  const who = p.a ? `<@${p.a}>` : (snap?.assignee ? `*${snap.assignee}*` : 'the assignee');
+  const done = ['qa success', 'done', 'released', 'closed'].includes(statusLc);
+  await client.chat.postMessage({
+    channel: p.c, thread_ts: p.t, unfurl_links: false,
+    text: done
+      ? `<${url}|${p.k}> is already *${status}* — nothing to follow up.`
+      : `${alreadyTracked ? 'Already tracking' : 'Tracking'} <${url}|${p.k}> (*${status}*). I'll nudge ${who} every 2 business days (Mon–Fri, working hours), tag SM at QA Ready and PC at QA Success.`,
+  });
 });
 
 // ── Assign button on the analysis → member picker → create + assign ──

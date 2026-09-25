@@ -3098,4 +3098,10 @@ function register(realApp, realOpenai) {
   console.log('✅ [ClientReport] module active (gpt-4o-mini) — monitoring:', Object.values(MONITORED_CHANNELS).join(', '));
 }
 
-module.exports = { register, MONITORED_CHANNELS, registerFollowUp };
+function isTracked(jiraKey) { return followUpStore.has(jiraKey) && !followUpStore.get(jiraKey).done; }
+function setTrackedAssignee(jiraKey, slackId) {
+  const t = followUpStore.get(jiraKey);
+  if (t && slackId) t.assigneeSlackHint = slackId;
+}
+
+module.exports = { register, MONITORED_CHANNELS, registerFollowUp, isTracked, setTrackedAssignee };
