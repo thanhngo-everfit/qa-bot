@@ -2479,7 +2479,8 @@ Max 8 steps total. Plain English only.`,
     await client.reactions.add({ channel: event.channel, name: 'x', timestamp: event.ts }).catch(() => {});
   }
 };
-slackApp.event('app_mention', crMentionHandler);
+slackApp.event('app_mention', withWatchdog('mention', crMentionHandler, 150000,
+  `I couldn't finish this in time and stopped. Please try again in a moment.`));
 
 // ── Duplicate-guard button actions ───────────────────────────────────
 // Buttons re-invoke the full mention pipeline with a synthetic event, so
@@ -2561,7 +2562,7 @@ slackApp.action('qa_cr_dup_cancel', async ({ ack, body, client }) => {
 // Watchdog wrapper: no client-report handler may run forever. On timeout
 // the status is cleared and the thread gets an honest note instead of a
 // permanent 'I'm analyzing the report'.
-function withWatchdog(name, handler, budgetMs) {
+function withWatchdog(name, handler, budgetMs, note = null) {
   return async (args) => {
     const { event, client, logger } = args;
     let finished = false;
@@ -2571,7 +2572,7 @@ function withWatchdog(name, handler, budgetMs) {
       try {
         await client.chat.postMessage({
           channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false,
-          text: `I couldn't finish analyzing this in time — tag me with _"analyze"_ to retry, or just describe what you need.`,
+          text: note || `I couldn't finish analyzing this in time — tag me with _"analyze"_ to retry, or just describe what you need.`,
         });
       } catch (_) {}
     }, budgetMs);

@@ -30,6 +30,10 @@ function getOpenAI() {
   if (!_openaiClient) {
     _openaiClient = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY,
+      // The SDK silently retries twice on timeouts by default, which
+      // TRIPLED every timeout we set (45s leash → ~135s) and blew past the
+      // watchdogs. aiComplete does its own retry/fallback, so disable it.
+      maxRetries: 0,
       // Point at any OpenAI-compatible gateway (internal LB, LiteLLM, Azure
       // proxy...) by setting OPENAI_BASE_URL, e.g. https://codex-lb.internal/v1
       ...(process.env.OPENAI_BASE_URL ? { baseURL: process.env.OPENAI_BASE_URL } : {}),
