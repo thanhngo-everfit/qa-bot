@@ -1935,7 +1935,10 @@ HARD RULES — follow exactly:
     }
 
     // Hardcoded fix version = "To be confirmed" (ID 12023)
-    const fixVersionId = '12023';
+    // Report channels keep the client-report convention ("Client Report (TBD)");
+    // everywhere else uses the default "To be confirmed".
+    const inReportChannel = !!clientReport.MONITORED_CHANNELS[event.channel];
+    const fixVersionId = inReportChannel ? clientReport.CLIENT_REPORT_FIX_VERSION_ID : '12023';
 
     // Resolve reporter: the person who tagged the bot (NOT the thread author)
     const reporterSlackId = event.user;
@@ -2001,8 +2004,17 @@ HARD RULES — follow exactly:
       // the 'created the ticket but stuck adding parent' phase.)
       const tParent = Date.now();
       let parentKey = null;
+
+      // Report channels: cards go under the platform's Client Report epic
+      // (iOS → Client Report (iOS), etc.) unless the request names an epic
+      // or parent. The sprint-epic search below is for other channels only.
+      if (inReportChannel && !epicKey) {
+        parentKey = clientReport.PLATFORM_PARENTS[ticket.platform] || null;
+        if (parentKey) logger.info(`[QABot] Client Report epic for ${ticket.platform}: ${parentKey}`);
+        else logger.warn(`[QABot] No Client Report epic mapped for platform "${ticket.platform}"`);
+      }
       try {
-        parentKey = await Promise.race([
+        if (!parentKey) parentKey = await Promise.race([
           (async () => {
             const channelInfo = await client.conversations.info({ channel: event.channel });
             const channelName = channelInfo.channel?.name || '';
@@ -2052,7 +2064,7 @@ HARD RULES — follow exactly:
       await agentSt.update('📝 _QA Agent is creating the Jira ticket(s)…_');
       const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId, issueType);
       if (epicKey && !jira.applied?.epic) jira.notes = [...(jira.notes || []), `couldn't attach to epic ${epicKey} — please link it in Jira`];
-      if (!epicKey) jira.notes = [...(jira.notes || []), 'no epic set'];
+      if (!epicKey && !jira.applied?.epic) jira.notes = [...(jira.notes || []), 'no epic set'];
       if (skippedAtts.length) jira.notes = [...(jira.notes || []), `${skippedAtts.length} file(s) too large to attach (${skippedAtts.map(s => s.name).join(', ')})`];
 
       // Post-create steps are BEST EFFORT: a slow/failed sprint, AC or

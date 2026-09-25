@@ -3214,4 +3214,9 @@ function setTrackedAssignee(jiraKey, slackId) {
   if (t && slackId) t.assigneeSlackHint = slackId;
 }
 
-module.exports = { register, MONITORED_CHANNELS, registerFollowUp, isTracked, setTrackedAssignee };
+// Client-report conventions, used by the shared creation pipeline for
+// cards created in the monitored channels.
+const CLIENT_REPORT_FIX_VERSION_ID = '27643';   // "Client Report (TBD)"
+
+module.exports = { register, MONITORED_CHANNELS, registerFollowUp, isTracked, setTrackedAssignee,
+  PLATFORM_PARENTS, CLIENT_REPORT_FIX_VERSION_ID };
