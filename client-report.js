@@ -1284,7 +1284,9 @@ async function rebuildFollowUpsFromJira() {
     for (let page = 0; page < 4; page++) {           // up to 400 tickets
       const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
         params: {
-          jql: `project = ${JIRA_PROJECT} AND fixVersion = 27643 AND statusCategory != Done ORDER BY created DESC`,
+          // Old client-report cards carry fixVersion 27643; cards created by the
+          // unified pipeline carry the [Client Report]/[Client Request] prefix.
+          jql: `project = ${JIRA_PROJECT} AND (fixVersion = 27643 OR summary ~ "\\"Client Report\\"" OR summary ~ "\\"Client Request\\"") AND statusCategory != Done ORDER BY created DESC`,
           maxResults: 100, startAt,
           fields: 'summary,status,description',
         },

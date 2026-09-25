@@ -2152,17 +2152,24 @@ HARD RULES — follow exactly:
 
     const epicLine = epicKey ? `\nEpic: <${JIRA_HOST}/browse/${epicKey}|${epicKey}>` : '';
 
-    const responseText = lines.join('\n\n') + epicLine;
+    let responseText = lines.join('\n\n') + epicLine;
     await agentSt.done();
 
     // One "Follow up" button per created ticket — starts (or confirms) the
     // follow-up tracking flow instead of asking people to tag me.
-    const followButtons = createdJiras.slice(0, 5).map(({ jira, assigneeSlackIds }) => ({
+    // In the report channels every card is tracked automatically, so no
+    // button — just say so. Elsewhere, offer the Follow up button.
+    const autoTracked = !!clientReport.MONITORED_CHANNELS[event.channel];
+    const followButtons = autoTracked ? [] : createdJiras.slice(0, 5).map(({ jira, assigneeSlackIds }) => ({
       type: 'button',
       action_id: `qa_followup_start_${jira.key}`,
       text: { type: 'plain_text', text: createdJiras.length > 1 ? `Follow up ${jira.key}` : 'Follow up', emoji: true },
       value: JSON.stringify({ k: jira.key, c: event.channel, t: threadTs, a: assigneeSlackIds?.[0] || null }),
     }));
+    if (autoTracked && responseText) {
+      const who = [...new Set(createdJiras.flatMap(j => j.assigneeSlackIds || []))].map(id => `<@${id}>`).join(', ');
+      responseText += `\n_I'll follow up${who ? ` with ${who}` : ''} until ${createdJiras.length > 1 ? 'they are' : "it's"} closed._`;
+    }
     const replyBlocks = responseText ? [
       { type: 'section', text: { type: 'mrkdwn', text: responseText.substring(0, 2900) } },
       ...(followButtons.length ? [{ type: 'actions', elements: followButtons }] : []),
