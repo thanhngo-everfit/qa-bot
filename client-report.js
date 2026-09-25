@@ -1141,14 +1141,20 @@ function buildTicketReply(createdJiras) {
 async function getJiraIssueDetails(issueKey) {
   try {
     const res = await axios.get(
-      `${JIRA_HOST}/rest/api/3/issue/${issueKey}?fields=status,assignee`,
+      `${JIRA_HOST}/rest/api/3/issue/${issueKey}?fields=status,assignee,fixVersions,updated,summary`,
       { headers: { Authorization: jiraAuth(), Accept: 'application/json' } }
     );
     const fields = res.data?.fields || {};
     const details = {
       status:          (fields.status?.name || '').toLowerCase(),
+      statusName:      fields.status?.name || '',
       assigneeEmail:   fields.assignee?.emailAddress || null,
       assigneeDisplay: fields.assignee?.displayName || null,
+      summary:         fields.summary || '',
+      updatedMs:       fields.updated ? Date.parse(fields.updated) : null,
+      fixVersions:     (fields.fixVersions || []).map(v => ({
+        name: v.name, released: !!v.released, releaseDate: v.releaseDate || null,
+      })),
     };
     console.log(`[Bot] ${issueKey} → status="${details.status}" assignee="${details.assigneeDisplay}" email="${details.assigneeEmail}"`);
     return details;
@@ -1259,6 +1265,10 @@ function registerFollowUp({ channelId, threadTs, jiraKey, jiraUrl, squad, assign
     // previous process life — never re-tag SM for it.
     lastPingAt:      alreadyAnnounced ? Date.now() : null,
     notifiedQaReady: alreadyAnnounced,
+    registeredAt:    Date.now(),       // first nudge is measured from here, never immediate
+    nudgeCount:      0,                // escalates to the squad lead after repeated silence
+    reporterSlackId: null,             // resolved lazily: who posted the report (fyi on milestones)
+    announced:       {},               // milestone → true (qa_success, live, qa_failed)
     done:            false,
   });
   console.log(`[FollowUp] Registered ${jiraKey} (squad: ${squad || 'unknown'}${seedStatus ? `, seeded at "${seedStatus}"` : ''}${alreadyAnnounced ? ', announcements suppressed' : ''})`);
@@ -1455,6 +1465,60 @@ async function hoursSinceAssigneeReply(client, channelId, threadTs, assigneeSlac
 }
 // ─────────────────────────────────────────────
 
+// ── Follow-up intelligence helpers ───────────────────────────────────
+// Working time only: Mon–Fri, FOLLOWUP_HOUR_START–END, Vietnam time.
+// Cadences are in WORKING hours, so a card created Friday 17:00 is not
+// "48h old" on Monday morning.
+const FOLLOWUP_CADENCE_BH = parseFloat(process.env.FOLLOWUP_CADENCE_BH || '18');   // 2 working days (9h/day)
+const ESCALATE_AFTER_NUDGES = parseInt(process.env.FOLLOWUP_ESCALATE_AFTER || '2', 10);
+
+function businessHoursBetween(startMs, endMs) {
+  if (!startMs || endMs <= startMs) return 0;
+  const startH = parseInt(process.env.FOLLOWUP_HOUR_START || '9', 10);
+  const endH   = parseInt(process.env.FOLLOWUP_HOUR_END   || '18', 10);
+  const STEP = 15 * 60 * 1000;
+  let minutes = 0;
+  for (let t = startMs; t < endMs; t += STEP) {
+    const vn = new Date(t + 7 * 3600 * 1000);          // VN = UTC+7
+    const d = vn.getUTCDay(), h = vn.getUTCHours();
+    if (d !== 0 && d !== 6 && h >= startH && h < endH) minutes += 15;
+  }
+  return minutes / 60;
+}
+
+// Release state from the ticket's fix versions:
+//   'none-needed' → fixVersion is N/A: no release, the fix is live once verified
+//   'released'    → every real fix version is released
+//   'pending'     → at least one real fix version is not released yet
+//   'unset'       → no fix version at all
+function releaseState(fixVersions) {
+  const vs = fixVersions || [];
+  if (!vs.length) return { state: 'unset', versions: [] };
+  if (vs.every(v => /^n\s*\/?\s*a$/i.test((v.name || '').trim()))) return { state: 'none-needed', versions: vs };
+  const real = vs.filter(v => !/^n\s*\/?\s*a$/i.test((v.name || '').trim()));
+  const pending = real.filter(v => !v.released);
+  return pending.length ? { state: 'pending', versions: pending } : { state: 'released', versions: real };
+}
+
+function describeVersions(vs) {
+  return vs.map(v => `*${v.name}*${v.releaseDate ? ` (${v.releaseDate})` : ''}`).join(', ');
+}
+
+// Who reported it = the author of the thread's first message (not a bot).
+async function resolveReporter(client, item) {
+  if (item.reporterSlackId !== null) return item.reporterSlackId || null;
+  try {
+    const parent = (await client.conversations.replies({ channel: item.channelId, ts: item.threadTs, limit: 1 })).messages?.[0];
+    item.reporterSlackId = parent && !parent.bot_id ? (parent.user || '') : '';
+  } catch (_) { item.reporterSlackId = ''; }
+  return item.reporterSlackId || null;
+}
+
+const fyi = (...ids) => {
+  const uniq = [...new Set(ids.filter(Boolean))];
+  return uniq.length ? `\n_fyi ${uniq.join(' ')}_` : '';
+};
+
 function startFollowUpScheduler(client) {
   const THIRTY_MIN   = 30 * 60 * 1000;
   const TWENTY_FOUR_H = 24 * 60 * 60 * 1000;
@@ -1486,6 +1550,7 @@ function startFollowUpScheduler(client) {
           console.log(`[FollowUp] ${jiraKey} status changed: ${item.lastStatus} → ${status}`);
           item.lastStatus   = status;
           item.lastStatusAt = Date.now();
+          item.nudgeCount   = 0;          // progress resets escalation
         }
 
         // ── 2. Resolve assignee Slack ID: email (exact) → creation hint → name search ──
@@ -1498,99 +1563,142 @@ function startFollowUpScheduler(client) {
           ? `<@${assigneeSlackId}>`
           : assigneeDisplay ? `*${assigneeDisplay}*` : '_unassigned_';
 
-        // ── 3. Get squad contacts ─────────────────────
-        const contacts = item.squad
-          ? resolveContactMentions(getSquadContacts(item.squad))
-          : null;
+        // ── 3. Who to talk to ─────────────────────────
+        // Squad may be unknown for cards created outside the old module —
+        // infer it from the ticket summary so SM/PC can still be tagged.
+        if (!item.squad) item.squad = detectSquadFromKeywords(details.summary || '') || null;
+        const contacts   = item.squad ? resolveContactMentions(getSquadContacts(item.squad)) : null;
+        const smMention  = contacts?.smMention || `<!subteam^${GROUP_SM}>`;
+        const pcMention  = contacts?.pcMention || null;
+        const reporterId = await resolveReporter(client, item);
+        const reporter   = reporterId ? `<@${reporterId}>` : null;
+        const rel        = releaseState(details.fixVersions);
+        const link       = `<${item.jiraUrl}|${jiraKey}>`;
+        const post = (text) => client.chat.postMessage({ channel: item.channelId, thread_ts: item.threadTs, unfurl_links: false, text });
 
-        // ── 4. Branch by Jira status ──────────────────
-
-        // ── Terminal: Done / Released → silent close ──
-        if (['done', 'released', 'closed'].includes(status)) {
-          item.done = true;
-          continue;
-        }
-
-        // ── QA Success → tag PC once, then close ──────
-        if (status === 'qa success') {
-          if (!inStartupGrace() && !(await alreadyAnnouncedInThread(client, item.channelId, item.threadTs, jiraKey, 'passed QA'))) {
-            // PC mention only — never fall back to the SM group here
-            const pcMention = contacts?.pcMention || contacts?.smMention || null;
-            await client.chat.postMessage({
-              channel: item.channelId, thread_ts: item.threadTs, unfurl_links: false,
-              text:
-                `✅ <${item.jiraUrl}|${jiraKey}> has passed QA!\n` +
-                `${pcMention ? `${pcMention} — please` : 'PC — please'} let the CS team know so they can follow up with the coach/client and close the Intercom ticket.`,
-            });
+        // Milestone guard: announce once per process life AND once per thread
+        // (the thread survives redeploys; memory doesn't).
+        item.announced = item.announced || {};
+        const once = async (key, marker, { threadCheck = true } = {}) => {
+          if (item.announced[key] || inStartupGrace()) return false;
+          if (threadCheck && await alreadyAnnouncedInThread(client, item.channelId, item.threadTs, jiraKey, marker)) {
+            item.announced[key] = true;
+            return false;
           }
-          item.done = true;   // stop tracking either way
+          return true;
+        };
+        const tellReporter = reporter ? `${reporter}, you` : 'CS, you';
+
+        // ── 4. Branch by status + release state ───────
+        const isTerminal = ['done', 'released', 'closed'].includes(status);
+        const isVerified = status === 'qa success' || isTerminal;
+
+        if (isVerified) {
+          // Fix Version N/A = no release: the fix is live as soon as it's verified.
+          if (rel.state === 'none-needed' || (isTerminal && rel.state === 'unset')) {
+            if (await once('live', 'is live')) {
+              await post(`${link} passed QA and is live — no release needed. ${tellReporter} can update the coach/client and close the Intercom ticket.` + fyi(pcMention));
+              item.announced.live = true;
+            }
+            item.done = true; continue;
+          }
+          if (rel.state === 'released') {
+            if (await once('live', 'is live')) {
+              await post(`${link} is live in ${describeVersions(rel.versions)}. ${tellReporter} can update the coach/client and close the Intercom ticket.` + fyi(pcMention));
+              item.announced.live = true;
+            }
+            item.done = true; continue;
+          }
+          if (rel.state === 'pending') {
+            // Verified but not shipped: the coach can't see it yet. Say when,
+            // then keep watching the release and announce again when it's out.
+            if (await once('qa_success', 'passed QA')) {
+              await post(`${link} passed QA. It ships with ${describeVersions(rel.versions)}, so it isn't live for the coach yet — I'll post here when that release is out.` + fyi(reporter, pcMention));
+              item.announced.qa_success = true;
+            }
+            continue;
+          }
+          // Verified with no Fix Version: nobody can tell when it goes live.
+          if (await once('qa_success', 'passed QA')) {
+            await post(`${link} passed QA, but it has no Fix Version, so I can't tell when it goes live. ${pcMention || smMention}, please set the Fix Version (or *N/A* if no release is needed).` + fyi(reporter));
+            item.announced.qa_success = true;
+          }
           continue;
         }
 
-        // ── QA Ready → tag SM to assign QA (once) ─────
-        if (status === 'qa ready') {
-          if (!item.notifiedQaReady && !inStartupGrace()
-              && !(await alreadyAnnouncedInThread(client, item.channelId, item.threadTs, jiraKey, 'QA Ready'))) {
-            const smMention = contacts?.smMention || `<!subteam^${GROUP_SM}>`;
-            await client.chat.postMessage({
-              channel: item.channelId, thread_ts: item.threadTs, unfurl_links: false,
-              text:
-                `🧪 <${item.jiraUrl}|${jiraKey}> is now *QA Ready*.\n` +
-                `${smMention} — please assign a QA member to verify this ticket.`,
-            });
-            item.notifiedQaReady = true;
+        // QA failed → back to the dev; a new QA Ready round will be announced again.
+        if (/qa fail|reopen|reject/.test(status)) {
+          const key = `qa_failed_${item.lastStatusAt}`;
+          if (!item.announced[key] && !inStartupGrace()) {
+            await post(`${link} *failed QA*. ${assigneeMention}, please take another look — QA's notes are on the ticket.` + fyi(smMention));
+            item.announced[key] = true;
+            item.qaRound = (item.qaRound || 0) + 1;
+            item.notifiedQaReady = false;
             item.lastPingAt = Date.now();
-          } else {
-            item.notifiedQaReady = true;   // suppressed → don't re-check every tick
+          }
+          continue;
+        }
+
+        // QA Ready → SM assigns a QA member; reporter gets a heads-up.
+        if (status === 'qa ready') {
+          const round = item.qaRound || 0;
+          if (!item.notifiedQaReady && await once(`qa_ready_${round}`, 'QA Ready', { threadCheck: round === 0 })) {
+            await post(`${link} is *QA Ready*. ${smMention}, please assign a QA member to verify it.` + fyi(reporter));
+            item.announced[`qa_ready_${round}`] = true;
+            item.lastPingAt = Date.now();
+            item.notifiedQaReady = true;
+          } else if (!inStartupGrace()) {
+            item.notifiedQaReady = true;
           }
           continue;
         }
 
         // ── Dev stages: To Do / In Progress / In Review ──
-        // Only ping on working days (Mon–Fri) and after 48h since last ping
         const DEV_STATUSES = ['to do', 'in progress', 'in review'];
         if (!DEV_STATUSES.includes(status)) continue;
 
-        // Business-hours gate already applied at tick level
+        // The clock starts at the latest sign of life — registration, status
+        // change, our last nudge, or ANY update on the Jira ticket — and
+        // counts WORKING hours only. A new card is never nudged in its first
+        // two working days.
+        const since = Math.max(item.registeredAt || 0, item.lastStatusAt || 0, item.lastPingAt || 0, details.updatedMs || 0);
+        const workedHours = businessHoursBetween(since, Date.now());
+        if (workedHours < FOLLOWUP_CADENCE_BH) continue;
 
-        const hoursSinceLastPing = item.lastPingAt
-          ? (Date.now() - item.lastPingAt) / (60 * 60 * 1000)
-          : 49; // never pinged → treat as overdue
-
-        if (hoursSinceLastPing < 48) continue;
-
-        // ── Scan thread + ask Claude before pinging ────
+        // ── Read the thread before nudging ─────────────
         const threadContext = await getThread(client, item.channelId, item.threadTs);
         const hoursStale    = await hoursSinceAssigneeReply(client, item.channelId, item.threadTs, assigneeSlackId);
-        const assessment    = await assessThreadBeforeFollowUp(
-          threadContext, jiraKey, status, assigneeDisplay, hoursStale
-        );
-
-        console.log(`[FollowUp] ${jiraKey} (${status}): ${assessment.action} — ${assessment.reason}`);
-
+        // The thread read is a refinement, not a gate: if the AI step fails, the
+        // working-hours cadence already makes a nudge safe to send.
+        let assessment;
+        try {
+          assessment = await assessThreadBeforeFollowUp(threadContext, jiraKey, status, assigneeDisplay, hoursStale);
+        } catch (err) {
+          console.warn(`[FollowUp] ${jiraKey} thread assessment failed (${err.message}) — nudging anyway`);
+          assessment = { action: 'ping', reason: 'assessment unavailable' };
+        }
+        console.log(`[FollowUp] ${jiraKey} (${status}, ${workedHours.toFixed(1)} working h quiet): ${assessment.action} — ${assessment.reason}`);
         if (assessment.action === 'close') { item.done = true; continue; }
-        if (assessment.action === 'skip') continue;
+        if (assessment.action === 'skip') { item.lastPingAt = Date.now(); continue; }   // recent activity → restart the clock
 
-        // ── Status-specific ping message ───────────────
+        item.nudgeCount = (item.nudgeCount || 0) + 1;
+        // Report the true age in the current status, not time since the last reminder
+        const inStatusSince = Math.max(item.registeredAt || 0, item.lastStatusAt || 0);
+        const days = Math.max(2, Math.floor(businessHoursBetween(inStatusSince, Date.now()) / 9));
+        const escalate = item.nudgeCount > ESCALATE_AFTER_NUDGES;
+
         let pingText;
         if (status === 'to do') {
-          pingText =
-            `👋 ${assigneeMention} — <${item.jiraUrl}|${jiraKey}> has been assigned to you and is still *To Do*.\n` +
-            `Could you acknowledge this ticket and let us know when you plan to start?`;
+          pingText = `${assigneeMention}, ${link} is assigned to you and still *To Do* after ${days} working days. When do you plan to start?`;
         } else if (status === 'in progress') {
-          pingText =
-            `👋 ${assigneeMention} — checking in on <${item.jiraUrl}|${jiraKey}> (*In Progress*).\n` +
-            `Any updates, ETA, or blockers we should know about?`;
-        } else if (status === 'in review') {
-          pingText =
-            `👋 ${assigneeMention} — <${item.jiraUrl}|${jiraKey}> is *In Review*.\n` +
-            `Is the review complete? Please move it to *QA Ready* when done so QA can pick it up.`;
+          pingText = `${assigneeMention}, checking in on ${link} (*In Progress*, no update for ${days} working days). Any ETA or blockers?`;
+        } else {
+          pingText = `${assigneeMention}, ${link} has been *In Review* for ${days} working days. Once it's approved, please move it to *QA Ready* so QA can pick it up.`;
         }
+        // Repeated silence → loop in the squad lead
+        if (escalate) pingText += `\n_No response after ${item.nudgeCount - 1} reminders — fyi ${smMention}_`;
 
-        await client.chat.postMessage({
-          channel: item.channelId, thread_ts: item.threadTs, unfurl_links: false,
-          text: pingText,
-        });
+        await post(pingText);
         item.lastPingAt = Date.now();
 
       } catch (err) {
