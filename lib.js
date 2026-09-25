@@ -52,6 +52,14 @@ let _useMaxCompletionTokens = false;
 let _stripResponseFormat = false;
 let _stripReasoningEffort = false;
 
+// Bulk-model circuit breaker: if the "fast" fallback model keeps timing
+// out (gpt-5.6-luna ran >60s on the analysis even at low effort, while the
+// smart model answered quickly), route bulk calls to the smart model for a
+// while, then try the fallback model again.
+let _bulkTimeouts = 0;
+let _bulkSlowUntil = 0;
+const BULK_BREAKER_MS = parseInt(process.env.OPENAI_BULK_BREAKER_MS || String(30 * 60 * 1000), 10);
+
 // Reasoning models (gpt-5.x / gpt-6 on the gateway) think before answering;
 // at the default effort a big prompt like the report analysis took >45s.
 // Bulk/fallback work (analysis, parsing, translation) needs little
@@ -99,15 +107,20 @@ async function aiComplete(paramsIn) {
             : params.model === 'gpt-4o-mini' ? FALLBACK_MODEL
             : params.model;
   if (_smartModelBroken && model !== FALLBACK_MODEL) model = FALLBACK_MODEL;
+  const isBulkCall = model === FALLBACK_MODEL;
+  if (isBulkCall && !_smartModelBroken && SMART_MODEL !== FALLBACK_MODEL && Date.now() < _bulkSlowUntil) {
+    model = SMART_MODEL;                          // breaker open: skip the slow model
+    params = { ...params, reasoning_effort: params.reasoning_effort || BULK_EFFORT || undefined };
+  }
 
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 4; attempt++) {
     const t0 = Date.now();
     const sysLen = (params.messages?.[0]?.content || '').length;
     const usrLen = (params.messages?.[params.messages.length - 1]?.content || '').length;
     console.log(`[AI] → ${model} max_tokens=${params.max_tokens || '-'} json=${!!params.response_format} tools=${params.tools ? params.tools.length : 0} sys=${sysLen}c user=${usrLen}c`);
     const heartbeat = setInterval(() => console.log(`[AI] … still waiting on ${model} (${Math.round((Date.now() - t0) / 1000)}s)`), 20000);
     try {
-      const { __timeoutMs, __jsonWordRetried, ...callParams } = params;
+      const { __timeoutMs, __jsonWordRetried, __slowRetried, ...callParams } = params;
       if (!callParams.reasoning_effort && !_stripReasoningEffort) {
         const eff = model === FALLBACK_MODEL ? BULK_EFFORT : SMART_EFFORT;
         if (eff) callParams.reasoning_effort = eff;
@@ -115,13 +128,25 @@ async function aiComplete(paramsIn) {
       const res = await openai.chat.completions.create({ ..._adaptParams(callParams), model }, { timeout: __timeoutMs || AI_TIMEOUT_MS });
       clearInterval(heartbeat);
       console.log(`[AI] ← ${model} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      if (model === FALLBACK_MODEL) _bulkTimeouts = 0;
       return res;
     } catch (err) {
       clearInterval(heartbeat);
       const elapsed = Date.now() - t0;
       const isTimeout = err?.name === 'APIConnectionTimeoutError' || /timed?\s?out/i.test(`${err?.message || ''}`);
       if (isTimeout) {
-        if (model !== FALLBACK_MODEL) {
+        if (model === FALLBACK_MODEL && !_smartModelBroken && SMART_MODEL !== FALLBACK_MODEL && !params.__slowRetried) {
+          _bulkTimeouts++;
+          if (_bulkTimeouts >= 2 && Date.now() >= _bulkSlowUntil) {
+            _bulkSlowUntil = Date.now() + BULK_BREAKER_MS;
+            console.warn(`[AI] ${FALLBACK_MODEL} timed out ${_bulkTimeouts}x — routing bulk calls to ${SMART_MODEL} for ${Math.round(BULK_BREAKER_MS / 60000)} min`);
+          }
+          console.warn(`[AI] ${model} timed out after ${(elapsed / 1000).toFixed(0)}s — retrying once on ${SMART_MODEL}`);
+          params = { ...params, __slowRetried: true, reasoning_effort: params.reasoning_effort || BULK_EFFORT || undefined };
+          model = SMART_MODEL;
+          continue;
+        }
+        if (model !== FALLBACK_MODEL && !params.__slowRetried) {
           console.warn(`[AI] ${model} timed out after ${(elapsed / 1000).toFixed(0)}s — retrying on ${FALLBACK_MODEL}`);
           model = FALLBACK_MODEL;
           continue;
