@@ -43,13 +43,22 @@ function getOpenAI() {
 }
 const SMART_MODEL    = process.env.OPENAI_SMART_MODEL    || 'gpt-4o';
 // One-line env truth at boot — ends 'which model/endpoint am I actually on?'
-console.log(`[Boot] AI endpoint=${process.env.OPENAI_BASE_URL ? new URL(process.env.OPENAI_BASE_URL).host : 'api.openai.com'} smart=${process.env.OPENAI_SMART_MODEL || 'gpt-4o'} fallback=${process.env.OPENAI_FALLBACK_MODEL || 'gpt-4o-mini'} timeout=${process.env.OPENAI_TIMEOUT_MS || '90000'}ms key=${(process.env.OPENAI_API_KEY || '').slice(0, 6)}…`);
+console.log(`[Boot] AI endpoint=${process.env.OPENAI_BASE_URL ? new URL(process.env.OPENAI_BASE_URL).host : 'api.openai.com'} smart=${process.env.OPENAI_SMART_MODEL || 'gpt-4o'} fallback=${process.env.OPENAI_FALLBACK_MODEL || 'gpt-4o-mini'} timeout=${process.env.OPENAI_TIMEOUT_MS || '90000'}ms effort(bulk/smart)=${process.env.OPENAI_BULK_EFFORT || 'low'}/${process.env.OPENAI_SMART_EFFORT || 'default'} key=${(process.env.OPENAI_API_KEY || '').slice(0, 6)}…`);
 const FALLBACK_MODEL = process.env.OPENAI_FALLBACK_MODEL || 'gpt-4o-mini';
 let _smartModelBroken = false;
 
 // Gateway quirk flags — learned once, applied to all subsequent calls
 let _useMaxCompletionTokens = false;
 let _stripResponseFormat = false;
+let _stripReasoningEffort = false;
+
+// Reasoning models (gpt-5.x / gpt-6 on the gateway) think before answering;
+// at the default effort a big prompt like the report analysis took >45s.
+// Bulk/fallback work (analysis, parsing, translation) needs little
+// thinking — run it at LOW effort. Smart calls keep their default unless
+// configured. Both are tunable in Railway without a code change.
+const BULK_EFFORT  = process.env.OPENAI_BULK_EFFORT  || 'low';
+const SMART_EFFORT = process.env.OPENAI_SMART_EFFORT || '';
 
 function _adaptParams(params) {
   const p = { ...params };
@@ -74,6 +83,7 @@ function _adaptParams(params) {
     delete p.max_tokens;
   }
   if (_stripResponseFormat) delete p.response_format;
+  if (_stripReasoningEffort) delete p.reasoning_effort;
   return p;
 }
 
@@ -98,6 +108,10 @@ async function aiComplete(paramsIn) {
     const heartbeat = setInterval(() => console.log(`[AI] … still waiting on ${model} (${Math.round((Date.now() - t0) / 1000)}s)`), 20000);
     try {
       const { __timeoutMs, __jsonWordRetried, ...callParams } = params;
+      if (!callParams.reasoning_effort && !_stripReasoningEffort) {
+        const eff = model === FALLBACK_MODEL ? BULK_EFFORT : SMART_EFFORT;
+        if (eff) callParams.reasoning_effort = eff;
+      }
       const res = await openai.chat.completions.create({ ..._adaptParams(callParams), model }, { timeout: __timeoutMs || AI_TIMEOUT_MS });
       clearInterval(heartbeat);
       console.log(`[AI] ← ${model} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -119,6 +133,12 @@ async function aiComplete(paramsIn) {
       if (!_useMaxCompletionTokens && /max_tokens.*not supported|use ['"]?max_completion_tokens/i.test(msg)) {
         _useMaxCompletionTokens = true;
         console.warn('[AI] Endpoint wants max_completion_tokens — adapting all calls.');
+        continue;
+      }
+      // Non-reasoning model / gateway rejects reasoning_effort → stop sending it
+      if (!_stripReasoningEffort && /reasoning_effort|reasoning\.effort/i.test(msg)) {
+        _stripReasoningEffort = true;
+        console.warn('[AI] Endpoint rejects reasoning_effort — dropping it for all calls.');
         continue;
       }
       // Endpoint demands the literal word 'json' in the messages: inject it

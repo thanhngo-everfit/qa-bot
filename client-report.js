@@ -905,7 +905,7 @@ Do NOT include the Slack thread link in the description — it is appended autom
     systemPrompt, userContent,
     userDirective ? 6000 : 2500, true,
     userDirective ? 'gpt-4o' : 'gpt-4o-mini',
-    userDirective ? null : 45000,
+    userDirective ? null : 60000,
   ); // jsonMode
 
   // Robust JSON extraction: strip fences, then take first { … last }
