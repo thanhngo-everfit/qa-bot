@@ -1522,11 +1522,6 @@ const coreMentionHandler = async ({ event, client, logger }) => {
   // Monitored (client-report) channels own their specialised flows —
   // EXCEPT ticket creation, which runs through this one proven pipeline in
   // every channel. Same prompt, same parsers, same behavior everywhere.
-  if (clientReport.MONITORED_CHANNELS[event.channel] && !lib.isCreationRequest(event.text) && !lib.isDiscoveryRequest(event.text)) return;
-  if (clientReport.MONITORED_CHANNELS[event.channel]) {
-    logger.info(`[QAAgent] Creation request in monitored channel ${clientReport.MONITORED_CHANNELS[event.channel]} — using core pipeline`);
-  }
-
   // Health self-report: '@QA Agent status' / 'are you alive'
   if (/^(status|health|are you (alive|ok|up)|ping)\b/i.test((event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim())) {
     const up = Math.round((Date.now() - BOOT_AT) / 1000);
@@ -1543,6 +1538,12 @@ const coreMentionHandler = async ({ event, client, logger }) => {
     });
     return;
   }
+
+  if (clientReport.MONITORED_CHANNELS[event.channel] && !lib.isCreationRequest(event.text) && !lib.isDiscoveryRequest(event.text)) return;
+  if (clientReport.MONITORED_CHANNELS[event.channel]) {
+    logger.info(`[QAAgent] Creation request in monitored channel ${clientReport.MONITORED_CHANNELS[event.channel]} — using core pipeline`);
+  }
+
 
   // Post the live status FIRST — before auth.test / thread reads — so a
   // silent thread always means "the handler never ran" (event not

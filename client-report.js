@@ -955,7 +955,7 @@ Do NOT include the Slack thread link in the description — it is appended autom
     try {
       englishTitle = (await aiCall(
         'Rewrite this bug report snippet as ONE short English ticket title (max 12 words). Output plain text only — no quotes, no brackets, English only.',
-        firstLine, 60
+        firstLine, 60, false, 'gpt-4o-mini', 20000
       )).trim().replace(/^["'\s]+|["'\s]+$/g, '').substring(0, 90) || firstLine;
     } catch (_) {}
 
@@ -988,6 +988,29 @@ Do NOT include the Slack thread link in the description — it is appended autom
 // Analysis reply as Block Kit: the same text (kept in `text` too, so every
 // parser that reads bot replies keeps working) plus an Assign button that
 // opens a member picker and creates + assigns the Jira card.
+// Run the analysis under a hard budget. If it overruns or fails, post a
+// minimal reply that still carries the Assign button — the team can act
+// even when the AI endpoint is slow.
+async function analyzeWithBudget(context, slackThreadUrl, budgetMs = 100000) {
+  const t0 = Date.now();
+  try {
+    const out = await Promise.race([
+      analyzeThread(context, slackThreadUrl),
+      new Promise((_, rej) => setTimeout(() => rej(new Error(`analysis exceeded ${budgetMs / 1000}s`)), budgetMs)),
+    ]);
+    console.log(`[Bot] Analysis done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    return { analysis: out, degraded: null };
+  } catch (err) {
+    console.warn(`[Bot] Analysis failed after ${((Date.now() - t0) / 1000).toFixed(1)}s: ${err.message}`);
+    return { analysis: null, degraded: err.message };
+  }
+}
+
+function degradedAnalysisText(reason) {
+  return `I couldn't complete the analysis this time (${reason.substring(0, 120)}).\n\n` +
+         `You can still assign it below, or tag me with _"analyze"_ to retry.`;
+}
+
 function analysisBlocks(text, channelId, threadTs) {
   const blocks = [];
   let chunk = '';
@@ -1693,7 +1716,8 @@ const crMentionHandler = async ({ event, client, logger }) => {
   // channels — one prompt, one mechanism, no parity drift. This module
   // keeps what it uniquely owns: auto-analysis, follow-ups, weekly
   // reports, troubleshooting, reassignment, retraction.
-  if (isCreationRequest(event.text) || isDiscoveryRequest(event.text)) {
+  if (isCreationRequest(event.text) || isDiscoveryRequest(event.text)
+      || /^(status|health|are you (alive|ok|up)|ping)\b/i.test((event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim())) {
     logger.info('[Bot] Creation/discovery request → deferring to core pipeline');
     return;
   }
@@ -1856,7 +1880,14 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
     if (doAnalyze) {
       await agentSt.start('⏳ _Dispatching to QA Agent — analyzing this thread…_');
       logger.info('[Bot] Analyze triggered manually');
-      const analysis = await analyzeThread(context, slackThreadUrl);
+      const { analysis, degraded } = await analyzeWithBudget(context, slackThreadUrl);
+      if (!analysis) {
+        await agentSt.done();
+        const t = degradedAnalysisText(degraded);
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, unfurl_links: false, text: t, blocks: analysisBlocks(t, event.channel, threadTs) });
+        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+        return;
+      }
       const squad    = analysis.tickets[0]?.squad || detectSquadFromKeywords(context);
       const contacts = resolveContactMentions(squad ? getSquadContacts(squad) : null);
       // The reporter is whoever started the thread (not whoever typed 'analyze')
@@ -2615,7 +2646,14 @@ const autoAnalysisHandler = withWatchdog('auto-analysis', async ({ event, client
     const context = text;
 
     await status.update('🧠 _QA Agent is analyzing the report…_');
-    const analysis = await analyzeThread(context, slackThreadUrl);
+    const { analysis, degraded } = await analyzeWithBudget(context, slackThreadUrl);
+    if (!analysis) {
+      await status.done();
+      const t = degradedAnalysisText(degraded);
+      await client.chat.postMessage({ channel: event.channel, thread_ts: event.ts, unfurl_links: false, text: t, blocks: analysisBlocks(t, event.channel, event.ts) });
+      await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+      return;
+    }
     logger.info(`[Bot] Auto-analyze: Severity=${analysis.severity}`);
 
     const squad    = analysis.tickets[0]?.squad || detectSquadFromKeywords(context);
