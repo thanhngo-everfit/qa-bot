@@ -472,27 +472,33 @@ async function versionCheck(client = null) {
       for (const n of r.names) if (!shippedByName.has(n.toLowerCase())) shippedByName.set(n.toLowerCase(), r);
     }
   }
-  const handled = new Set();
+  // Card counts run in parallel (8 at a time). UP has years of old versions
+  // that were never released or archived; checking them one by one took
+  // minutes. Versions dated more than STALE_DAYS ago are summarised as a
+  // count instead of checked individually.
+  const STALE_DAYS = parseInt(process.env.VERSION_CHECK_STALE_DAYS || '120', 10);
+  const staleBefore = isoDay(new Date(vnNow().getTime() - STALE_DAYS * 86400 * 1000));
+  const jobs = [];
+  flags.stale = 0;
   for (const v of versions) {
     const r = shippedByName.get((v.name || '').trim().toLowerCase());
-    if (!r) continue;
-    const c = await hasCards(v.id);
-    flags.shipped.push({ id: String(v.id), name: v.name, date: v.releaseDate || null, cards: c.more ? `${c.n}+` : String(c.n),
-                         shippedDay: r.day, by: r.by, link: r.link });
-    handled.add(String(v.id));
-  }
-  for (const v of versions) {
-    if (handled.has(String(v.id))) continue;
+    if (r) { jobs.push({ v, kind: 'shipped', r }); continue; }
     const draft = !isRealVersionName(v.name);
     const overdue = !!v.releaseDate && v.releaseDate < today;
     const noDate = !v.releaseDate;
     if (!draft && !overdue && !noDate) continue;
-    const c = await hasCards(v.id);
-    if (!c.n) continue;                                        // empty versions aren't worth anyone's time
+    if (overdue && !draft && v.releaseDate < staleBefore) { flags.stale++; continue; }
+    jobs.push({ v, kind: draft ? 'draft' : overdue ? 'overdue' : 'noDate' });
+  }
+  for (let i = 0; i < jobs.length; i += 8) {
+    await Promise.all(jobs.slice(i, i + 8).map(async (j) => { j.c = await hasCards(j.v.id); }));
+  }
+  for (const j of jobs) {
+    const { v, c } = j;
     const entry = { id: String(v.id), name: v.name, date: v.releaseDate || null, cards: c.more ? `${c.n}+` : String(c.n) };
-    if (draft) flags.draft.push(entry);
-    else if (overdue) flags.overdue.push(entry);
-    else flags.noDate.push(entry);
+    if (j.kind === 'shipped') { flags.shipped.push({ ...entry, shippedDay: j.r.day, by: j.r.by, link: j.r.link }); continue; }
+    if (!c.n) continue;                                        // empty versions aren't worth anyone's time
+    flags[j.kind].push(entry);
   }
   flags.overdue.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
   return flags;
@@ -518,6 +524,7 @@ function renderVersionCheck(flags) {
     section('Release date passed', 'still not marked released in Jira — release it, or move the date', flags.overdue),
     section('No release date', 'cards are assigned but the version has no date', flags.noDate),
   ].filter(Boolean);
+  if (flags.stale) parts.push(`_Also ${flags.stale} version${flags.stale > 1 ? 's' : ''} dated over 4 months ago never released or archived — worth a clean-up in Jira._`);
   return parts.join('\n\n');
 }
 
@@ -534,6 +541,7 @@ async function alertVersionIssues(client, { force = false, channel = RELEASE_REV
   // Age each finding; forget ones that got fixed
   const live = new Set();
   for (const [kind, list] of Object.entries(flags)) {
+    if (!Array.isArray(list)) continue;                       // e.g. the stale count
     for (const e of list) {
       const k = `${e.id}:${kind}`;
       live.add(k);
@@ -680,10 +688,30 @@ function isReleaseCommand(text) { const t = (text || '').replace(/<@[A-Z0-9]+>/g
 
 async function handleCommand({ event, client, logger }) {
   const tTs = event.thread_ts || event.ts;
-  if (isVersionCheckCommand(event.text)) {
-    await alertVersionIssues(client, { force: true, channel: event.channel, threadTs: tTs });
-    return;
+  // A live status (tracked, so a restart mid-way posts "please retry") and
+  // an answer on every path — a failure must never be silent.
+  const st = lib.agentStatus(client, event.channel, tTs);
+  const t0 = Date.now();
+  try {
+    if (isVersionCheckCommand(event.text)) {
+      await st.start("I'm checking the fix versions in Jira");
+      await alertVersionIssues(client, { force: true, channel: event.channel, threadTs: tTs });
+      await st.done();
+      logger?.info?.(`[Release] version check done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      return;
+    }
+    await st.start("I'm drafting the release from Jira");
+    await handleDraftCommand({ event, client, logger, tTs });
+    await st.done();
+  } catch (err) {
+    await st.done();
+    logger?.warn?.('[Release] command failed:', err?.stack || err);
+    await client.chat.postMessage({ channel: event.channel, thread_ts: tTs,
+      text: `I couldn't finish that: \`${(err?.response?.status ? `Jira ${err.response.status}` : err?.message || 'unknown error').substring(0, 200)}\`` }).catch(() => {});
   }
+}
+
+async function handleDraftCommand({ event, client, logger, tTs }) {
   const text = (event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim();
   const vMatch = text.match(/\b((?:iOS|Android)\s+(?:Coach|Client)|Internal API|Academy\s+(?:Web|CMS)|Web Challenger|API|Web|CMS)\s+(\d+(?:\.\d+){1,3})\b/i);
   let groups;
