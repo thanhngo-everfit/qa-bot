@@ -271,6 +271,28 @@ function renderAnnouncement(d) {
   return lines.join('\n');
 }
 
+// Drafts must never notify anyone: show group and people tags as plain
+// text. Only the approved post (renderAnnouncement) carries real mentions.
+let _groupHandles = null;
+async function groupHandles(client) {
+  if (_groupHandles) return _groupHandles;
+  _groupHandles = {};
+  try {
+    const res = await client.usergroups.list({ include_disabled: false });
+    for (const g of res.usergroups || []) _groupHandles[g.id] = g.handle || g.name;
+  } catch (_) { /* needs usergroups:read — fall back to a generic label */ }
+  return _groupHandles;
+}
+async function neutralize(client, text) {
+  const handles = await groupHandles(client);
+  const uids = [...new Set([...(text || '').matchAll(/<@([A-Z0-9]+)>/g)].map(m => m[1]))];
+  await lib.warmUserNames(client, uids).catch(() => {});
+  return (text || '')
+    .replace(/<!subteam\^([A-Z0-9]+)(?:\|([^>]*))?>/g, (m, id, label) => `\`@${(label || handles[id] || 'group').replace(/^@/, '')}\``)
+    .replace(/<@([A-Z0-9]+)(?:\|[^>]*)?>/g, (m, id) => lib.replaceMentionsCached(`<@${id}>`))
+    .replace(/<!(here|channel|everyone)>/g, '`@$1`');
+}
+
 function renderReadiness(d) {
   if (!d.total) return '_No cards in this version yet._';
   const ready = d.total - d.notReady.length;
@@ -280,7 +302,7 @@ function renderReadiness(d) {
 }
 
 // ── Draft state + approval ───────────────────────────────────────────
-const DRAFTS    = new Map();   // draftId → { d, dmChannel, dmTs, groupKey }
+const DRAFTS    = new Map();   // draftId → { d, channel, threadTs, ts, groupKey }
 const ANNOUNCED = new Map();   // groupKey → { ts, versionIds, releaseDate }
 const SKIPPED   = new Set();   // groupKey (for this process life)
 const REMINDED  = new Set();
@@ -292,9 +314,9 @@ function draftBlocks(id, d) {
   if (mobile && !d.notes) missing.push('release notes');
   if (mobile && !d.force) missing.push('force/optional update');
   const blocks = [
-    { type: 'section', text: { type: 'mrkdwn', text: `*Release draft — ${d.group.family} · ${d.group.releaseDate ? prettyDate(d.group.releaseDate) : 'no date'}*\nNot posted yet. Review, then approve to post in <#${RELEASE_CHANNEL}>.` } },
-    { type: 'section', text: { type: 'mrkdwn', text: renderAnnouncement(d).substring(0, 2900) } },
-    { type: 'section', text: { type: 'mrkdwn', text: renderReadiness(d).substring(0, 2900) } },
+    { type: 'section', text: { type: 'mrkdwn', text: `*Release draft — ${d.group.family} · ${d.group.releaseDate ? prettyDate(d.group.releaseDate) : 'no date'}*\nNot posted yet — nobody has been notified. Approve to post it in <#${RELEASE_CHANNEL}>.${d.note ? `\n_${d.note}_` : ''}` } },
+    { type: 'section', text: { type: 'mrkdwn', text: (d._preview || '').substring(0, 2900) } },
+    { type: 'section', text: { type: 'mrkdwn', text: (d._readinessPreview || '').substring(0, 2900) } },
   ];
   for (const c of d.candidates || []) {
     const list = c.issues.slice(0, 10).map(i => `• <${JIRA_HOST}/browse/${i.key}|${i.key}> ${lib.postLabel(i.fields?.summary || '')}`).join('\n');
@@ -318,29 +340,30 @@ function draftBlocks(id, d) {
   return blocks;
 }
 
-async function sendDraft(client, d, logger = console) {
+async function prepPreview(client, d) {
+  d._preview = await neutralize(client, renderAnnouncement(d));
+  d._readinessPreview = await neutralize(client, renderReadiness(d));
+}
+
+// A draft is a REPLY in a thread (the requester's message, or the daily
+// review thread) — never a top-level post and never a DM.
+async function sendDraft(client, d, { channel, threadTs }) {
   const id = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
-  let dmChannel = null;
-  try {
-    dmChannel = (await client.conversations.open({ users: RELEASE_APPROVERS.join(',') })).channel?.id || null;
-  } catch (err) {
-    logger.warn?.('[Release] Could not open a DM with the approver (needs im:write):', err.data?.error || err.message);
-  }
-  const target = dmChannel || RELEASE_CHANNEL;
+  await prepPreview(client, d);
   const res = await client.chat.postMessage({
-    channel: target, unfurl_links: false, unfurl_media: false,
+    channel, thread_ts: threadTs, unfurl_links: false, unfurl_media: false,
     text: `Release draft — ${d.group.family} ${d.group.releaseDate || ''}`,
-    blocks: dmChannel ? draftBlocks(id, d)
-      : [{ type: 'context', elements: [{ type: 'mrkdwn', text: `Draft for ${RELEASE_APPROVERS.map(u => `<@${u}>`).join(' ')} — I couldn't DM you (add the im:write scope), so it's here.` }] }, ...draftBlocks(id, d)],
+    blocks: draftBlocks(id, d),
   });
-  DRAFTS.set(id, { d, dmChannel: target, dmTs: res.ts, groupKey: d.group.key });
+  DRAFTS.set(id, { d, channel, threadTs, ts: res.ts, groupKey: d.group.key });
   return id;
 }
 
 async function refreshDraft(client, id) {
   const st = DRAFTS.get(id);
   if (!st) return;
-  await client.chat.update({ channel: st.dmChannel, ts: st.dmTs, text: 'Release draft', blocks: draftBlocks(id, st.d) }).catch(() => {});
+  await prepPreview(client, st.d);
+  await client.chat.update({ channel: st.channel, ts: st.ts, text: 'Release draft', blocks: draftBlocks(id, st.d) }).catch(() => {});
 }
 
 // Has anyone (a PC) already announced this version in the channel?
@@ -360,16 +383,23 @@ async function alreadyAnnouncedInChannel(client, group) {
 // ── Scheduled work ───────────────────────────────────────────────────
 async function draftUpcoming(client, logger = console) {
   const groups = await upcomingGroups();
-  let sent = 0;
+  const ready = [];
   for (const g of groups) {
     if (ANNOUNCED.has(g.key) || SKIPPED.has(g.key)) continue;
     if ([...DRAFTS.values()].some(s => s.groupKey === g.key)) continue;
     if (await alreadyAnnouncedInChannel(client, g)) { ANNOUNCED.set(g.key, { ts: null, versionIds: g.versions.map(v => v.id), releaseDate: g.releaseDate, byPC: true }); continue; }
     const d = await buildDraft(client, g);
-    await sendDraft(client, d, logger);
-    sent++;
+    if (!d.total) continue;                               // empty in UP (e.g. another team's version) → nothing to release
+    ready.push(d);
   }
-  if (sent) logger.info?.(`[Release] Sent ${sent} release draft(s) for approval`);
+  if (!ready.length) return;
+  // One short top-level message for the approver; every draft lives in its thread
+  const head = await client.chat.postMessage({
+    channel: RELEASE_CHANNEL, unfurl_links: false,
+    text: `${RELEASE_APPROVERS.map(u => `<@${u}>`).join(' ')} ${ready.length} release draft${ready.length > 1 ? 's are' : ' is'} ready for your review in this thread — nothing is posted until you approve.`,
+  });
+  for (const d of ready) await sendDraft(client, d, { channel: RELEASE_CHANNEL, threadTs: head.ts });
+  logger.info?.(`[Release] Sent ${ready.length} release draft(s) for approval`);
 }
 
 async function remindPending(client) {
@@ -380,8 +410,8 @@ async function remindPending(client) {
     const mobile = isMobileFamily(st.d.group.family);
     const missing = [mobile && !st.d.notes ? 'release notes' : null, mobile && !st.d.force ? 'force/optional update' : null].filter(Boolean);
     await client.chat.postMessage({
-      channel: st.dmChannel, thread_ts: st.dmTs,
-      text: `Reminder: the ${st.d.group.family} release (${prettyDate(st.d.group.releaseDate)}) is tomorrow and this draft isn't approved yet${missing.length ? ` — still TBD: ${missing.join(', ')}` : ''}.`,
+      channel: st.channel, thread_ts: st.threadTs,
+      text: `${RELEASE_APPROVERS.map(u => `<@${u}>`).join(' ')} reminder: the ${st.d.group.family} release (${prettyDate(st.d.group.releaseDate)}) is tomorrow and this draft isn't approved yet${missing.length ? ` — still TBD: ${missing.join(', ')}` : ''}.`,
     }).catch(() => {});
   }
 }
@@ -465,9 +495,12 @@ async function handleCommand({ event, client, logger }) {
       text: vMatch ? `I couldn't find an unreleased version named ${vMatch[1]} ${vMatch[2]}.` : `No releases scheduled in the next ${LOOKAHEAD_WORKDAYS} working days.` });
     return;
   }
-  for (const g of groups) await sendDraft(client, await buildDraft(client, g), logger);
-  await client.chat.postMessage({ channel: event.channel, thread_ts: tTs,
-    text: `Drafted ${groups.length} release announcement(s) — sent to ${RELEASE_APPROVERS.map(u => `<@${u}>`).join(' ')} for approval.` });
+  for (const g of groups) {
+    const d = await buildDraft(client, g);
+    if (!d.total) d.note = `${g.versions.map(v => v.name).join(' / ')} has no cards in ${RELEASE_PROJECT} — it may belong to another team's project (e.g. PAY), or cards aren't assigned to it yet.`;
+    else if (await alreadyAnnouncedInChannel(client, g)) d.note = 'This version already appears in a release post in the channel — check before posting it again.';
+    await sendDraft(client, d, { channel: event.channel, threadTs: tTs });
+  }
 }
 
 // ── Interactions ─────────────────────────────────────────────────────
@@ -525,7 +558,7 @@ function register(slackApp) {
     fresh.force = st.d.force; fresh.notes = st.d.notes;
     st.d = fresh;
     await refreshDraft(client, id);
-    await client.chat.postMessage({ channel: st.dmChannel, thread_ts: st.dmTs,
+    await client.chat.postMessage({ channel: st.channel, thread_ts: st.ts,
       text: `Moved ${moved.length} card(s) to ${cand.versionName}${moved.length ? `: ${moved.join(', ')}` : ''}${failed.length ? `\nCouldn't move: ${failed.join(', ')}` : ''}` }).catch(() => {});
   });
 
@@ -533,10 +566,13 @@ function register(slackApp) {
     await ack();
     const id = body.actions?.[0]?.value;
     const st = DRAFTS.get(id);
-    if (!st) return;
+    if (!st) {                                            // expired (restart) → just remove the draft
+      await client.chat.delete({ channel: body.channel.id, ts: body.message.ts }).catch(() => {});
+      return;
+    }
     SKIPPED.add(st.groupKey);
     DRAFTS.delete(id);
-    await client.chat.update({ channel: st.dmChannel, ts: st.dmTs, text: 'Skipped',
+    await client.chat.update({ channel: st.channel, ts: st.ts, text: 'Skipped',
       blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `Skipped — the ${st.d.group.family} release draft wasn't posted.` } }] }).catch(() => {});
   });
 
@@ -545,7 +581,8 @@ function register(slackApp) {
     const id = body.actions?.[0]?.value;
     const st = DRAFTS.get(id);
     if (!st) {
-      await client.chat.postMessage({ channel: body.channel.id, text: 'That draft expired (I restarted). Ask me to "draft release for <version>" again.' }).catch(() => {});
+      await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.thread_ts || body.message.ts,
+        text: 'That draft expired (I restarted), so I didn\'t post it. Ask me to "draft release for <version>" again — or press Skip to remove it.' }).catch(() => {});
       return;
     }
     if (!RELEASE_APPROVERS.includes(body.user?.id)) return;
@@ -557,7 +594,7 @@ function register(slackApp) {
       versionNames: Object.fromEntries(fresh.perVersion.map(v => [String(v.id), v.name])) });
     DRAFTS.delete(id);
     const link = `https://everfitt.slack.com/archives/${RELEASE_CHANNEL}/p${posted.ts.replace('.', '')}`;
-    await client.chat.update({ channel: st.dmChannel, ts: st.dmTs, text: 'Posted',
+    await client.chat.update({ channel: st.channel, ts: st.ts, text: 'Posted',
       blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `Posted the ${fresh.group.family} release to <#${RELEASE_CHANNEL}> — <${link}|view>. I'll post readiness in its thread each morning until release day.` } }] }).catch(() => {});
     logger?.info?.(`[Release] Approved and posted ${st.groupKey}`);
   });
@@ -567,5 +604,5 @@ module.exports = {
   register, startScheduler, isReleaseCommand, handleCommand,
   // exported for tests
   versionFamily, upcomingWorkdays, itemLabel, renderAnnouncement, renderReadiness, buildDraft, upcomingGroups,
-  versionTagRegex, findCandidates, moveToVersion, PLACEHOLDER_VERSION_IDS,
+  versionTagRegex, findCandidates, moveToVersion, PLACEHOLDER_VERSION_IDS, draftUpcoming,
 };
