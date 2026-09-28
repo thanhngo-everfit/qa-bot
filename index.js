@@ -1587,6 +1587,38 @@ const coreMentionHandler = async ({ event, client, logger }) => {
     return;
   }
 
+  // Report: "which threads have no ticket?" — read-only, anyone can ask.
+  if (lib.isNoTicketReportRequest(event.text)) {
+    const tTs = event.thread_ts || event.ts;
+    const daysMatch = (event.text || '').match(/\b(\d{1,3})\s*(?:days?|ngày)\b/i);
+    const days = daysMatch ? Math.min(parseInt(daysMatch[1], 10), 365) : 120;
+    const st = agentStatus(client, event.channel, tTs);
+    await st.start("I'm checking this channel's issue posts against Jira");
+    try {
+      const botUserId = (await client.auth.test()).user_id;
+      const r = await lib.findThreadsWithoutTickets(client, event.channel, { days, botUserId });
+      await st.done();
+      const link = (ts) => `https://everfitt.slack.com/archives/${event.channel}/p${ts.replace('.', '')}`;
+      const date = (ts) => new Date(parseFloat(ts) * 1000 + 7 * 3600 * 1000).toISOString().substring(0, 10);
+      const firstLine = (t) => t.replace(/<!subteam\^[A-Z0-9]+(\|[^>]*)?>/g, '').replace(/<@[A-Z0-9]+(\|[^>]*)?>/g, '')
+        .replace(/<(https?:[^|>]+)(\|[^>]*)?>/g, '$1').replace(/\s+/g, ' ').trim().substring(0, 90);
+      const shown = r.missing.slice(0, 40);
+      const lines = shown.map(p => `• ${date(p.ts)} · <@${p.user}> · <${link(p.ts)}|${firstLine(p.text) || 'post'}>`).join('\n');
+      await client.chat.postMessage({
+        channel: event.channel, thread_ts: tTs, unfurl_links: false, unfurl_media: false,
+        text: r.missing.length === 0
+          ? `Every issue post from the last ${days} days has a ticket (${r.scanned} checked).`
+          : `*${r.missing.length}* of ${r.scanned} issue posts from the last ${days} days have no ticket:\n${lines}` +
+            (r.missing.length > shown.length ? `\n_…and ${r.missing.length - shown.length} more._` : '') +
+            `\n_Checked both ways: Jira cards linking back to the thread, and card keys or Jira links in the thread._`,
+      });
+    } catch (err) {
+      await st.done();
+      await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, text: `I couldn't finish the check: \`${(err.message || '').substring(0, 200)}\`` });
+    }
+    return;
+  }
+
   // Health self-report: '@QA Agent status' / 'are you alive'
   if (/^(status|health|are you (alive|ok|up)|ping)\b/i.test((event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim())) {
     const up = Math.round((Date.now() - BOOT_AT) / 1000);

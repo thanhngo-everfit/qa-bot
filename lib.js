@@ -785,6 +785,69 @@ async function transitionToStatus(issueKey, statusName) {
 // Cards are found by the channel id in their description (the Slack thread
 // link every card carries). Epics and sub-tasks can't take an epic parent,
 // so they're excluded. Paced to stay well inside Jira's rate limits.
+// ── Report: issue posts in a channel that never got a ticket ──────────
+// A post "has a ticket" if EITHER a Jira card links back to its thread
+// (the Slack link in the card's description — covers cards QA created by
+// hand) OR its thread mentions a card key / Jira link.
+const NO_TICKET_RE = /\b(?:threads?|posts?|issues?|reports?|messages?|bugs?)\b[\s\S]*?\b(?:without|no|missing|not have|don'?t have|doesn'?t have|haven'?t)\b[\s\S]*?\b(?:tickets?|cards?|jira)\b/i;
+function isNoTicketReportRequest(text) {
+  return NO_TICKET_RE.test((text || '').replace(/<@[A-Z0-9]+>/g, ''));
+}
+
+async function findThreadsWithoutTickets(client, channelId, { days = 120, botUserId = null } = {}) {
+  const oldest = String((Date.now() - days * 86400 * 1000) / 1000);
+  // 1) Top-level human posts that look like issue reports
+  const posts = [];
+  let cursor;
+  for (let page = 0; page < 20; page++) {
+    const res = await client.conversations.history({ channel: channelId, oldest, limit: 200, cursor });
+    for (const m of res.messages || []) {
+      if (m.bot_id || (m.subtype && m.subtype !== 'file_share')) continue;       // joins, bots, edits
+      const t = (m.text || '').trim();
+      if (t.length < 25) continue;                                               // "a huy nè", pings
+      if (botUserId && t.includes(`<@${botUserId}>`)) continue;                  // commands to the bot
+      if (/^~[\s\S]*~\s*(`?nab`?)?\s*$/i.test(t)) continue;                      // struck out / "NAB"
+      posts.push({ ts: m.ts, user: m.user, text: t, replies: m.reply_count || 0 });
+    }
+    cursor = res.response_metadata?.next_cursor;
+    if (!cursor) break;
+  }
+  // 2) Threads linked from Jira card descriptions
+  const linked = new Set();
+  let nextPageToken = null;
+  for (let page = 0; page < 10; page++) {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
+      params: { jql: `text ~ "${channelId}"`, maxResults: 100, fields: 'description', ...(nextPageToken ? { nextPageToken } : {}) },
+      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+    });
+    for (const i of res.data?.issues || []) {
+      const blob = JSON.stringify(i.fields?.description || '');
+      for (const m of blob.matchAll(/archives\/([A-Z0-9]+)\/p(\d{10})(\d{6})/g)) if (m[1] === channelId) linked.add(`${m[2]}.${m[3]}`);
+      for (const m of blob.matchAll(/thread_ts=(\d{10}\.\d{6})/g)) linked.add(m[1]);
+    }
+    nextPageToken = res.data?.nextPageToken || null;
+    if (!nextPageToken || res.data?.isLast) break;
+  }
+  // 3) Remaining posts: does the thread itself mention a card?
+  const KEY = /\b(?:UP|PAY|AIT|CHAL|PLAN)-\d+\b|atlassian\.net\/browse\//i;
+  const missing = [];
+  for (const p of posts) {
+    if (linked.has(p.ts)) continue;
+    if (KEY.test(p.text)) continue;
+    let found = false;
+    if (p.replies) {
+      try {
+        const rr = await client.conversations.replies({ channel: channelId, ts: p.ts, limit: 200 });
+        found = (rr.messages || []).some(m => KEY.test(m.text || '') ||
+          JSON.stringify(m.blocks || []).match(KEY) || (m.attachments || []).some(a => KEY.test(JSON.stringify(a))));
+      } catch (_) {}
+      await new Promise(r => setTimeout(r, 150));
+    }
+    if (!found) missing.push(p);
+  }
+  return { scanned: posts.length, linkedFromJira: linked.size, missing };
+}
+
 // "move all tickets from this channel to epic UP-x" (issues/cards/parent too)
 const BULK_MOVE_RE = /\bmove\b[\s\S]*?\b(?:tickets?|issues?|cards?)\b[\s\S]*?\bchannel\b[\s\S]*?\b(?:epic|parent)\s+((?:UP|PAY|AIT|CHAL)-\d+)\b/i;
 function isBulkMoveRequest(text) {
@@ -1134,6 +1197,7 @@ module.exports = {
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient, getIssueEpic,
   shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion, listOpenEpics, setIssueParent,
   getLastActiveSprint, getVersionName, getIssueTitle, bulkSetParentForChannel, BULK_MOVE_RE, isBulkMoveRequest,
+  isNoTicketReportRequest, findThreadsWithoutTickets,
   CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, challengerEpicFor, challengerSummary,
   LOW_PRIORITY_SPRINT_ID, LOW_PRIORITY_STATUS, LOW_PRIORITIES, LOW_PRIORITY_RULES, lowPriorityRule, getSprintInfo, transitionToStatus,
   PROJECT_BOARDS, getActiveSprintForProject,
