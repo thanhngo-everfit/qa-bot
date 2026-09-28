@@ -695,6 +695,43 @@ function challengerSummary(summary, platform) {
   return s.substring(0, 250);
 }
 
+// ── Low-priority UP cards → review sprint + "Need Review" ────────────
+// Low/Lowest priority cards in UP are parked for review instead of joining
+// the active sprint: they go to a dedicated sprint and the Need Review status.
+const LOW_PRIORITY_SPRINT_ID = process.env.LOW_PRIORITY_SPRINT_ID || '5097';
+const LOW_PRIORITY_STATUS    = process.env.LOW_PRIORITY_STATUS    || 'Need Review';
+const LOW_PRIORITIES         = new Set(['Low', 'Lowest']);
+
+const _sprintInfo = new Map();
+async function getSprintInfo(sprintId) {
+  if (!sprintId) return null;
+  const hit = _sprintInfo.get(String(sprintId));
+  if (hit && Date.now() - hit.at < 30 * 60 * 1000) return hit.info;
+  let info = null;
+  try {
+    const res = await axios.get(`${JIRA_HOST}/rest/agile/1.0/sprint/${sprintId}`, {
+      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+    });
+    info = { id: res.data?.id, name: res.data?.name || `Sprint ${sprintId}`, state: res.data?.state || 'unknown' };
+  } catch (err) {
+    console.warn(`[Sprint] ${sprintId} lookup failed:`, err.response?.status || err.message);
+  }
+  _sprintInfo.set(String(sprintId), { at: Date.now(), info });
+  return info;
+}
+
+// Move an issue to a status by NAME — transition ids differ per workflow.
+async function transitionToStatus(issueKey, statusName) {
+  const headers = { Authorization: jiraAuth(), Accept: 'application/json', 'Content-Type': 'application/json' };
+  const res = await axios.get(`${JIRA_HOST}/rest/api/3/issue/${issueKey}/transitions`, { headers });
+  const want = (statusName || '').trim().toLowerCase();
+  const t = (res.data?.transitions || []).find(x =>
+    (x.to?.name || '').toLowerCase() === want || (x.name || '').toLowerCase() === want);
+  if (!t) return { ok: false, reason: `no transition to "${statusName}"` };
+  await axios.post(`${JIRA_HOST}/rest/api/3/issue/${issueKey}/transitions`, { transition: { id: t.id } }, { headers });
+  return { ok: true, status: t.to?.name || statusName };
+}
+
 // ── Names for the ticket confirmation (cached) ───────────────────────
 let _lastSprint = null;
 function getLastActiveSprint() { return _lastSprint; }
@@ -1006,6 +1043,7 @@ module.exports = {
   shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion, listOpenEpics, setIssueParent,
   getLastActiveSprint, getVersionName, getIssueTitle,
   CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, challengerEpicFor, challengerSummary,
+  LOW_PRIORITY_SPRINT_ID, LOW_PRIORITY_STATUS, LOW_PRIORITIES, getSprintInfo, transitionToStatus,
   resolveUserName, resolveInlineMentions, warmUserNames, replaceMentionsCached, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
   slackify, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, clientReportSummary,

@@ -2155,9 +2155,28 @@ HARD RULES — follow exactly:
         }
       };
 
-      const sprintAdded = (sprintId && !projectRoute)
-        ? await withBudget('sprint add', 20000, () => addIssueToSprint(jira.key, sprintId), false)
+      // Low/Lowest priority UP cards are parked for review: the review
+      // sprint instead of the active sprint, then the Need Review status.
+      const isLowUp = targetProject === JIRA_PROJECT && lib.LOW_PRIORITIES.has(ticket.priority);
+      let cardSprintId = sprintId, cardSprintName = null, statusSet = null;
+      if (isLowUp) {
+        const info = await lib.getSprintInfo(lib.LOW_PRIORITY_SPRINT_ID);
+        if (info && info.state !== 'closed') {
+          cardSprintId = lib.LOW_PRIORITY_SPRINT_ID;
+          cardSprintName = info.name;
+        } else {
+          jira.notes = [...(jira.notes || []), `review sprint ${lib.LOW_PRIORITY_SPRINT_ID} is ${info ? 'closed' : 'unavailable'} — used the active sprint`];
+        }
+      }
+      const sprintAdded = (cardSprintId && !projectRoute)
+        ? await withBudget('sprint add', 20000, () => addIssueToSprint(jira.key, cardSprintId), false)
         : false;
+      if (isLowUp) {
+        const moved = await withBudget('status → ' + lib.LOW_PRIORITY_STATUS, 20000,
+          () => lib.transitionToStatus(jira.key, lib.LOW_PRIORITY_STATUS), { ok: false, reason: 'timed out' });
+        if (moved.ok) statusSet = moved.status;
+        else jira.notes = [...(jira.notes || []), `couldn't set status ${lib.LOW_PRIORITY_STATUS} (${moved.reason})`];
+      }
 
       // ── Feature 3: Add acceptance criteria checklist ──
       let acCount = 0;
@@ -2193,7 +2212,7 @@ HARD RULES — follow exactly:
         });
       }
 
-      createdJiras.push({ jira, ticket, assigneeSlackIds, uploaded, acCount, sprintAdded });
+      createdJiras.push({ jira, ticket, assigneeSlackIds, uploaded, acCount, sprintAdded, sprintNameOverride: sprintAdded ? cardSprintName : null, statusSet });
     }
 
     // ── Build Slack response ──────────────────
@@ -2209,7 +2228,8 @@ HARD RULES — follow exactly:
         epicKey:     a.epic || null,
         epicName:    a.epic ? await lib.getIssueTitle(a.epic) : null,
         versionName: a.fixVersionId ? await lib.getVersionName(a.fixVersionId) : null,
-        sprintName:  cj.sprintAdded ? (lib.getLastActiveSprint()?.name || 'Active Sprint') : null,
+        sprintName:  cj.sprintAdded ? (cj.sprintNameOverride || lib.getLastActiveSprint()?.name || 'Active Sprint') : null,
+        statusSet:   cj.statusSet || null,
         project:     cj.jira.key.split('-')[0],
       };
     }
@@ -2241,6 +2261,7 @@ HARD RULES — follow exactly:
           out.push(f.sprintName
             ? `*Sprint:* ${f.sprintName}`
             : `*Sprint:* ${f.project === 'CHAL' ? 'not added — planned on the Challenger board' : f.project && f.project !== JIRA_PROJECT ? `not added — ${f.project} triages it into its own sprint` : 'not added (no active sprint found)'}`);
+          if (f.statusSet) out.push(`*Status:* ${f.statusSet} (low priority — parked for review)`);
           const problems = (jira.notes || []).filter(n => n !== 'no epic set');
           if (problems.length) out.push(`_${problems.join(' · ')}_`);
           return out.join('\n');
