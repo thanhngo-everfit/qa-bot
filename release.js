@@ -136,6 +136,62 @@ async function slackIdForEmail(client, email) {
   try { return (await client.users.lookupByEmail({ email })).user?.id || null; } catch { return null; }
 }
 
+// ── Organizing fix versions ──────────────────────────────────────────
+// Verified cards (QA Success) often stay on a placeholder version and miss
+// the release. For each release version, find those whose title's platform
+// tag matches it. Only QA Success — nothing unverified is suggested.
+const PLACEHOLDER_VERSION_IDS = (process.env.PLACEHOLDER_VERSION_IDS || '12023,27643').split(',').map(s => s.trim());
+
+function versionTagRegex(versionName) {
+  const n = (versionName || '').toLowerCase();
+  if (/challenger/.test(n))        return null;                     // CHAL cards can't take UP versions
+  if (/^internal api\b/.test(n))   return /\[internal api\]/i;
+  if (/^academy\b/.test(n))        return /\[academy[^\]]*\]/i;
+  if (/^cms\b/.test(n))            return /\[cms\]/i;
+  if (/^ios coach\b/.test(n))      return /\[ios(?: coach(?:\/client)?| coach\/client)?\]/i;
+  if (/^ios client\b/.test(n))     return /\[ios(?: client| coach\/client)?\]/i;
+  if (/^android coach\b/.test(n))  return /\[android(?: coach(?:\/client)?)?\]/i;
+  if (/^android client\b/.test(n)) return /\[android(?: client| coach\/client)?\]/i;
+  if (/^api\b/.test(n))            return /\[(?:api|be|backend)\]/i;
+  if (/^web\b/.test(n))            return /\[(?:web|fe|frontend)\]/i;
+  return null;
+}
+
+async function findCandidates(perVersion) {
+  let pool = [];
+  try {
+    let nextPageToken = null;
+    for (let page = 0; page < 3; page++) {
+      const res = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
+        params: { jql: `project = ${RELEASE_PROJECT} AND fixVersion in (${PLACEHOLDER_VERSION_IDS.join(',')}) AND status = "QA Success" ORDER BY updated DESC`,
+                  maxResults: 100, fields: 'summary,fixVersions,assignee', ...(nextPageToken ? { nextPageToken } : {}) },
+        headers: headers(),
+      });
+      pool.push(...(res.data?.issues || []));
+      nextPageToken = res.data?.nextPageToken || null;
+      if (!nextPageToken || res.data?.isLast) break;
+    }
+  } catch (err) {
+    console.warn('[Release] candidate lookup failed:', err.response?.status || err.message);
+  }
+  return perVersion.map(v => {
+    const re = versionTagRegex(v.name);
+    const issues = re ? pool.filter(i => re.test(i.fields?.summary || '')) : [];
+    return { versionId: String(v.id), versionName: v.name, issues };
+  }).filter(c => c.issues.length);
+}
+
+// Put a card on a release version: drop placeholder versions, keep any
+// other real version it already has, add the target.
+async function moveToVersion(issueKey, versionId) {
+  const res = await axios.get(`${JIRA_HOST}/rest/api/3/issue/${issueKey}`, { params: { fields: 'fixVersions' }, headers: headers() });
+  const keep = (res.data?.fields?.fixVersions || [])
+    .filter(v => !PLACEHOLDER_VERSION_IDS.includes(String(v.id)) && !NOT_A_RELEASE.test(v.name || '') && String(v.id) !== String(versionId))
+    .map(v => ({ id: String(v.id) }));
+  await axios.put(`${JIRA_HOST}/rest/api/3/issue/${issueKey}`, { fields: { fixVersions: [...keep, { id: String(versionId) }] } },
+    { headers: { ...headers(), 'Content-Type': 'application/json' } });
+}
+
 // Build the whole draft for a group
 async function buildDraft(client, group) {
   const perVersion = [];
@@ -178,9 +234,10 @@ async function buildDraft(client, group) {
     notReadyLines.push(`• <${JIRA_HOST}/browse/${i.key}|${i.key}> ${i.fields?.status?.name || '?'} · ${id ? `<@${id}>` : (a?.displayName || 'unassigned')}`);
   }
 
+  const candidates = await findCandidates(perVersion);
   return {
     group, perVersion, itemsBySide: [...itemsBySide.entries()].map(([side, set]) => [side, order(set)]),
-    pic, total: allIssues.length, notReady, notReadyLines,
+    pic, total: allIssues.length, notReady, notReadyLines, candidates,
     force: null, notes: null,
   };
 }
@@ -239,6 +296,13 @@ function draftBlocks(id, d) {
     { type: 'section', text: { type: 'mrkdwn', text: renderAnnouncement(d).substring(0, 2900) } },
     { type: 'section', text: { type: 'mrkdwn', text: renderReadiness(d).substring(0, 2900) } },
   ];
+  for (const c of d.candidates || []) {
+    const list = c.issues.slice(0, 10).map(i => `• <${JIRA_HOST}/browse/${i.key}|${i.key}> ${lib.postLabel(i.fields?.summary || '')}`).join('\n');
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text:
+      `*Verified but not in a release* — ${c.issues.length} QA Success card(s) matching ${c.versionName} are still on a placeholder version:\n${list}${c.issues.length > 10 ? `\n_…and ${c.issues.length - 10} more_` : ''}`.substring(0, 2900) } });
+    blocks.push({ type: 'actions', elements: [{ type: 'button', action_id: 'rel_addfix', value: `${id}|${c.versionId}`,
+      text: { type: 'plain_text', text: `Add ${c.issues.length} to ${c.versionName}`.substring(0, 75) } }] });
+  }
   if (missing.length) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Still needs your decision: ${missing.join(' and ')}.` }] });
   const elements = [];
   if (mobile) {
@@ -444,6 +508,27 @@ function register(slackApp) {
     await refreshDraft(client, id);
   });
 
+  slackApp.action('rel_addfix', async ({ ack, body, client, logger }) => {
+    await ack();
+    const [id, versionId] = (body.actions?.[0]?.value || '').split('|');
+    const st = DRAFTS.get(id);
+    if (!st || !RELEASE_APPROVERS.includes(body.user?.id)) return;
+    const cand = (st.d.candidates || []).find(c => c.versionId === versionId);
+    if (!cand) return;
+    const moved = [], failed = [];
+    for (const i of cand.issues) {
+      try { await moveToVersion(i.key, versionId); moved.push(i.key); }
+      catch (err) { failed.push(i.key); logger?.warn?.(`[Release] move ${i.key} → ${cand.versionName} failed:`, err.response?.data || err.message); }
+    }
+    // Rebuild from Jira so items, PIC and readiness include the moved cards
+    const fresh = await buildDraft(client, st.d.group);
+    fresh.force = st.d.force; fresh.notes = st.d.notes;
+    st.d = fresh;
+    await refreshDraft(client, id);
+    await client.chat.postMessage({ channel: st.dmChannel, thread_ts: st.dmTs,
+      text: `Moved ${moved.length} card(s) to ${cand.versionName}${moved.length ? `: ${moved.join(', ')}` : ''}${failed.length ? `\nCouldn't move: ${failed.join(', ')}` : ''}` }).catch(() => {});
+  });
+
   slackApp.action('rel_skip', async ({ ack, body, client }) => {
     await ack();
     const id = body.actions?.[0]?.value;
@@ -482,4 +567,5 @@ module.exports = {
   register, startScheduler, isReleaseCommand, handleCommand,
   // exported for tests
   versionFamily, upcomingWorkdays, itemLabel, renderAnnouncement, renderReadiness, buildDraft, upcomingGroups,
+  versionTagRegex, findCandidates, moveToVersion, PLACEHOLDER_VERSION_IDS,
 };

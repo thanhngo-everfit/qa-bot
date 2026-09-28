@@ -58,13 +58,14 @@ const TOOLS = [
   } },
   { type: 'function', function: {
     name: 'jira_update_issue',
-    description: 'Update an EXISTING Jira issue: move it under a parent epic, rename it, change its priority or its issue type (e.g. "Product Task"). Only pass the fields to change. The parent must be an Epic — if not, the result says what it is and suggests its epic.',
+    description: 'Update an EXISTING Jira issue: move it under a parent epic, put it in a release fix version, rename it, change its priority or its issue type (e.g. "Product Task"). Only pass the fields to change. The parent must be an Epic — if not, the result says what it is and suggests its epic.',
     parameters: { type: 'object', required: ['key'], properties: {
       key:        { type: 'string', description: 'Issue to update, e.g. UP-79584' },
       parent:     { type: 'string', description: 'Epic key to put the issue under, e.g. UP-79078' },
       summary:    { type: 'string' },
       priority:   { type: 'string', enum: ['Highest', 'High', 'Medium', 'Low', 'Lowest'] },
       issue_type: { type: 'string', description: 'e.g. Bug, Task, Product Task' },
+      fix_version: { type: 'string', description: 'Release version NAME to put the issue in, e.g. "Web 4.37.1". Replaces placeholder versions (To be confirmed, Client Report (TBD)); keeps other real versions.' },
     } },
   } },
   { type: 'function', function: {
@@ -267,7 +268,24 @@ async function execTool(name, args, ctx) {
           });
           Object.assign(applied, { ...(args.summary ? { summary: args.summary } : {}), ...(args.priority ? { priority: args.priority } : {}), ...(args.issue_type ? { issue_type: args.issue_type } : {}) });
         }
-        if (!Object.keys(applied).length) return { error: 'Nothing to update — pass parent, summary, priority or issue_type.' };
+        if (args.fix_version) {
+          const project = String(args.key).split('-')[0];
+          const vRes = await axios.get(`${JIRA_HOST}/rest/api/3/project/${project}/versions`, { headers: { Authorization: jiraAuth(), Accept: 'application/json' } });
+          const want = String(args.fix_version).trim().toLowerCase();
+          const target = (vRes.data || []).find(v => (v.name || '').trim().toLowerCase() === want && !v.archived);
+          if (!target) {
+            const close = (vRes.data || []).filter(v => !v.released && !v.archived && (v.name || '').toLowerCase().includes(want.split(' ')[0])).slice(0, 5).map(v => v.name);
+            return { error: `No version named "${args.fix_version}" in ${project}.${close.length ? ` Unreleased ones like it: ${close.join(', ')}.` : ''}` };
+          }
+          const cur = await axios.get(`${JIRA_HOST}/rest/api/3/issue/${args.key}`, { params: { fields: 'fixVersions' }, headers: { Authorization: jiraAuth(), Accept: 'application/json' } });
+          const PLACEHOLDER = /^(?:n\s*\/?\s*a|to be confirmed|will not release)\b|\(tbd\)|\btbd\b/i;
+          const keep = (cur.data?.fields?.fixVersions || []).filter(v => !PLACEHOLDER.test(v.name || '') && String(v.id) !== String(target.id)).map(v => ({ id: String(v.id) }));
+          await axios.put(`${JIRA_HOST}/rest/api/3/issue/${args.key}`, { fields: { fixVersions: [...keep, { id: String(target.id) }] } }, {
+            headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json' },
+          });
+          applied.fix_version = target.name + (target.released ? ' (already released)' : '');
+        }
+        if (!Object.keys(applied).length) return { error: 'Nothing to update — pass parent, fix_version, summary, priority or issue_type.' };
         return { updated: args.key, applied };
       }
       case 'jira_transition': {
