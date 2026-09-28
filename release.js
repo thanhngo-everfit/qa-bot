@@ -18,7 +18,7 @@ const lib = require('./lib');
 const { JIRA_HOST, jiraAuth } = lib;
 
 const RELEASE_CHANNEL   = process.env.RELEASE_CHANNEL   || 'C02K8962G9J';   // #internal-release-process
-const RELEASE_APPROVERS = (process.env.RELEASE_APPROVERS || 'U0142GU335F').split(',').map(s => s.trim()).filter(Boolean);
+const RELEASE_APPROVERS = (process.env.RELEASE_APPROVERS || 'U0142GU335F,U0445EQS1ED').split(',').map(s => s.trim()).filter(Boolean);
 const RELEASE_PROJECT   = process.env.RELEASE_PROJECT   || 'UP';
 // Automatic review + reminders happen in the leads' channel, tagging them.
 const RELEASE_REVIEW_CHANNEL = process.env.RELEASE_REVIEW_CHANNEL || 'C0BND0T6Y3C';   // #core-scrum-team
@@ -311,6 +311,7 @@ function renderReadiness(d) {
 const DRAFTS    = new Map();   // draftId → { d, channel, threadTs, ts, groupKey }
 const ANNOUNCED = new Map();   // groupKey → { ts, versionIds, releaseDate }
 const SKIPPED   = new Set();   // groupKey (for this process life)
+const POSTED    = new Map();   // draftId → { by, link } — for late clicks on an approved draft
 const REMINDED  = new Set();
 const READINESS_POSTED = new Map();   // groupKey → last ISO day posted
 
@@ -591,6 +592,12 @@ function register(slackApp) {
     await ack();
     const id = body.actions?.[0]?.value;
     const st = DRAFTS.get(id);
+    if (!st && POSTED.has(id)) {
+      const p = POSTED.get(id);
+      await client.chat.postEphemeral({ channel: body.channel.id, user: body.user.id, thread_ts: body.message?.thread_ts,
+        text: `Already approved by <@${p.by}> and posted — <${p.link}|view>.` }).catch(() => {});
+      return;
+    }
     if (!st) {
       await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.thread_ts || body.message.ts,
         text: 'That draft expired (I restarted), so I didn\'t post it. Ask me to "draft release for <version>" again — or press Skip to remove it.' }).catch(() => {});
@@ -601,6 +608,14 @@ function register(slackApp) {
         text: `Only ${RELEASE_APPROVERS.map(u => `<@${u}>`).join(' ')} can approve release posts.` }).catch(() => {});
       return;
     }
+    // Two approvers → guard against both clicking at once (posting takes a
+    // few seconds while Jira is re-read)
+    if (st.approving) {
+      await client.chat.postEphemeral({ channel: body.channel.id, user: body.user.id, thread_ts: body.message?.thread_ts,
+        text: `<@${st.approving}> is already posting this release.` }).catch(() => {});
+      return;
+    }
+    st.approving = body.user.id;
     // Re-read Jira so the post reflects the latest state
     const fresh = await buildDraft(client, st.d.group);
     fresh.force = st.d.force; fresh.notes = st.d.notes;
@@ -609,8 +624,9 @@ function register(slackApp) {
       versionNames: Object.fromEntries(fresh.perVersion.map(v => [String(v.id), v.name])) });
     DRAFTS.delete(id);
     const link = `https://everfitt.slack.com/archives/${RELEASE_CHANNEL}/p${posted.ts.replace('.', '')}`;
+    POSTED.set(id, { by: body.user.id, link });
     await client.chat.update({ channel: st.channel, ts: st.ts, text: 'Posted',
-      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `Posted the ${fresh.group.family} release to <#${RELEASE_CHANNEL}> — <${link}|view>. I'll post readiness in its thread each morning until release day.` } }] }).catch(() => {});
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `Approved by <@${body.user.id}> and posted the ${fresh.group.family} release to <#${RELEASE_CHANNEL}> — <${link}|view>. I'll post readiness in its thread each morning until release day.` } }] }).catch(() => {});
     logger?.info?.(`[Release] Approved and posted ${st.groupKey}`);
   });
 }
