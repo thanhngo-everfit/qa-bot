@@ -594,14 +594,15 @@ async function getMonthlyTbdVersion(projectKey) {
 // ── Jira: open epics of a project (for the "pick an epic" prompt) ────
 // Most recently updated first; Slack menus hold at most 100 options.
 const _epicsCache = new Map();   // projectKey → { at, epics }
-async function listOpenEpics(projectKey, max = 100) {
-  const hit = _epicsCache.get(projectKey);
+async function listOpenEpics(projectKey, max = 100, summaryContains = null) {
+  const cacheKey = summaryContains ? `${projectKey}:${summaryContains}` : projectKey;
+  const hit = _epicsCache.get(cacheKey);
   if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.epics;
   let epics = [];
   try {
     const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
       params: {
-        jql: `project = ${projectKey} AND issuetype = Epic AND statusCategory != Done ORDER BY updated DESC`,
+        jql: `project = ${projectKey} AND issuetype = Epic AND statusCategory != Done${summaryContains ? ` AND summary ~ "${summaryContains}"` : ''} ORDER BY updated DESC`,
         maxResults: Math.min(max, 100), fields: 'summary',
       },
       headers: { Authorization: jiraAuth(), Accept: 'application/json' },
@@ -610,7 +611,7 @@ async function listOpenEpics(projectKey, max = 100) {
   } catch (err) {
     console.warn(`[Jira] ${projectKey} epic list failed:`, err.response?.status || err.message);
   }
-  _epicsCache.set(projectKey, { at: Date.now(), epics });
+  _epicsCache.set(cacheKey, { at: Date.now(), epics });
   return epics;
 }
 
@@ -625,6 +626,73 @@ async function setIssueParent(issueKey, epicKey) {
     await put({ customfield_10014: epicKey });            // legacy Epic Link
     return true;
   }
+}
+
+// ── Challenger app → the CHAL board ──────────────────────────────────
+// Challenger is a separate app with its own board (CHAL, board 619). Its
+// cards follow CHAL's conventions, verified against existing CHAL cards:
+//  · title  [Platform][Challenger App][Feature] …  with plain iOS/Android
+//  · parent the platform's "Everfit Challenger App … | Post-release fixes"
+//           epic — these epics live in UP, not CHAL
+//  · no Fix Version, no sprint (none of the existing CHAL cards use them)
+const CHALLENGER_PROJECT  = 'CHAL';
+const CHALLENGER_CHANNELS = new Set((process.env.CHALLENGER_CHANNELS || 'C0AM53YF9PV').split(',').map(s => s.trim()).filter(Boolean));
+const CHALLENGER_FALLBACK_EPICS = { iOS: 'UP-73630', Android: 'UP-72185', API: 'UP-73628', Web: 'UP-73859' };
+
+function isChallengerRequest(channelId, text) {
+  return CHALLENGER_CHANNELS.has(channelId) || /\bchallenger\b/i.test(text || '');   // "challenger", never "challenge"
+}
+
+function challengerPlatform(platform) {
+  const p = (platform || '').toLowerCase();
+  if (p.startsWith('ios'))     return 'iOS';
+  if (p.startsWith('android')) return 'Android';
+  if (p === 'web')             return 'Web';
+  return 'API';                                   // API, Data, unknown → backend
+}
+
+// Newest open "… Challenger … Post-release fixes" epic per platform, so the
+// bot follows the team when a new phase's fixes epic is opened.
+let _chalEpics = null, _chalEpicsAt = 0;
+async function challengerEpicFor(platform) {
+  const plat = challengerPlatform(platform);
+  if (!_chalEpics || Date.now() - _chalEpicsAt > 6 * 3600 * 1000) {
+    const found = {};
+    try {
+      const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
+        params: {
+          jql: `project = UP AND issuetype = Epic AND statusCategory != Done AND summary ~ "Challenger" AND summary ~ "\\"Post-release fixes\\"" ORDER BY created DESC`,
+          maxResults: 50, fields: 'summary',
+        },
+        headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+      });
+      for (const i of res.data?.issues || []) {
+        const m = (i.fields?.summary || '').match(/^\s*(iOS|Android|API|Web)\b/i);
+        if (!m) continue;
+        const k = { ios: 'iOS', android: 'Android', api: 'API', web: 'Web' }[m[1].toLowerCase()];
+        if (!found[k]) found[k] = i.key;               // newest first
+      }
+    } catch (err) {
+      console.warn('[Jira] Challenger epic lookup failed:', err.response?.status || err.message);
+    }
+    _chalEpics = { ...CHALLENGER_FALLBACK_EPICS, ...found };
+    _chalEpicsAt = Date.now();
+  }
+  return _chalEpics[plat] || null;
+}
+
+// CHAL title convention: [Platform][Challenger App][Feature] …
+function challengerSummary(summary, platform) {
+  const plat = challengerPlatform(platform);
+  let s = (summary || '').trim();
+  const PLATFORM_TAG = /\[(?:iOS|Android)(?: (?:Client|Coach))?\]|\[(?:API|Web|BE|FE|Backend|Frontend|Mobile|Data)\]/i;
+  if (PLATFORM_TAG.test(s)) s = s.replace(PLATFORM_TAG, `[${plat}]`);
+  else {
+    const lead = s.match(/^(\[(?:client\s*report|client\s*request|request)\])/i);
+    s = lead ? `${lead[1]}[${plat}]${s.slice(lead[1].length)}` : `[${plat}] ${s}`;
+  }
+  if (!/\[challenger(?: app)?\]/i.test(s)) s = s.replace(`[${plat}]`, `[${plat}][Challenger App]`);
+  return s.substring(0, 250);
 }
 
 // ── Names for the ticket confirmation (cached) ───────────────────────
@@ -739,7 +807,7 @@ async function gatherChannelContext(client, channelId, { days = 14, maxThreads =
         const who = m.user ? await resolveUserName(client, m.user) : (m.bot_id ? 'QA Agent' : 'unknown');
         const txt = (await resolveInlineMentions(client, m.text || '')).replace(/\s+/g, ' ').substring(0, 400);
         if (txt) lines.push(`[${who}]: ${txt}`);
-        for (const k of (m.text || '').match(/\b(?:UP|PAY|AIT)-\d+\b/g) || []) ticketKeys.add(k);
+        for (const k of (m.text || '').match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/g) || []) ticketKeys.add(k);
       };
       await push(parent);
       if (parent.reply_count) {
@@ -904,7 +972,7 @@ function slackify(text) {
   out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<$2|$1>');   // [t](url) → <url|t>
   out = out.replace(/^#{1,4}\s+(.+)$/gm, '*$1*');                          // headers → bold
   out = out.replace(/\*\*([^*\n]+)\*\*/g, '*$1*');                        // **b** → *b*
-  out = out.replace(/(<[^>]*>)|\b(UP|PLAN|PAY|AIT)-(\d+)\b/g, (m, link, proj, num) =>
+  out = out.replace(/(<[^>]*>)|\b(UP|PLAN|PAY|AIT|CHAL)-(\d+)\b/g, (m, link, proj, num) =>
     link ? link : `<${JIRA_HOST}/browse/${proj}-${num}|${proj}-${num}>`);  // bare keys → links
   return out;
 }
@@ -937,6 +1005,7 @@ module.exports = {
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient, getIssueEpic,
   shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion, listOpenEpics, setIssueParent,
   getLastActiveSprint, getVersionName, getIssueTitle,
+  CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, challengerEpicFor, challengerSummary,
   resolveUserName, resolveInlineMentions, warmUserNames, replaceMentionsCached, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
   slackify, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, clientReportSummary,

@@ -1372,7 +1372,7 @@ async function rebuildFollowUpsFromJira() {
         params: {
           // Old client-report cards carry fixVersion 27643; cards created by the
           // unified pipeline carry the [Client Report]/[Client Request] prefix.
-          jql: `project in (UP, PAY, AIT) AND (fixVersion = 27643 OR summary ~ "\\"Client Report\\"" OR summary ~ "\\"Client Request\\"") AND statusCategory != Done ORDER BY created DESC`,
+          jql: `project in (UP, PAY, AIT, CHAL) AND (fixVersion = 27643 OR summary ~ "\\"Client Report\\"" OR summary ~ "\\"Client Request\\"") AND statusCategory != Done ORDER BY created DESC`,
           maxResults: 100, startAt,
           fields: 'summary,status,description',
         },
@@ -1444,7 +1444,7 @@ async function rebuildFollowUpsFromHistory(client) {
           for (const r of replies.messages || []) {
             const t = textOf(r);
             combined.push(t);
-            if (!jiraKey) { const mm = t.match(/\b(?:UP|PAY|AIT)-\d+\b/); if (mm) jiraKey = mm[0]; }
+            if (!jiraKey) { const mm = t.match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/); if (mm) jiraKey = mm[0]; }
             if (!squad && r.bot_id) {
               const sm = t.match(/(?:Squad|Related squad):\s*\*?([^*\n]+?)\*?\s*$/m);
               if (sm) squad = sm[1].replace(/&amp;/g, '&').trim();
@@ -1478,7 +1478,7 @@ async function scanThreadForTickets(client, channelId, threadTs) {
     const messages = (await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 })).messages || [];
     const keys = new Set();
     for (const msg of messages) {
-      const matches = (msg.text || '').match(/\b(?:UP|PAY|AIT)-\d+\b/g) || [];
+      const matches = (msg.text || '').match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/g) || [];
       matches.forEach(k => keys.add(k));
     }
     return [...keys].map(k => ({ key: k, url: `${JIRA_HOST}/browse/${k}` }));
@@ -1701,6 +1701,15 @@ function startFollowUpScheduler(client) {
             }
             continue;
           }
+          // Challenger cards don't use Fix Versions: it ships with the next
+          // Challenger app release — say that instead of asking for a version.
+          if (jiraKey.startsWith('CHAL-')) {
+            if (await once('qa_success', 'passed QA')) {
+              await post(`${link} passed QA. It goes live with the next Challenger app release.` + fyi(reporter, pcMention));
+              item.announced.qa_success = true;
+            }
+            item.done = true; continue;
+          }
           // Verified with no Fix Version: nobody can tell when it goes live.
           if (await once('qa_success', 'passed QA')) {
             const why = rel.versions.length ? `its Fix Version is still a placeholder (${describeVersions(rel.versions)})` : 'it has no Fix Version';
@@ -1807,7 +1816,7 @@ async function findOrRegisterTracked(client, channelId, threadTs, botBotId, botU
 
     // Find first UP-XXXXX in any message
     for (const msg of messages) {
-      const match = (msg.text || '').match(/\b(?:UP|PAY|AIT)-\d+\b/);
+      const match = (msg.text || '').match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/);
       if (match) {
         jiraKey = match[0];
         jiraUrl = `${JIRA_HOST}/browse/${jiraKey}`;
@@ -2153,12 +2162,12 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
         return;
       }
 
-      const specificKey = (event.text.match(/\b(?:UP|PAY|AIT)-\d+\b/i) || [])[0]?.toUpperCase();
+      const specificKey = (event.text.match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/i) || [])[0]?.toUpperCase();
       const threadMsgsCA = (await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 50 }).catch(() => ({ messages: [] }))).messages || [];
       const threadKeys = [];
       for (const msg of [...threadMsgsCA].reverse()) {
         if (msg.bot_id !== botBotId) continue;
-        for (const k of (msg.text || '').match(/\b(?:UP|PAY|AIT)-\d+\b/g) || []) {
+        for (const k of (msg.text || '').match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/g) || []) {
           if (!threadKeys.includes(k)) threadKeys.push(k);
         }
       }
@@ -2228,7 +2237,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
 
         // An explicit ticket key in the request wins over any matching
         // ("do follow up with @Hanh for UP-79009").
-        const explicitKey = (event.text.match(/\b(?:UP|PAY|AIT)-\d+\b/i) || [])[0]?.toUpperCase() || null;
+        const explicitKey = (event.text.match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/i) || [])[0]?.toUpperCase() || null;
 
         const matches = [];
         for (const key of (explicitKey ? [explicitKey] : threadKeys).slice(0, 12)) {
@@ -2470,7 +2479,7 @@ Max 8 steps total. Plain English only.`,
     const existingSummaries = [];
     for (const msg of allThreadMsgs) {
       if (msg.bot_id !== botBotId) continue;
-      (msg.text || '').match(/\b(?:UP|PAY|AIT)-\d+\b/g)?.forEach(k => { if (!existingKeys.includes(k)) existingKeys.push(k); });
+      (msg.text || '').match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/g)?.forEach(k => { if (!existingKeys.includes(k)) existingKeys.push(k); });
       const sm = (msg.text || '').match(/\*(.+?)\*/);
       if (sm) existingSummaries.push(sm[1].toLowerCase());
     }
@@ -2512,7 +2521,7 @@ Max 8 steps total. Plain English only.`,
         .filter(t => !/^(bug|task)$/i.test(t))
         .sort((a, b) => b.length - a.length)
         .find(t => new RegExp(`\\b${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(event.text));
-      const parentMatch = event.text.match(/\b(?:epic|under|parent)\s+(?:this\s+)?(?:epic\s+|parent\s+)?((?:UP|PAY|AIT)-\d+)\b/i);
+      const parentMatch = event.text.match(/\b(?:epic|under|parent)\s+(?:this\s+)?(?:epic\s+|parent\s+)?((?:UP|PAY|AIT|CHAL)-\d+)\b/i);
       for (const t of analysis.tickets) {
         if (explicitType) t.type = explicitType;
         if (parentMatch) t.explicitParent = parentMatch[1].toUpperCase();
@@ -2544,7 +2553,7 @@ Max 8 steps total. Plain English only.`,
 
     // Keys the requester referenced in the command itself (e.g. "under epic
     // UP-51189", "duplicate of UP-123") are context, NOT duplicate signals.
-    const referencedInTrigger = new Set((event.text.match(/\b(?:UP|PLAN|PAY|AIT)-\d+\b/gi) || []).map(k => k.toUpperCase()));
+    const referencedInTrigger = new Set((event.text.match(/\b(?:UP|PLAN|PAY|AIT|CHAL)-\d+\b/gi) || []).map(k => k.toUpperCase()));
     const dedupKeys = liveKeys.filter(k => !referencedInTrigger.has(k));
 
     // Shortcut: "assign to @X" when a LIVE ticket already exists
@@ -2974,7 +2983,7 @@ async function enrichThread(client, channelId, msg, botUserId) {
 
       // Find first Jira ticket — anywhere in the message incl. unfurls
       if (!jiraKey) {
-        const match = fullText.match(/\b(?:UP|PAY|AIT)-\d+\b/);
+        const match = fullText.match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/);
         if (match) { jiraKey = match[0]; jiraUrl = `${JIRA_HOST}/browse/${jiraKey}`; }
       }
 

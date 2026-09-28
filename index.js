@@ -988,7 +988,7 @@ async function pickParentFromCanvas(client, channelId, bugPlatform) {
   if (!canvasContent) return null;
 
   // Extract all UP- and PLAN- keys from canvas
-  const upKeys   = [...new Set((canvasContent.match(/\b(?:UP|PAY|AIT)-\d+\b/g)   || []))];
+  const upKeys   = [...new Set((canvasContent.match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/g)   || []))];
   const planKeys = [...new Set((canvasContent.match(/PLAN-\d+/g) || []))];
   console.log(`[QABot] Canvas keys: UP=${upKeys.join(',')} PLAN=${planKeys.join(',')}`);
 
@@ -1499,7 +1499,7 @@ async function scanThreadTicketKeys(client, channelId, threadTs) {
       return parts.join(' ');
     };
     for (const m of replies.messages || []) {
-      for (const k of textOf(m).match(/\b(?:UP|PAY|AIT)-\d+\b/g) || []) if (!keys.includes(k)) keys.push(k);
+      for (const k of textOf(m).match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/g) || []) if (!keys.includes(k)) keys.push(k);
     }
   } catch (_) {}
   return keys;
@@ -1858,7 +1858,7 @@ HARD RULES — follow exactly:
       const threadResult = await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 50 });
       for (const msg of (threadResult.messages || [])) {
         if (msg.bot_id !== botBotId) continue;
-        const keyMatches = (msg.text || '').match(/\b(?:UP|PAY|AIT)-\d+\b/g) || [];
+        const keyMatches = (msg.text || '').match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/g) || [];
         existingKeys.push(...keyMatches);
         const summaryMatch = (msg.text || '').match(/\*(.+?)\*/);
         if (summaryMatch) existingSummaries.push(summaryMatch[1].toLowerCase());
@@ -1944,8 +1944,8 @@ HARD RULES — follow exactly:
     }
 
     // Parse Epic from trigger message (PLAN-XXX or UP-XXX)
-    const epicExplicit = event.text.match(/\b(?:epic|under|parent)\s+(?:epic\s+)?(PLAN-\d+|UP-\d+|PAY-\d+|AIT-\d+)\b/i);
-    const epicAny      = event.text.match(/\b(PLAN-\d+|UP-\d+|PAY-\d+|AIT-\d+)\b/i);
+    const epicExplicit = event.text.match(/\b(?:epic|under|parent)\s+(?:epic\s+)?(PLAN-\d+|UP-\d+|PAY-\d+|AIT-\d+|CHAL-\d+)\b/i);
+    const epicAny      = event.text.match(/\b(PLAN-\d+|UP-\d+|PAY-\d+|AIT-\d+|CHAL-\d+)\b/i);
     let epicKey        = (epicExplicit ? epicExplicit[1] : epicAny ? epicAny[1] : null)?.toUpperCase() || null;
 
     // "same epic as that previous bug/ticket" → inherit the epic from a
@@ -1978,7 +1978,15 @@ HARD RULES — follow exactly:
       if (projectRoute) targetProject = projectRoute.project;
       logger.info(`[QABot] Squad "${threadSquad || 'unknown'}" → project ${targetProject}`);
     }
-    const ticketFixVersionId = projectRoute ? await lib.getMonthlyTbdVersion(targetProject) : fixVersionId;
+    // Challenger app → CHAL board, from any channel. Checked last so it wins
+    // over the squad routing above.
+    if (lib.isChallengerRequest(event.channel, `${event.text || ''}\n${context || ''}`)) {
+      targetProject = lib.CHALLENGER_PROJECT;
+      projectRoute  = { project: lib.CHALLENGER_PROJECT, parent: null, challenger: true };
+      logger.info('[QABot] Challenger app → project CHAL');
+    }
+    const ticketFixVersionId = projectRoute?.challenger ? null        // CHAL doesn't use Fix Versions
+      : projectRoute ? await lib.getMonthlyTbdVersion(targetProject) : fixVersionId;
 
     // Resolve reporter: the person who tagged the bot (NOT the thread author)
     const reporterSlackId = event.user;
@@ -2062,7 +2070,10 @@ HARD RULES — follow exactly:
       // Report channels: cards go under the platform's Client Report epic
       // (iOS → Client Report (iOS), etc.) unless the request names an epic
       // or parent. The sprint-epic search below is for other channels only.
-      if (inReportChannel && !epicKey && projectRoute) {
+      if (!epicKey && projectRoute?.challenger) {
+        parentKey = await lib.challengerEpicFor(ticket.platform);
+        logger.info(`[QABot] Challenger epic for ${ticket.platform}: ${parentKey || 'none'}`);
+      } else if (inReportChannel && !epicKey && projectRoute) {
         parentKey = projectRoute.parent;
         logger.info(`[QABot] ${targetProject} Client Report epic: ${parentKey}`);
       } else if (inReportChannel && !epicKey) {
@@ -2071,7 +2082,7 @@ HARD RULES — follow exactly:
         else logger.warn(`[QABot] No Client Report epic mapped for platform "${ticket.platform}"`);
       }
       try {
-        if (!parentKey) parentKey = await Promise.race([
+        if (!parentKey && !projectRoute?.challenger) parentKey = await Promise.race([
           (async () => {
             const channelInfo = await client.conversations.info({ channel: event.channel });
             const channelName = channelInfo.channel?.name || '';
@@ -2086,7 +2097,7 @@ HARD RULES — follow exactly:
       }
       logger.info(`[QABot] Parent resolution: ${parentKey || 'none'} in ${((Date.now() - tParent) / 1000).toFixed(1)}s`);
       // Fall back to canvas-based lookup if sprint search found nothing
-      if (!parentKey && Date.now() - tParent < 20000) {
+      if (!parentKey && !projectRoute?.challenger && Date.now() - tParent < 20000) {
         parentKey = await pickParentFromCanvas(client, event.channel, ticket.platform);
         logger.info(`[QABot] Parent from canvas: ${parentKey || 'none'} for platform=${ticket.platform}`);
       }
@@ -2114,6 +2125,9 @@ HARD RULES — follow exactly:
 
       // Client-report channels: enforce the [Client Report]/[Client Request]
       // title convention (bug vs task) before creating.
+      if (projectRoute?.challenger) {
+        ticket.summary = lib.challengerSummary(ticket.summary, ticket.platform);
+      }
       if (clientReport.MONITORED_CHANNELS[event.channel]) {
         ticket.summary = lib.clientReportSummary(ticket.summary, issueType);
       }
@@ -2226,7 +2240,7 @@ HARD RULES — follow exactly:
           out.push(`*Fix Version:* ${f.versionName || (jira.applied?.fixVersion ? 'set' : 'none')}`);
           out.push(f.sprintName
             ? `*Sprint:* ${f.sprintName}`
-            : `*Sprint:* ${f.project && f.project !== JIRA_PROJECT ? `not added — ${f.project} triages it into its own sprint` : 'not added (no active sprint found)'}`);
+            : `*Sprint:* ${f.project === 'CHAL' ? 'not added — planned on the Challenger board' : f.project && f.project !== JIRA_PROJECT ? `not added — ${f.project} triages it into its own sprint` : 'not added (no active sprint found)'}`);
           const problems = (jira.notes || []).filter(n => n !== 'no epic set');
           if (problems.length) out.push(`_${problems.join(' · ')}_`);
           return out.join('\n');
@@ -2275,7 +2289,9 @@ HARD RULES — follow exactly:
       if (jira.applied?.epic) continue;
       try {
         const projectKey = jira.key.split('-')[0];
-        const epics = await lib.listOpenEpics(projectKey);
+        const epics = projectKey === lib.CHALLENGER_PROJECT
+          ? await lib.listOpenEpics('UP', 100, 'Challenger')      // CHAL's epics live in UP
+          : await lib.listOpenEpics(projectKey);
         if (!epics.length) continue;
         const options = epics.slice(0, 100).map(e => ({
           text:  { type: 'plain_text', text: `${e.key} — ${e.summary}`.substring(0, 75) },
