@@ -2515,11 +2515,14 @@ slackApp.action('qa_assign_open', async ({ ack, body, client, logger }) => {
           {
             type: 'input', block_id: 'assignee_block',
             label: { type: 'plain_text', text: 'Assign to' },
-            element: { type: 'users_select', action_id: 'assignee', placeholder: { type: 'plain_text', text: 'Pick a member' } },
+            element: {
+              type: 'multi_users_select', action_id: 'assignees', max_selected_items: 5,
+              placeholder: { type: 'plain_text', text: 'Pick one or more members' },
+            },
           },
           {
             type: 'context',
-            elements: [{ type: 'mrkdwn', text: "I'll create the Jira card from this thread and assign it to them." }],
+            elements: [{ type: 'mrkdwn', text: "I'll create the Jira card from this thread. Pick several people and each gets their own card — Jira allows one assignee per card, and each card follows that person's platform (e.g. iOS, BE)." }],
           },
         ],
       },
@@ -2533,16 +2536,23 @@ slackApp.view('qa_assign_submit', async ({ ack, body, view, client, logger }) =>
   await ack();   // close the modal immediately; the work continues in the thread
   let meta = {};
   try { meta = JSON.parse(view.private_metadata || '{}'); } catch (_) {}
-  const assignee = view.state?.values?.assignee_block?.assignee?.selected_user;
+  const blockVals = view.state?.values?.assignee_block || {};
+  const assignees = [...new Set(
+    blockVals.assignees?.selected_users ||                       // multi-select
+    (blockVals.assignee?.selected_user ? [blockVals.assignee.selected_user] : [])   // older single-select modals
+  )];
   const clicker  = body.user?.id;
-  if (!meta.c || !meta.t || !assignee) return;
+  if (!meta.c || !meta.t || !assignees.length) return;
+  const who = assignees.map(id => `<@${id}>`).join(', ');
 
   // Visible audit line in the thread — also the anchor for status/reactions
   let anchorTs = meta.t;
   try {
     const posted = await client.chat.postMessage({
       channel: meta.c, thread_ts: meta.t, unfurl_links: false,
-      text: `<@${clicker}> asked me to create a Jira card and assign it to <@${assignee}>.`,
+      text: assignees.length > 1
+        ? `<@${clicker}> asked me to create a Jira card for each of ${who}.`
+        : `<@${clicker}> asked me to create a Jira card and assign it to ${who}.`,
     });
     anchorTs = posted.ts;
   } catch (_) {}
@@ -2554,7 +2564,7 @@ slackApp.view('qa_assign_submit', async ({ ack, body, view, client, logger }) =>
       const msg = (rr.messages || []).find(x => x.ts === meta.m);
       if (msg) {
         const blocks = (msg.blocks || []).filter(b => b.type !== 'actions');
-        blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Assigned to <@${assignee}> by <@${clicker}>` }] });
+        blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Assigned to ${who} by <@${clicker}>` }] });
         await client.chat.update({ channel: meta.c, ts: meta.m, text: msg.text || 'Analysis', blocks });
       }
     } catch (err) { logger.warn('[QAAgent] Could not update analysis message:', err.data?.error || err.message); }
@@ -2563,7 +2573,7 @@ slackApp.view('qa_assign_submit', async ({ ack, body, view, client, logger }) =>
   // Same pipeline as typing "create ticket and assign to @X" in the thread
   try {
     await coreMentionHandler({
-      event: { channel: meta.c, thread_ts: meta.t, ts: anchorTs, user: clicker, text: `create ticket and assign to <@${assignee}>` },
+      event: { channel: meta.c, thread_ts: meta.t, ts: anchorTs, user: clicker, text: `create ticket and assign to ${assignees.map(id => `<@${id}>`).join(' ')}` },
       client, logger,
     });
   } catch (err) {
