@@ -432,7 +432,10 @@ async function versionCheck() {
 }
 
 function renderVersionCheck(flags) {
-  const line = (e) => `• <${versionUrl(e.id)}|${esc(e.name)}> · ${e.cards} card${e.cards === '1' ? '' : 's'}${e.date ? ` · ${prettyDate(e.date)}` : ''}`;
+  const line = (e) => {
+    const age = e.openDays > 0 ? ` · _open ${e.openDays} working day${e.openDays > 1 ? 's' : ''}_` : ' · _new_';
+    return `• <${versionUrl(e.id)}|${esc(e.name)}> · ${e.cards} card${e.cards === '1' ? '' : 's'}${e.date ? ` · ${prettyDate(e.date)}` : ''}${age}`;
+  };
   const section = (title, hint, list) => list.length
     ? `*${title}* — ${hint}\n${list.slice(0, 10).map(line).join('\n')}${list.length > 10 ? `\n_…and ${list.length - 10} more_` : ''}` : null;
   const parts = [
@@ -443,23 +446,41 @@ function renderVersionCheck(flags) {
   return parts.join('\n\n');
 }
 
+const FIRST_SEEN = new Map();   // "<versionId>:<kind>" → ISO day first reported
 const checkSignature = (f) => JSON.stringify([f.draft, f.overdue, f.noDate].map(l => l.map(e => `${e.id}:${e.date}`).sort()));
 let _lastCheck = { sig: null, day: null };
 
+const DAILY_ALL_CLEAR = (process.env.VERSION_CHECK_ALL_CLEAR || 'true') !== 'false';
+
 async function alertVersionIssues(client, { force = false, channel = RELEASE_REVIEW_CHANNEL, threadTs = null } = {}) {
   const flags = await versionCheck();
+  const today = isoDay(vnNow());
+  // Age each finding; forget ones that got fixed
+  const live = new Set();
+  for (const [kind, list] of Object.entries(flags)) {
+    for (const e of list) {
+      const k = `${e.id}:${kind}`;
+      live.add(k);
+      if (!FIRST_SEEN.has(k)) FIRST_SEEN.set(k, today);
+      e.openDays = businessDaysSince(FIRST_SEEN.get(k));
+    }
+  }
+  for (const k of [...FIRST_SEEN.keys()]) if (!live.has(k)) FIRST_SEEN.delete(k);
+
   const total = flags.draft.length + flags.overdue.length + flags.noDate.length;
+  if (!force && _lastCheck.day === today) return;            // once per working day
+  _lastCheck = { sig: checkSignature(flags), day: today };
+
   if (!total) {
-    if (force) await client.chat.postMessage({ channel, thread_ts: threadTs, text: 'Fix versions look clean — no draft names, overdue or undated versions with cards.' });
+    if (force || DAILY_ALL_CLEAR) {
+      await client.chat.postMessage({ channel, thread_ts: threadTs,
+        text: `*Fix version check* (${prettyDate(today)}) — all clear: no draft names, overdue or undated versions with cards.` });
+    }
     return;
   }
-  // Repeat only when something changed, or every 2 working days while unresolved
-  const sig = checkSignature(flags), today = isoDay(vnNow());
-  if (!force && sig === _lastCheck.sig && businessDaysSince(_lastCheck.day) < 2) return;
-  _lastCheck = { sig, day: today };
   await client.chat.postMessage({
     channel, thread_ts: threadTs, unfurl_links: false, unfurl_media: false,
-    text: `${threadTs ? '' : `${notifyTags()} `}*Fix version check* — ${total} version${total > 1 ? 's need' : ' needs'} a PC's attention before release:\n\n${renderVersionCheck(flags)}`,
+    text: `${threadTs ? '' : `${notifyTags()} `}*Fix version check* (${prettyDate(today)}) — ${total} version${total > 1 ? 's need' : ' needs'} a PC's attention before release:\n\n${renderVersionCheck(flags)}`,
   });
 }
 
