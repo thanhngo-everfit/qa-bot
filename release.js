@@ -47,7 +47,7 @@ const NOT_A_RELEASE = /^(?:n\s*\/?\s*a|to be confirmed|will not release)\b|\(tbd
 // Web 4.37.1, Academy CMS 0.2.4, API Challenger 1.0.0. Two-part numbers
 // (iOS Coach 2.83) are the team's normal minor format. Anything else —
 // "Training - Mobile cards" — is a PC's draft placeholder.
-const VALID_VERSION_RE = /^(?:(?:iOS|Android)\s+(?:Coach|Client)|Web|API|Internal API|Academy\s+(?:Web|CMS)|CMS|MP API|(?:Web|API|iOS|Android)\s+Challenger)\s+\d+(?:\.\d+){1,3}$/i;
+const VALID_VERSION_RE = /^(?:(?:iOS|Android)\s+(?:Coach|Client|White Label)|Web|API|Internal API|Academy\s+(?:Web|CMS)|CMS|MP API|(?:Web|API|iOS|Android)\s+Challenger)\s+\d+(?:\.\d+){1,3}$/i;
 const isRealVersionName = (name) => VALID_VERSION_RE.test((name || '').trim());
 
 const headers = () => ({ Authorization: jiraAuth(), Accept: 'application/json' });
@@ -476,8 +476,26 @@ async function versionCheck(client = null) {
   // that were never released or archived; checking them one by one took
   // minutes. Versions dated more than STALE_DAYS ago are summarised as a
   // count instead of checked individually.
-  const STALE_DAYS = parseInt(process.env.VERSION_CHECK_STALE_DAYS || '120', 10);
-  const staleBefore = isoDay(new Date(vnNow().getTime() - STALE_DAYS * 86400 * 1000));
+  // A version matters only if its cards moved recently. One query finds
+  // every unreleased version with a card updated in the last ACTIVE_DAYS;
+  // the long tail of abandoned versions becomes a single clean-up line.
+  const ACTIVE_DAYS = parseInt(process.env.VERSION_CHECK_ACTIVE_DAYS || '60', 10);
+  const active = new Set();
+  try {
+    let nextPageToken = null;
+    for (let page = 0; page < 20; page++) {
+      const res = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
+        params: { jql: `project = ${RELEASE_PROJECT} AND fixVersion in unreleasedVersions() AND updated >= -${ACTIVE_DAYS}d`,
+                  maxResults: 100, fields: 'fixVersions', ...(nextPageToken ? { nextPageToken } : {}) },
+        headers: headers(),
+      });
+      for (const i of res.data?.issues || []) for (const fv of i.fields?.fixVersions || []) active.add(String(fv.id));
+      nextPageToken = res.data?.nextPageToken || null;
+      if (!nextPageToken || res.data?.isLast) break;
+    }
+  } catch (err) {
+    console.warn('[Release] active-version lookup failed:', err.response?.status || err.message);
+  }
   const jobs = [];
   flags.stale = 0;
   for (const v of versions) {
@@ -487,7 +505,7 @@ async function versionCheck(client = null) {
     const overdue = !!v.releaseDate && v.releaseDate < today;
     const noDate = !v.releaseDate;
     if (!draft && !overdue && !noDate) continue;
-    if (overdue && !draft && v.releaseDate < staleBefore) { flags.stale++; continue; }
+    if (!active.has(String(v.id))) { flags.stale++; continue; }      // no card touched in ACTIVE_DAYS
     jobs.push({ v, kind: draft ? 'draft' : overdue ? 'overdue' : 'noDate' });
   }
   for (let i = 0; i < jobs.length; i += 8) {
@@ -524,7 +542,7 @@ function renderVersionCheck(flags) {
     section('Release date passed', 'still not marked released in Jira — release it, or move the date', flags.overdue),
     section('No release date', 'cards are assigned but the version has no date', flags.noDate),
   ].filter(Boolean);
-  if (flags.stale) parts.push(`_Also ${flags.stale} version${flags.stale > 1 ? 's' : ''} dated over 4 months ago never released or archived — worth a clean-up in Jira._`);
+  if (flags.stale) parts.push(`_Also ${flags.stale} old version${flags.stale > 1 ? 's' : ''} with no card activity in 2 months were never released or archived — worth archiving in Jira._`);
   return parts.join('\n\n');
 }
 
@@ -567,7 +585,16 @@ async function alertVersionIssues(client, { force = false, channel = RELEASE_REV
     type: 'button', action_id: `rel_mark_released_${e.id}`, value: `${e.id}|${e.shippedDay}|${e.name}`.substring(0, 2000),
     text: { type: 'plain_text', text: `Mark ${e.name} released`.substring(0, 75) },
   }));
-  const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: text.substring(0, 2900) } }];
+  // One block per section (Slack caps a block at 3000 chars) — never cut a line
+  const blocks = [];
+  for (const chunk of text.split('\n\n')) {
+    let buf = '';
+    for (const lineTxt of chunk.split('\n')) {
+      if ((buf + '\n' + lineTxt).length > 2900 && buf) { blocks.push({ type: 'section', text: { type: 'mrkdwn', text: buf } }); buf = lineTxt; }
+      else buf = buf ? `${buf}\n${lineTxt}` : lineTxt;
+    }
+    if (buf) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: buf } });
+  }
   if (buttons.length) blocks.push({ type: 'actions', elements: buttons });
   await client.chat.postMessage({ channel, thread_ts: threadTs, unfurl_links: false, unfurl_media: false, text, blocks });
 }
