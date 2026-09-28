@@ -2518,6 +2518,41 @@ slackApp.action(/^qa_followup_start_/, async ({ ack, body, client, logger }) => 
   });
 });
 
+// ── The report thread was deleted → remove my messages from it ────────
+// Slack reports a deleted thread-starting message in one of two ways:
+//   • it had replies  → message_changed, the message becomes a 'tombstone'
+//                       ("This message was deleted.")
+//   • no replies      → message_deleted (nothing of mine to clean)
+// Deleted REPLIES (including my own clean-up deletions) are ignored.
+function deletedThreadTs(event) {
+  if (event.subtype === 'message_changed' && event.message?.subtype === 'tombstone') {
+    return event.message.ts;
+  }
+  if (event.subtype === 'message_deleted') {
+    const prev = event.previous_message || {};
+    const isParent = !prev.thread_ts || prev.thread_ts === prev.ts;
+    if (isParent && (prev.reply_count > 0 || prev.thread_ts)) return event.deleted_ts || prev.ts;
+  }
+  return null;
+}
+
+slackApp.event('message', async ({ event, client, logger }) => {
+  const threadTs = deletedThreadTs(event);
+  if (!threadTs) return;
+  try {
+    const removed = await lib.retractOwnMessages(client, event.channel, threadTs, 'all');
+    const stopped = clientReport.stopTrackingThread(event.channel, threadTs);
+    if (removed || stopped.length) {
+      logger.info(`[QAAgent] Thread ${threadTs} deleted in ${event.channel} — removed ${removed} of my message(s)${stopped.length ? `, stopped follow-up on ${stopped.join(', ')}` : ''}`);
+    }
+  } catch (err) {
+    // thread_not_found etc. — the thread is already gone, nothing to clean
+    if (!/thread_not_found|message_not_found/.test(err.data?.error || '')) {
+      logger.warn('[QAAgent] Deleted-thread clean-up failed:', err.data?.error || err.message);
+    }
+  }
+});
+
 // ── Assign button on the analysis → member picker → create + assign ──
 slackApp.action('qa_assign_open', async ({ ack, body, client, logger }) => {
   await ack();

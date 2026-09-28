@@ -3279,6 +3279,34 @@ async function recoverOrphanedAnalyses(client) {
   console.log(`[Recovery] Boot sweep done — ${cleaned} orphaned status(es) removed, ${rerun} analysis re-run(s)`);
 }
 
+// ── Boot sweep: threads whose first message was deleted earlier ──────
+// The live listener handles deletions from now on; this catches ones that
+// happened while the bot was down or before the listener existed.
+async function cleanDeletedThreads(client) {
+  const oldest = String((Date.now() - 14 * 24 * 3600 * 1000) / 1000);
+  let threads = 0, removed = 0;
+  for (const channelId of Object.keys(MONITORED_CHANNELS)) {
+    let cursor;
+    for (let page = 0; page < 5; page++) {
+      let res;
+      try { res = await client.conversations.history({ channel: channelId, oldest, limit: 200, cursor }); }
+      catch (err) { console.warn(`[Cleanup] history failed for ${channelId}:`, err.data?.error || err.message); break; }
+      for (const m of res.messages || []) {
+        const isDeletedParent = m.subtype === 'tombstone' || (m.user === 'USLACKBOT' && /this message was deleted/i.test(m.text || ''));
+        if (!isDeletedParent || !m.reply_count) continue;
+        try {
+          const n = await retractOwnMessages(client, channelId, m.ts, 'all');
+          stopTrackingThread(channelId, m.ts);
+          if (n) { threads++; removed += n; }
+        } catch (_) {}
+      }
+      cursor = res.response_metadata?.next_cursor;
+      if (!cursor) break;
+    }
+  }
+  console.log(`[Cleanup] Deleted-thread sweep: removed ${removed} message(s) from ${threads} thread(s)`);
+}
+
 function register(realApp, realOpenai) {
   openai = realOpenai;
   loadKnowledgeBase();
@@ -3291,7 +3319,21 @@ function register(realApp, realOpenai) {
   startWeeklyReportScheduler(realApp.client);
   // Give the app a moment to finish booting, then recover interrupted work
   setTimeout(() => recoverOrphanedAnalyses(realApp.client).catch(err => console.warn('[Recovery] failed:', err.message)), 15000);
+  setTimeout(() => cleanDeletedThreads(realApp.client).catch(err => console.warn('[Cleanup] failed:', err.message)), 30000);
   console.log('✅ [ClientReport] module active (gpt-4o-mini) — monitoring:', Object.values(MONITORED_CHANNELS).join(', '));
+}
+
+// The report thread was deleted: stop following up there (the Jira cards
+// stay — only the Slack side is gone). Returns the keys that were stopped.
+function stopTrackingThread(channelId, threadTs) {
+  const stopped = [];
+  for (const [key, item] of followUpStore.entries()) {
+    if (item.channelId === channelId && item.threadTs === threadTs && !item.done) {
+      item.done = true;
+      stopped.push(key);
+    }
+  }
+  return stopped;
 }
 
 function isTracked(jiraKey) { return followUpStore.has(jiraKey) && !followUpStore.get(jiraKey).done; }
@@ -3314,5 +3356,5 @@ const SQUAD_PROJECTS = {
   'AI Features':       { project: 'AIT', parent: 'AIT-2179' },   // "AI | Client Report"
 };
 
-module.exports = { register, MONITORED_CHANNELS, registerFollowUp, isTracked, setTrackedAssignee,
+module.exports = { register, MONITORED_CHANNELS, registerFollowUp, isTracked, setTrackedAssignee, stopTrackingThread,
   PLATFORM_PARENTS, CLIENT_REPORT_FIX_VERSION_ID, SQUAD_PROJECTS, squadForThread, priorityForThread };
