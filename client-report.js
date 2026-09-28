@@ -127,6 +127,9 @@ const SQUAD_ROSTER = {
       'license', 'licence', 'seat', 'not eligible', 'license assignment',
       'remaining license', 'assigned license',
       'macrosnap', 'macro snap',
+      // Packages: selling packages, purchase, client cancellation / self-cancel
+      'package', 'packages', 'self-cancel', 'self cancel', 'cancel package',
+      'package cancellation', 'cancel subscription', 'purchase', 'checkout',
     ],
   },
   'Booking': {
@@ -309,6 +312,48 @@ function detectSquadFromKeywords(text) {
     if (score > bestScore) { bestScore = score; best = squad; }
   }
   return best;
+}
+
+// Routing signal from the report itself: CS usually cc's the owning squad's
+// PC/SM. Contacts shared by many squads (the Core leads) carry no signal,
+// so only contacts belonging to few squads count.
+function squadsFromMentions(text) {
+  const ids = new Set([...(text || '').matchAll(/<@([A-Z0-9]+)(?:\|[^>]*)?>/g)].map(m => m[1]));
+  if (!ids.size) return [];
+  const squadsOf = {};                                   // contact id → [squads]
+  // Only PC/BA contacts (index > 0) signal ownership. Leads (index 0) are
+  // SMs spanning several squads — being cc'd on a report says nothing.
+  for (const [squad, r] of Object.entries(SQUAD_ROSTER)) {
+    (r.contacts || []).forEach((c, i) => {
+      if (i > 0 && c.id) (squadsOf[c.id] = squadsOf[c.id] || []).push(squad);
+    });
+  }
+  const score = {};
+  for (const id of ids) {
+    const owned = squadsOf[id] || [];
+    if (!owned.length || owned.length > 2) continue;     // not a contact, or too generic to signal
+    for (const s of owned) score[s] = (score[s] || 0) + 1 / owned.length;
+  }
+  const best = Math.max(0, ...Object.values(score));
+  return best > 0 ? Object.keys(score).filter(s => score[s] === best) : [];
+}
+
+// Final squad: the AI's pick, unless the report explicitly cc'd another
+// squad's contacts — then trust the reporter, using keywords to break ties.
+function resolveSquad(analysis, context) {
+  const aiSquad = analysis?.tickets?.[0]?.squad || null;
+  const mentioned = squadsFromMentions(context);
+  if (mentioned.length && !mentioned.includes(aiSquad)) {
+    let pick = mentioned[0];
+    if (mentioned.length > 1) {
+      const kw = detectSquadFromKeywords(context);
+      if (kw && mentioned.includes(kw)) pick = kw;
+    }
+    console.log(`[Bot] Squad override: AI said "${aiSquad}", report cc'd ${mentioned.join(' / ')} → "${pick}"`);
+    for (const t of analysis?.tickets || []) t.squad = pick;
+    return pick;
+  }
+  return aiSquad || detectSquadFromKeywords(context);
 }
 
 function getSquadContacts(squad) {
@@ -742,7 +787,11 @@ SQUAD ROUTING HINTS:
     Olly / Olly Voice / Ask Olly, Smart Response, Knowledge Base, BI Dashboard,
     Push-up Challenge, Compare Check-in, anything AI-generated
   - "Payment & Billing": payments, subscriptions, invoices, refunds, Stripe,
-    licenses/seats, MacroSnap
+    licenses/seats, MacroSnap, and PACKAGES — selling packages, purchase /
+    checkout, client cancellation and the client self-cancel setting.
+    A package/subscription behaving wrongly (e.g. a client can cancel when
+    self-cancel is disabled) is Payment & Billing, NOT Platform Capability,
+    even if the symptom is described as a permission not being enforced.
   - "Booking": appointments, session booking, availability, booking pages
 
   - If issue involves BOTH an AI feature bug AND a license/billing error
@@ -1998,7 +2047,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
         await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
         return;
       }
-      const squad    = analysis.tickets[0]?.squad || detectSquadFromKeywords(context);
+      const squad    = resolveSquad(analysis, context);
       const contacts = resolveContactMentions(squad ? getSquadContacts(squad) : null);
       // The reporter is whoever started the thread (not whoever typed 'analyze')
       let reporterId = null;
@@ -2433,7 +2482,7 @@ Max 8 steps total. Plain English only.`,
       if (explicitType || parentMatch) logger.info(`[Bot] Explicit overrides: type=${explicitType || '-'} parent=${parentMatch ? parentMatch[1] : '-'}`);
     } catch (_) {}
 
-    const squad = analysis.tickets[0]?.squad || detectSquadFromKeywords(context);
+    const squad = resolveSquad(analysis, context);
 
     // Parse trigger: direct assignees vs cc/fyi (cc'd members are NEVER assigned)
     const { assignees: triggerAssignees, ccIds } = parseAssigneesFromTrigger(event.text, botUserId);
@@ -2766,7 +2815,7 @@ const autoAnalysisHandler = withWatchdog('auto-analysis', async ({ event, client
     }
     logger.info(`[Bot] Auto-analyze: Severity=${analysis.severity}`);
 
-    const squad    = analysis.tickets[0]?.squad || detectSquadFromKeywords(context);
+    const squad    = resolveSquad(analysis, context);
     const contacts = resolveContactMentions(squad ? getSquadContacts(squad) : null);
 
     const replyText = buildAnalysisReply(analysis, squad, contacts, event.user || null);
