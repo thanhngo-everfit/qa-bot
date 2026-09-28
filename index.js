@@ -1551,6 +1551,42 @@ const coreMentionHandler = async ({ event, client, logger }) => {
   // Monitored (client-report) channels own their specialised flows —
   // EXCEPT ticket creation, which runs through this one proven pipeline in
   // every channel. Same prompt, same parsers, same behavior everywhere.
+  // Bulk admin command: "move all tickets from this channel to epic UP-x".
+  // Edits many cards at once, so it's limited to BULK_ADMINS (default: Thanh).
+  const bulkText = (event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim();
+  const bulkMatch = bulkText.match(/\bmove\b[\s\S]*?\b(?:tickets?|issues?|cards?)\b[\s\S]*?\bchannel\b[\s\S]*?\b(?:epic|parent)\s+((?:UP|PAY|AIT|CHAL)-\d+)\b/i);
+  if (bulkMatch) {
+    const epicKey = bulkMatch[1].toUpperCase();
+    const tTs = event.thread_ts || event.ts;
+    const admins = new Set((process.env.BULK_ADMINS || 'U0142GU335F').split(',').map(s => s.trim()));
+    if (!admins.has(event.user)) {
+      await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, text: "Moving a whole channel's cards is limited to admins — ask Thanh to run it." });
+      return;
+    }
+    const st = agentStatus(client, event.channel, tTs);
+    await st.start(`I'm moving this channel's cards to ${epicKey}`);
+    try {
+      const r = await lib.bulkSetParentForChannel(event.channel, epicKey, {
+        onProgress: (n, total) => st.update(`I'm moving this channel's cards to ${epicKey} (${n}/${total})`),
+      });
+      await st.done();
+      const title = (await lib.getIssueTitle(epicKey)) || epicKey;
+      const failLines = r.failed.slice(0, 10).map(f => `• ${f.key}: ${String(f.reason).substring(0, 120)}`).join('\n');
+      await client.chat.postMessage({
+        channel: event.channel, thread_ts: tTs, unfurl_links: false,
+        text: r.total === 0
+          ? `Nothing to move — every card from this channel is already under <${JIRA_HOST}/browse/${epicKey}|${title}>.`
+          : `Moved *${r.moved.length}* of ${r.total} card(s) from this channel to <${JIRA_HOST}/browse/${epicKey}|${title}>.` +
+            (r.failed.length ? `\n${r.failed.length} couldn't be moved:\n${failLines}` : ''),
+      });
+      logger.info(`[QAAgent] Bulk parent → ${epicKey}: moved ${r.moved.length}/${r.total}, failed ${r.failed.length}`);
+    } catch (err) {
+      await st.done();
+      await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, text: `I couldn't finish moving the cards: \`${(err.message || '').substring(0, 200)}\`` });
+    }
+    return;
+  }
+
   // Health self-report: '@QA Agent status' / 'are you alive'
   if (/^(status|health|are you (alive|ok|up)|ping)\b/i.test((event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim())) {
     const up = Math.round((Date.now() - BOOT_AT) / 1000);

@@ -781,6 +781,32 @@ async function transitionToStatus(issueKey, statusName) {
   return { ok: true, status: t.to?.name || statusName };
 }
 
+// ── Bulk: put every card from a Slack channel under one epic ─────────
+// Cards are found by the channel id in their description (the Slack thread
+// link every card carries). Epics and sub-tasks can't take an epic parent,
+// so they're excluded. Paced to stay well inside Jira's rate limits.
+async function bulkSetParentForChannel(channelId, epicKey, { onProgress } = {}) {
+  const jql = `text ~ "${channelId}" AND (parent is EMPTY OR parent != ${epicKey}) AND issuetype not in (Epic, Sub-task) ORDER BY created DESC`;
+  const keys = [];
+  for (let startAt = 0; startAt < 1000; startAt += 100) {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
+      params: { jql, startAt, maxResults: 100, fields: 'summary' },
+      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+    });
+    const batch = (res.data?.issues || []).map(i => i.key);
+    keys.push(...batch);
+    if (batch.length < 100) break;
+  }
+  const moved = [], failed = [];
+  for (let i = 0; i < keys.length; i++) {
+    try { await setIssueParent(keys[i], epicKey); moved.push(keys[i]); }
+    catch (err) { failed.push({ key: keys[i], reason: err.response?.data?.errors ? JSON.stringify(err.response.data.errors) : (err.response?.status || err.message) }); }
+    if (onProgress && (i + 1) % 20 === 0) { try { await onProgress(i + 1, keys.length); } catch (_) {} }
+    await new Promise(r => setTimeout(r, 250));
+  }
+  return { total: keys.length, moved, failed };
+}
+
 // ── Names for the ticket confirmation (cached) ───────────────────────
 let _lastSprint = null;
 function getLastActiveSprint() { return _lastSprint; }
@@ -1100,7 +1126,7 @@ module.exports = {
   SMART_MODEL, aiComplete, aiCall, toolsSupported,
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient, getIssueEpic,
   shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion, listOpenEpics, setIssueParent,
-  getLastActiveSprint, getVersionName, getIssueTitle,
+  getLastActiveSprint, getVersionName, getIssueTitle, bulkSetParentForChannel,
   CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, challengerEpicFor, challengerSummary,
   LOW_PRIORITY_SPRINT_ID, LOW_PRIORITY_STATUS, LOW_PRIORITIES, LOW_PRIORITY_RULES, lowPriorityRule, getSprintInfo, transitionToStatus,
   PROJECT_BOARDS, getActiveSprintForProject,

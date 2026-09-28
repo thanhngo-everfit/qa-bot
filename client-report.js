@@ -2832,6 +2832,7 @@ function withWatchdog(name, handler, budgetMs, note = null) {
   };
 }
 
+let _botUidCache = null;
 const autoAnalysisHandler = withWatchdog('auto-analysis', async ({ event, client, logger }) => {
   // Only monitored channels
   if (!MONITORED_CHANNELS[event.channel]) return;
@@ -2854,6 +2855,13 @@ const autoAnalysisHandler = withWatchdog('auto-analysis', async ({ event, client
 
   // Skip bare @mentions (handled by app_mention)
   if (/^<@[A-Z0-9]+>(\s+\w+)?$/.test(text)) return;
+  // Skip ANY message addressed to the bot: it's a command ("review all
+  // critical issues…", "move all tickets…"), handled by app_mention — not
+  // an issue report to analyse.
+  try {
+    if (!_botUidCache) _botUidCache = (await client.auth.test()).user_id;
+    if (_botUidCache && text.includes(`<@${_botUidCache}>`)) return;
+  } catch (_) {}
 
   try {
     logger.info(`[Bot] Auto-analyzing new thread in ${MONITORED_CHANNELS[event.channel]}`);
