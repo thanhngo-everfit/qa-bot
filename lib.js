@@ -790,8 +790,31 @@ async function transitionToStatus(issueKey, statusName) {
 // (the Slack link in the card's description — covers cards QA created by
 // hand) OR its thread mentions a card key / Jira link.
 const NO_TICKET_RE = /\b(?:threads?|posts?|issues?|reports?|messages?|bugs?)\b[\s\S]*?\b(?:without|no|missing|not have|don'?t have|doesn'?t have|haven'?t)\b[\s\S]*?\b(?:tickets?|cards?|jira)\b/i;
+// A post's first line as plain text that is safe INSIDE a Slack link label
+// (<url|label> breaks on "<", ">" and "|"): unwraps links and mentions,
+// drops formatting, trims to 90 chars.
+function postLabel(text) {
+  const t = (text || '')
+    .replace(/<!subteam\^[A-Z0-9]+(?:\|[^>]*)?>/g, '')
+    .replace(/<@[A-Z0-9]+(?:\|([^>]*))?>/g, (m, n) => n || '')
+    .replace(/<(?:mailto:)?[^|>]+\|([^>]+)>/g, '$1')
+    .replace(/<((?:https?|mailto):[^>]+)>/g, '$1')
+    .replace(/[`*_~<>|]/g, '')
+    .replace(/&amp;/g, '&').replace(/&lt;|&gt;/g, '')
+    .replace(/\s+/g, ' ').trim();
+  return (t || 'post').substring(0, 90);
+}
+
+// "create tickets under each thread without a ticket" — the ACTION
+const BULK_CREATE_RE = /\b(?:create|log|make|open|file)\b[\s\S]*?\b(?:tickets?|cards?)\b[\s\S]*?\b(?:each|every|all)\b[\s\S]*?\b(?:threads?|posts?|issues?)\b|\b(?:create|log)\b[\s\S]*?\b(?:tickets?|cards?)\b[\s\S]*?\b(?:without|missing)\b/i;
+function isBulkCreateRequest(text) {
+  return BULK_CREATE_RE.test((text || '').replace(/<@[A-Z0-9]+>/g, ''));
+}
+// The REPORT is a question — never when the message asks to create.
 function isNoTicketReportRequest(text) {
-  return NO_TICKET_RE.test((text || '').replace(/<@[A-Z0-9]+>/g, ''));
+  const t = (text || '').replace(/<@[A-Z0-9]+>/g, '');
+  if (isBulkCreateRequest(t) || /\b(?:create|log|make|file)\b/i.test(t)) return false;
+  return NO_TICKET_RE.test(t);
 }
 
 async function findThreadsWithoutTickets(client, channelId, { days = 120, botUserId = null } = {}) {
@@ -807,6 +830,15 @@ async function findThreadsWithoutTickets(client, channelId, { days = 120, botUse
       if (t.length < 25) continue;                                               // "a huy nè", pings
       if (botUserId && t.includes(`<@${botUserId}>`)) continue;                  // commands to the bot
       if (/^~[\s\S]*~\s*(`?nab`?)?\s*$/i.test(t)) continue;                      // struck out / "NAB"
+      if (/\bQ\s*&\s*A\b/i.test(t.substring(0, 60))) continue;                       // questions, not bugs
+      // An issue post carries a signal: a [Platform]/[Feature] tag, a severity,
+      // or the team group ping with some substance. Chatter ("why I'm here"),
+      // a lone test email or a "setting parent…" note has none of these.
+      const hasTag = /\[[^\]]{2,40}\]/.test(t);
+      const hasSeverity = /\b(critical|highest|high|medium|low|lowest)\b/i.test(t.substring(0, 40));
+      const pingsTeam = /<!subteam\^/.test(t);
+      const plain = t.replace(/<[^>]+>/g, '').replace(/[`*_~]/g, '').trim();
+      if (!hasTag && !hasSeverity && !(pingsTeam && plain.length >= 40)) continue;
       posts.push({ ts: m.ts, user: m.user, text: t, replies: m.reply_count || 0 });
     }
     cursor = res.response_metadata?.next_cursor;
@@ -1197,7 +1229,7 @@ module.exports = {
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient, getIssueEpic,
   shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion, listOpenEpics, setIssueParent,
   getLastActiveSprint, getVersionName, getIssueTitle, bulkSetParentForChannel, BULK_MOVE_RE, isBulkMoveRequest,
-  isNoTicketReportRequest, findThreadsWithoutTickets,
+  isNoTicketReportRequest, findThreadsWithoutTickets, isBulkCreateRequest, BULK_CREATE_RE, postLabel,
   CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, challengerEpicFor, challengerSummary,
   LOW_PRIORITY_SPRINT_ID, LOW_PRIORITY_STATUS, LOW_PRIORITIES, LOW_PRIORITY_RULES, lowPriorityRule, getSprintInfo, transitionToStatus,
   PROJECT_BOARDS, getActiveSprintForProject,

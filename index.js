@@ -1587,6 +1587,50 @@ const coreMentionHandler = async ({ event, client, logger }) => {
     return;
   }
 
+  // Bulk create: "create tickets under each thread without a ticket".
+  // Admin-only; shows the count and asks for confirmation before creating.
+  if (lib.isBulkCreateRequest(event.text)) {
+    const tTs = event.thread_ts || event.ts;
+    const admins = new Set((process.env.BULK_ADMINS || 'U0142GU335F').split(',').map(s => s.trim()));
+    if (!admins.has(event.user)) {
+      await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, text: 'Creating cards for a whole channel is limited to admins — ask Thanh to run it.' });
+      return;
+    }
+    const daysMatch = (event.text || '').match(/\b(\d{1,3})\s*(?:days?|ngày)\b/i);
+    const days = daysMatch ? Math.min(parseInt(daysMatch[1], 10), 365) : 120;
+    const st = agentStatus(client, event.channel, tTs);
+    await st.start("I'm finding issue posts without a ticket");
+    let r;
+    try {
+      const botUserId = (await client.auth.test()).user_id;
+      r = await lib.findThreadsWithoutTickets(client, event.channel, { days, botUserId });
+    } catch (err) {
+      await st.done();
+      await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, text: `I couldn't check the channel: \`${(err.message || '').substring(0, 200)}\`` });
+      return;
+    }
+    await st.done();
+    if (!r.missing.length) {
+      await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, text: `Every issue post from the last ${days} days already has a ticket — nothing to create.` });
+      return;
+    }
+    const id = `${Date.now()}`;
+    BULK_CREATE_JOBS.set(id, { channel: event.channel, tsList: r.missing.map(p => p.ts), by: event.user, statusTs: null, threadTs: tTs });
+    const preview = r.missing.slice(0, 10).map(p => `• <https://everfitt.slack.com/archives/${event.channel}/p${p.ts.replace('.', '')}|${lib.postLabel(p.text)}>`).join('\n');
+    await client.chat.postMessage({
+      channel: event.channel, thread_ts: tTs, unfurl_links: false, unfurl_media: false,
+      text: `I found ${r.missing.length} issue posts without a ticket.`,
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: `I found *${r.missing.length}* issue posts from the last ${days} days without a ticket. I'll create one card in each thread and reply there.\n${preview}${r.missing.length > 10 ? `\n_…and ${r.missing.length - 10} more._` : ''}` } },
+        { type: 'actions', elements: [
+          { type: 'button', style: 'primary', action_id: 'qa_bulk_create_go', value: id, text: { type: 'plain_text', text: `Create ${r.missing.length} tickets` } },
+          { type: 'button', action_id: 'qa_bulk_create_cancel', value: id, text: { type: 'plain_text', text: 'Cancel' } },
+        ] },
+      ],
+    });
+    return;
+  }
+
   // Report: "which threads have no ticket?" — read-only, anyone can ask.
   if (lib.isNoTicketReportRequest(event.text)) {
     const tTs = event.thread_ts || event.ts;
@@ -1600,8 +1644,7 @@ const coreMentionHandler = async ({ event, client, logger }) => {
       await st.done();
       const link = (ts) => `https://everfitt.slack.com/archives/${event.channel}/p${ts.replace('.', '')}`;
       const date = (ts) => new Date(parseFloat(ts) * 1000 + 7 * 3600 * 1000).toISOString().substring(0, 10);
-      const firstLine = (t) => t.replace(/<!subteam\^[A-Z0-9]+(\|[^>]*)?>/g, '').replace(/<@[A-Z0-9]+(\|[^>]*)?>/g, '')
-        .replace(/<(https?:[^|>]+)(\|[^>]*)?>/g, '$1').replace(/\s+/g, ' ').trim().substring(0, 90);
+      const firstLine = (t) => lib.postLabel(t);
       const shown = r.missing.slice(0, 40);
       const lines = shown.map(p => `• ${date(p.ts)} · <@${p.user}> · <${link(p.ts)}|${firstLine(p.text) || 'post'}>`).join('\n');
       await client.chat.postMessage({
@@ -2570,6 +2613,51 @@ slackApp.action('qa_core_dup_follow', async ({ ack, body, client, logger }) => {
     lines.length
       ? `🔍 <@${body.user.id}> chose *follow up on existing*:\n${lines.join('\n')}\n_I'm tracking the open ones — I'll follow up every 2 business days until closed._`
       : `🔍 I couldn't find live tickets in this thread anymore.`);
+});
+
+// ── Bulk create: confirm / cancel ─────────────────────────────────────
+const BULK_CREATE_JOBS = new Map();   // id → { channel, tsList, by, threadTs }
+
+slackApp.action('qa_bulk_create_cancel', async ({ ack, body, client }) => {
+  await ack();
+  BULK_CREATE_JOBS.delete(body.actions?.[0]?.value);
+  try {
+    await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: 'Cancelled — no tickets created.',
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `Cancelled by <@${body.user.id}> — no tickets created.` } }] });
+  } catch (_) {}
+});
+
+slackApp.action('qa_bulk_create_go', async ({ ack, body, client, logger }) => {
+  await ack();
+  const id = body.actions?.[0]?.value;
+  const job = BULK_CREATE_JOBS.get(id);
+  BULK_CREATE_JOBS.delete(id);                       // one run per confirmation
+  const channel = body.channel.id, msgTs = body.message.ts, clicker = body.user.id;
+  const admins = new Set((process.env.BULK_ADMINS || 'U0142GU335F').split(',').map(s => s.trim()));
+  const show = (text) => client.chat.update({ channel, ts: msgTs, text, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }] }).catch(() => {});
+  if (!job) { await show('This confirmation expired (the bot restarted). Run the command again — it only picks up posts that still have no ticket.'); return; }
+  if (!admins.has(clicker)) { BULK_CREATE_JOBS.set(id, job); return; }
+
+  const total = job.tsList.length;
+  let done = 0, failed = 0;
+  await show(`Creating tickets… 0/${total}`);
+  for (const ts of job.tsList) {
+    try {
+      // Same pipeline as typing "create ticket" in that thread: the card is
+      // built from the thread and the confirmation is posted under it.
+      await coreMentionHandler({
+        event: { channel, thread_ts: ts, ts, user: clicker, text: 'create ticket' },
+        client, logger,
+      });
+      done++;
+    } catch (err) {
+      failed++;
+      logger.warn(`[QAAgent] Bulk create failed for thread ${ts}:`, err?.message || err);
+    }
+    if ((done + failed) % 5 === 0 || done + failed === total) await show(`Creating tickets… ${done + failed}/${total}`);
+    await new Promise(r => setTimeout(r, 4000));      // pace AI + Jira calls
+  }
+  await show(`Done — processed *${total}* thread(s): ${done} ticket(s) created${failed ? `, ${failed} failed (check those threads)` : ''}. Each card is confirmed in its own thread.`);
 });
 
 // ── "Select an epic" prompt for cards created without one ─────────────
