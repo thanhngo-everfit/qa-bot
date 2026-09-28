@@ -1048,6 +1048,16 @@ function explicitPriority(text) {
   return map[w] || null;
 }
 
+// Production-issues cards: a single leading [Production Audit] tag.
+// Strips client-report tags and QA's own [Prod]/[Production] markers so the
+// title never reads "[Production Audit][Prod][…]". Idempotent.
+function productionAuditSummary(summary, prefix = '[Production Audit]') {
+  let s = (summary || '').trim();
+  s = s.replace(/^(?:\s*\[(?:client\s*report|client\s*request|request|prod|production|production\s*audit)\]\s*)+/i, '').trim();
+  s = s.replace(/\[(?:prod|production)\]/ig, '').replace(/\s{2,}/g, ' ').trim();
+  return `${prefix}${s.startsWith('[') ? '' : ' '}${s}`.substring(0, 250);
+}
+
 // ── slackify: normalize AI output for Slack ──────────────────────────
 // Models (especially gpt-4o-mini) leak markdown: **bold**, ### headers,
 // [text](url). Slack needs *bold* and <url|text>. Also auto-link every
@@ -1096,7 +1106,7 @@ module.exports = {
   PROJECT_BOARDS, getActiveSprintForProject,
   resolveUserName, resolveInlineMentions, warmUserNames, replaceMentionsCached, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
-  slackify, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, clientReportSummary,
+  slackify, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, clientReportSummary, productionAuditSummary,
   PRIORITY_RUBRIC, SEVERITY_TO_JIRA, JIRA_TO_SEVERITY, explicitPriority,
   DISCOVERY_PROJECT, createDiscoveryItem, updateIssueDescription, addIssueComment, mdToAdfDoc,
 };

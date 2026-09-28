@@ -1966,7 +1966,11 @@ HARD RULES — follow exactly:
     // Hardcoded fix version = "To be confirmed" (ID 12023)
     // Report channels keep the client-report convention ("Client Report (TBD)");
     // everywhere else uses the default "To be confirmed".
-    const inReportChannel = !!clientReport.MONITORED_CHANNELS[event.channel];
+    // Channel profile: the CS channels use client-report conventions; the
+    // production-issues channel has its own prefix and epic.
+    const chProfile       = clientReport.channelProfile(event.channel);
+    const inReportChannel = chProfile?.kind === 'client-report';
+    const inProdAudit     = chProfile?.kind === 'production-audit';
     const fixVersionId = inReportChannel ? clientReport.CLIENT_REPORT_FIX_VERSION_ID : '12023';
 
     // Squad-owned projects: Payment & Billing / Booking → PAY, AI Features →
@@ -2039,7 +2043,7 @@ HARD RULES — follow exactly:
     // report threads) the priority the analysis already told the team,
     // then the parser's own rubric-based pick.
     const explicitPrio = lib.explicitPriority(event.text);
-    const threadPrio   = (!explicitPrio && inReportChannel)
+    const threadPrio   = (!explicitPrio && (inReportChannel || inProdAudit))
       ? await clientReport.priorityForThread(client, event.channel, threadTs) : null;
     for (const t of expandedTickets) {
       const chosen = explicitPrio || threadPrio;
@@ -2078,6 +2082,9 @@ HARD RULES — follow exactly:
       if (!epicKey && projectRoute?.challenger) {
         parentKey = await lib.challengerEpicFor(ticket.platform);
         logger.info(`[QABot] Challenger epic for ${ticket.platform}: ${parentKey || 'none'}`);
+      } else if (inProdAudit && !epicKey && !projectRoute) {
+        parentKey = chProfile.epic;
+        logger.info(`[QABot] Production Audit epic: ${parentKey}`);
       } else if (inReportChannel && !epicKey && projectRoute) {
         parentKey = projectRoute.parent;
         logger.info(`[QABot] ${targetProject} Client Report epic: ${parentKey}`);
@@ -2133,8 +2140,10 @@ HARD RULES — follow exactly:
       if (projectRoute?.challenger) {
         ticket.summary = lib.challengerSummary(ticket.summary, ticket.platform);
       }
-      if (clientReport.MONITORED_CHANNELS[event.channel]) {
+      if (inReportChannel) {
         ticket.summary = lib.clientReportSummary(ticket.summary, issueType);
+      } else if (inProdAudit) {
+        ticket.summary = lib.productionAuditSummary(ticket.summary, chProfile.prefix);
       }
       logger.info(`[QABot] Creating ${issueType}: ${ticket.summary} epic=${epicKey || 'none'} parent=${parentKey || 'none'}`);
       await agentSt.update('📝 _QA Agent is creating the Jira ticket(s)…_');

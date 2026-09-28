@@ -26,7 +26,21 @@ const MONITORED_CHANNELS = {
   'C03H5DCAZ45': 'bug_reporting-internal',
   'C064GEV0D6Z': 'enterprise_bug_reporting_internal',
   'C075QSJS81X': 'customer-request-discussion',
+  'C0BG6LT3MH7': 'production-issues',
 };
+
+// What each monitored channel's cards look like. The three CS channels use
+// the client-report conventions ([Client Report] prefix, Client Report
+// platform epics, 'Client Report (TBD)', squad-owned projects). The
+// production-issues channel — QA/BA findings in production — gets its own
+// prefix and the Production Audit epic, with the default Fix Version.
+const CHANNEL_PROFILES = {
+  'C0BG6LT3MH7': { kind: 'production-audit', prefix: '[Production Audit]', epic: 'UP-79457' },
+};
+function channelProfile(channelId) {
+  if (CHANNEL_PROFILES[channelId]) return CHANNEL_PROFILES[channelId];
+  return MONITORED_CHANNELS[channelId] ? { kind: 'client-report' } : null;
+}
 
 // ── Squad Roster (from squad_roster.xlsx) ─────
 // Each squad has: SM, PC, BA, role-based engineers, and domain keywords for detection
@@ -3208,6 +3222,7 @@ async function sendWeeklyReport(client) {
   const { user_id: botUserId } = await client.auth.test().catch(() => ({}));
 
   for (const [channelId, channelName] of Object.entries(MONITORED_CHANNELS)) {
+    if (channelProfile(channelId)?.kind !== 'client-report') continue;   // CS channels only
     console.log(`[WeeklyReport] Scanning #${channelName}...`);
     const msgs    = await scanChannelThreads(client, channelId, oldest, latest);
     const threads = await Promise.all(msgs.map(msg => enrichThread(client, channelId, msg, botUserId)));
@@ -3366,5 +3381,5 @@ const SQUAD_PROJECTS = {
   'AI Features':       { project: 'AIT', parent: 'AIT-2179' },   // "AI | Client Report"
 };
 
-module.exports = { register, MONITORED_CHANNELS, registerFollowUp, isTracked, setTrackedAssignee, stopTrackingThread,
+module.exports = { register, MONITORED_CHANNELS, CHANNEL_PROFILES, channelProfile, registerFollowUp, isTracked, setTrackedAssignee, stopTrackingThread,
   PLATFORM_PARENTS, CLIENT_REPORT_FIX_VERSION_ID, SQUAD_PROJECTS, squadForThread, priorityForThread };
