@@ -1260,7 +1260,21 @@ function getRosterBucket(userName) {
 //   - "Tien (iOS)"         → iOS Coach   (preserves Coach/Client if LLM already chose it)
 //   - title "Backend Eng"  → API
 // Returns null when the role can't be inferred — the LLM-parsed platform stays.
-async function inferPlatformFromAssignee(client, slackUserId, fallbackPlatform) {
+// Client vs Coach for a mobile platform: keep what the original platform
+// said; otherwise weigh the report's wording ("client app", "client" vs
+// "coach app", "coach"). Ties default to Client in report wording, Coach
+// when nothing points either way (internal QA threads).
+function mobileSide(originalPlatform, text) {
+  if (/client/i.test(originalPlatform || '')) return 'Client';
+  if (/coach/i.test(originalPlatform || ''))  return 'Coach';
+  const t = (text || '').toLowerCase();
+  const client = (t.match(/client app/g) || []).length * 3 + (t.match(/\bclients?\b/g) || []).length;
+  const coach  = (t.match(/coach app/g)  || []).length * 3 + (t.match(/\bcoach(es)?\b/g) || []).length;
+  if (client === 0 && coach === 0) return 'Coach';
+  return client >= coach ? 'Client' : 'Coach';
+}
+
+async function inferPlatformFromAssignee(client, slackUserId, fallbackPlatform, contextText = '') {
   try {
     const info        = await client.users.info({ user: slackUserId });
     const profile     = info.user?.profile || {};
@@ -1302,12 +1316,14 @@ async function inferPlatformFromAssignee(client, slackUserId, fallbackPlatform) 
     const fallbackBucket = getPlatformBucket(fallbackPlatform);
     if (bucket === fallbackBucket) return fallbackPlatform;
 
-    // Mismatch → switch to the assignee's bucket. Default to "Coach" for mobile
-    // (most internal threads concern the Coach app; QA can adjust if it's Client).
+    // Mismatch → switch to the assignee's bucket. For mobile, decide Client
+    // vs Coach from the original platform, then from the report wording
+    // (client-app reports are common in the report channels).
     if (bucket === 'api')     return 'API';
     if (bucket === 'web')     return 'Web';
-    if (bucket === 'ios')     return 'iOS Coach';
-    if (bucket === 'android') return 'Android Coach';
+    const side = mobileSide(fallbackPlatform, contextText);
+    if (bucket === 'ios')     return `iOS ${side}`;
+    if (bucket === 'android') return `Android ${side}`;
     return null;
   } catch (err) {
     console.warn(`[QABot] Could not infer platform for ${slackUserId}: ${err.message}`);
@@ -1320,6 +1336,12 @@ async function inferPlatformFromAssignee(client, slackUserId, fallbackPlatform) 
 // we swap the first bracketed block when the assignee's role overrides the platform.
 function rewriteSummaryPrefix(summary, newPlatform) {
   const prefix = `[${newPlatform}]`;
+  const PLATFORM_TAG = /\[(?:iOS|Android)(?: (?:Client|Coach))?\]|\[(?:API|Web|BE|FE|Backend|Frontend|Mobile)\]/i;
+  // Replace the platform tag wherever it sits (it may follow [Client Report]);
+  // never touch the leading [Client Report]/[Client Request] tag.
+  if (PLATFORM_TAG.test(summary)) return summary.replace(PLATFORM_TAG, prefix);
+  const lead = summary.match(/^(\[(?:client\s*report|client\s*request|request)\])/i);
+  if (lead) return `${lead[1]}${prefix}${summary.slice(lead[1].length)}`;
   if (summary.startsWith('[')) return summary.replace(/^\[[^\]]+\]/, prefix);
   return `${prefix}${summary}`;
 }
@@ -2016,7 +2038,7 @@ HARD RULES — follow exactly:
       // Override platform + summary prefix based on the first assignee's role.
       // Skip for tickets with fixed prefix (e.g. [Client Request] app icon format).
       if (assigneeSlackIds.length > 0 && !ticket.skipPlatformOverride) {
-        const inferred = await inferPlatformFromAssignee(client, assigneeSlackIds[0], ticket.platform);
+        const inferred = await inferPlatformFromAssignee(client, assigneeSlackIds[0], ticket.platform, `${ticket.summary || ''} ${ticket.description || ''}`);
         if (inferred && inferred !== ticket.platform) {
           logger.info(`[QABot] Platform override: ${ticket.platform} → ${inferred} (assignee role)`);
           ticket.summary  = rewriteSummaryPrefix(ticket.summary, inferred);
