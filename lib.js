@@ -702,6 +702,16 @@ const LOW_PRIORITY_SPRINT_ID = process.env.LOW_PRIORITY_SPRINT_ID || '5097';
 const LOW_PRIORITY_STATUS    = process.env.LOW_PRIORITY_STATUS    || 'Need Review';
 const LOW_PRIORITIES         = new Set(['Low', 'Lowest']);
 
+// Per-project review parking for Low/Lowest cards. Add a board here (or
+// override the sprint in Railway) — the status is matched by name.
+const LOW_PRIORITY_RULES = {
+  UP:   { sprint: LOW_PRIORITY_SPRINT_ID,                        status: LOW_PRIORITY_STATUS },
+  CHAL: { sprint: process.env.CHAL_LOW_PRIORITY_SPRINT_ID || '5098', status: process.env.CHAL_LOW_PRIORITY_STATUS || 'Need Review' },
+};
+function lowPriorityRule(projectKey, priority) {
+  return LOW_PRIORITIES.has(priority) ? (LOW_PRIORITY_RULES[projectKey] || null) : null;
+}
+
 const _sprintInfo = new Map();
 async function getSprintInfo(sprintId) {
   if (!sprintId) return null;
@@ -1043,7 +1053,7 @@ module.exports = {
   shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion, listOpenEpics, setIssueParent,
   getLastActiveSprint, getVersionName, getIssueTitle,
   CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, challengerEpicFor, challengerSummary,
-  LOW_PRIORITY_SPRINT_ID, LOW_PRIORITY_STATUS, LOW_PRIORITIES, getSprintInfo, transitionToStatus,
+  LOW_PRIORITY_SPRINT_ID, LOW_PRIORITY_STATUS, LOW_PRIORITIES, LOW_PRIORITY_RULES, lowPriorityRule, getSprintInfo, transitionToStatus,
   resolveUserName, resolveInlineMentions, warmUserNames, replaceMentionsCached, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
   slackify, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, clientReportSummary,

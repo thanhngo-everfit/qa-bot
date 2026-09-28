@@ -2157,25 +2157,28 @@ HARD RULES — follow exactly:
 
       // Low/Lowest priority UP cards are parked for review: the review
       // sprint instead of the active sprint, then the Need Review status.
-      const isLowUp = targetProject === JIRA_PROJECT && lib.LOW_PRIORITIES.has(ticket.priority);
-      let cardSprintId = sprintId, cardSprintName = null, statusSet = null;
-      if (isLowUp) {
-        const info = await lib.getSprintInfo(lib.LOW_PRIORITY_SPRINT_ID);
+      // Low/Lowest priority cards on a board with a review rule (UP → 5097,
+      // CHAL → 5098) are parked: the review sprint, then Need Review.
+      const lowRule = lib.lowPriorityRule(targetProject, ticket.priority);
+      let cardSprintId = projectRoute ? null : sprintId;   // squad boards otherwise get no sprint
+      let cardSprintName = null, statusSet = null;
+      if (lowRule) {
+        const info = await lib.getSprintInfo(lowRule.sprint);
         if (info && info.state !== 'closed') {
-          cardSprintId = lib.LOW_PRIORITY_SPRINT_ID;
+          cardSprintId = lowRule.sprint;
           cardSprintName = info.name;
         } else {
-          jira.notes = [...(jira.notes || []), `review sprint ${lib.LOW_PRIORITY_SPRINT_ID} is ${info ? 'closed' : 'unavailable'} — used the active sprint`];
+          jira.notes = [...(jira.notes || []), `review sprint ${lowRule.sprint} is ${info ? 'closed' : 'unavailable'}${cardSprintId ? ' — used the active sprint' : ' — no sprint set'}`];
         }
       }
-      const sprintAdded = (cardSprintId && !projectRoute)
+      const sprintAdded = cardSprintId
         ? await withBudget('sprint add', 20000, () => addIssueToSprint(jira.key, cardSprintId), false)
         : false;
-      if (isLowUp) {
-        const moved = await withBudget('status → ' + lib.LOW_PRIORITY_STATUS, 20000,
-          () => lib.transitionToStatus(jira.key, lib.LOW_PRIORITY_STATUS), { ok: false, reason: 'timed out' });
+      if (lowRule) {
+        const moved = await withBudget('status → ' + lowRule.status, 20000,
+          () => lib.transitionToStatus(jira.key, lowRule.status), { ok: false, reason: 'timed out' });
         if (moved.ok) statusSet = moved.status;
-        else jira.notes = [...(jira.notes || []), `couldn't set status ${lib.LOW_PRIORITY_STATUS} (${moved.reason})`];
+        else jira.notes = [...(jira.notes || []), `couldn't set status ${lowRule.status} (${moved.reason})`];
       }
 
       // ── Feature 3: Add acceptance criteria checklist ──
