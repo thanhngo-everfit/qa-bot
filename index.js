@@ -1293,7 +1293,7 @@ async function inferPlatformFromAssignee(client, slackUserId, fallbackPlatform, 
     if (bucket) console.log(`[QABot] Roster match: ${profile.real_name || profile.display_name} → ${bucket}`);
 
     // 1) Everfit convention: parenthesized role tag in the display name, e.g. "Hong (BE)"
-    const tagMatch = bucket ? null : haystack.match(/\((be|fe|backend|frontend|ios|android|web|dl|data)\)/i);
+    const tagMatch = bucket ? null : haystack.match(/\(\s*(be|fe|backend|frontend|ios|android|web|dl|data)\s*\)/i);   // tolerates "( DL )"
     if (tagMatch) {
       const tag = tagMatch[1].toLowerCase();
       if      (tag === 'dl' || tag === 'data')                         bucket = 'data';   // data labelling
