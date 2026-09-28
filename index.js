@@ -2007,6 +2007,11 @@ HARD RULES — follow exactly:
     }
     logger.info(`[QABot] Attachments ready: ${attachments.filter(a => a.buffer).length}/${attachments.length} in ${((Date.now() - tAtt) / 1000).toFixed(1)}s${skippedAtts.length ? ` · ${skippedAtts.length} skipped (too large)` : ''}`);
     const sprintId       = await getActiveSprintId();
+    // Every board runs its own sprints (PAY → Payment NN, AIT → AINN,
+    // CHAL → Challenger N): the card joins ITS project's active sprint.
+    const targetSprint = targetProject === JIRA_PROJECT
+      ? (sprintId ? { id: sprintId, name: lib.getLastActiveSprint()?.name || null } : null)
+      : await lib.getActiveSprintForProject(targetProject);
     logger.info(`[QABot] Active sprint: ${sprintId || 'none found — ticket will not be added to a sprint'}`);
 
     const createdJiras = [];
@@ -2160,8 +2165,8 @@ HARD RULES — follow exactly:
       // Low/Lowest priority cards on a board with a review rule (UP → 5097,
       // CHAL → 5098) are parked: the review sprint, then Need Review.
       const lowRule = lib.lowPriorityRule(targetProject, ticket.priority);
-      let cardSprintId = projectRoute ? null : sprintId;   // squad boards otherwise get no sprint
-      let cardSprintName = null, statusSet = null;
+      let cardSprintId = targetSprint?.id || null;
+      let cardSprintName = targetSprint?.name || null, statusSet = null;
       if (lowRule) {
         const info = await lib.getSprintInfo(lowRule.sprint);
         if (info && info.state !== 'closed') {
@@ -2263,7 +2268,7 @@ HARD RULES — follow exactly:
           out.push(`*Fix Version:* ${f.versionName || (jira.applied?.fixVersion ? 'set' : 'none')}`);
           out.push(f.sprintName
             ? `*Sprint:* ${f.sprintName}`
-            : `*Sprint:* ${f.project === 'CHAL' ? 'not added — planned on the Challenger board' : f.project && f.project !== JIRA_PROJECT ? `not added — ${f.project} triages it into its own sprint` : 'not added (no active sprint found)'}`);
+            : `*Sprint:* not added (no active ${f.project || ''} sprint found)`);
           if (f.statusSet) out.push(`*Status:* ${f.statusSet} (low priority — parked for review)`);
           const problems = (jira.notes || []).filter(n => n !== 'no epic set');
           if (problems.length) out.push(`_${problems.join(' · ')}_`);

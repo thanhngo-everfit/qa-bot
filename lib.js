@@ -311,6 +311,44 @@ function agentStatus(client, channel, threadTs) {
 }
 
 // ── Jira: Active Sprint (never "SM Review") ──────────────────────────
+// Board per project, as reported by each project's own sprints (Sprint
+// field = customfield_10010 on this site). UP keeps its discovered board.
+const PROJECT_BOARDS = {
+  PAY:  process.env.PAY_BOARD_ID  || '317',   // Payment NN
+  AIT:  process.env.AIT_BOARD_ID  || '218',   // AINN
+  CHAL: process.env.CHAL_BOARD_ID || '619',   // Challenger N
+};
+
+// The active dev sprint of a project's board — never "SM Review" and never a
+// review-parking sprint (those are chosen explicitly for low priority).
+async function getActiveSprintForProject(projectKey) {
+  try {
+    let boardId = PROJECT_BOARDS[projectKey] || null;
+    if (!boardId) {
+      const boardRes = await axios.get(`${JIRA_HOST}/rest/agile/1.0/board`, {
+        params: { projectKeyOrId: projectKey, type: 'scrum' },
+        headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+      });
+      boardId = boardRes.data?.values?.[0]?.id || null;
+    }
+    if (!boardId) return null;
+    const sprintRes = await axios.get(`${JIRA_HOST}/rest/agile/1.0/board/${boardId}/sprint`, {
+      params: { state: 'active' },
+      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+    });
+    const parking = new Set(Object.values(LOW_PRIORITY_RULES).map(r => String(r.sprint)));
+    const eligible = (sprintRes.data?.values || [])
+      .filter(s => !/sm\s*review/i.test(s.name || '') && !parking.has(String(s.id)))
+      .sort((a, b) => new Date(b.startDate || 0) - new Date(a.startDate || 0));
+    if (!eligible.length) return null;
+    console.log(`[Sprint] ${projectKey}: active sprint ${eligible[0].name} (${eligible[0].id})`);
+    return { id: eligible[0].id, name: eligible[0].name };
+  } catch (err) {
+    console.warn(`[Sprint] ${projectKey} active sprint lookup failed:`, err.response?.status || err.message);
+    return null;
+  }
+}
+
 async function getActiveSprintId() {
   try {
     const boardRes = await axios.get(`${JIRA_HOST}/rest/agile/1.0/board`, {
@@ -326,7 +364,8 @@ async function getActiveSprintId() {
     const sprints = sprintRes.data?.values || [];
     // Multiple sprints can be active at once (dev sprint + "SM Review").
     // Tickets must ALWAYS go to the real Active Sprint — never SM Review.
-    const eligible = sprints.filter(s => !/sm\s*review/i.test(s.name || ''));
+    const parking = new Set(Object.values(LOW_PRIORITY_RULES).map(r => String(r.sprint)));
+    const eligible = sprints.filter(s => !/sm\s*review/i.test(s.name || '') && !parking.has(String(s.id)));
     if (!eligible.length) return null;
     eligible.sort((a, b) => new Date(b.startDate || 0) - new Date(a.startDate || 0));
     console.log(`[Sprint] Selected active sprint: ${eligible[0].name} (${eligible[0].id})`);
@@ -1054,6 +1093,7 @@ module.exports = {
   getLastActiveSprint, getVersionName, getIssueTitle,
   CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, challengerEpicFor, challengerSummary,
   LOW_PRIORITY_SPRINT_ID, LOW_PRIORITY_STATUS, LOW_PRIORITIES, LOW_PRIORITY_RULES, lowPriorityRule, getSprintInfo, transitionToStatus,
+  PROJECT_BOARDS, getActiveSprintForProject,
   resolveUserName, resolveInlineMentions, warmUserNames, replaceMentionsCached, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
   slackify, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, clientReportSummary,
