@@ -12,7 +12,7 @@ const {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiCall,
   agentStatus, getActiveSprintId, createJiraIssueResilient, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest,
-  warmUserNames, replaceMentionsCached,
+  warmUserNames, replaceMentionsCached, PRIORITY_RUBRIC,
   resolveInlineMentions, qaTaskWork,
 } = require('./lib');
 
@@ -386,6 +386,20 @@ async function squadForThread(client, channelId, threadTs) {
     const parentText = msgs[0]?.text || '';
     return resolveSquad({ tickets: [{}] }, parentText) || null;
   } catch (_) { return null; }
+}
+
+// The priority the thread's analysis already stated (so the card matches
+// what the team was told). Returns a Jira priority name or null.
+async function priorityForThread(client, channelId, threadTs) {
+  try {
+    const rr = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 });
+    for (const m of rr.messages || []) {
+      if (!m.bot_id) continue;
+      const mm = (m.text || '').match(/\*?Priority:\*?\s*(?::[a-z_]+:\s*)?[^A-Za-z\n]*(Critical|High|Medium|Low|Trivial)\b/);
+      if (mm) return SEVERITY_META[mm[1]]?.jiraPriority || null;
+    }
+  } catch (_) {}
+  return null;
 }
 
 function getSquadContacts(squad) {
@@ -842,33 +856,7 @@ PLATFORM DETECTION (strict):
   - API                      → backend/data fix, account changes, email updates, sync errors, anything needing DB/server access
 
 ════════════════════════════════════════════
-SEVERITY STANDARD — apply strictly, this determines urgency and SLA:
-
-  🔴 Critical
-     WHEN: production outage, data loss/corruption, security breach, payment failure,
-           complete login failure for all users, crash on launch, GDPR/legal risk.
-     SLA: Same-day fix required.
-
-  🟠 High
-     WHEN: core feature fully broken with NO workaround, crash on a common user action,
-           billing/subscription access broken for a paying coach, sync failure blocking
-           daily coaching work for multiple users.
-     SLA: Fix within 1–2 working days.
-
-  🟡 Medium
-     WHEN: feature partially broken but a workaround exists, issue isolated to 1 account/device,
-           confusing UX blocking a specific task, typo in critical copy, minor data display error,
-           account update request (email change, etc.), UI misalignment causing confusion.
-     SLA: Fix within current sprint.
-
-  🟢 Low
-     WHEN: cosmetic spacing/padding/color issue, minor visual glitch, edge case affecting <1%
-           of users, nice-to-have improvement, non-blocking inconsistency.
-     SLA: Schedule in backlog.
-
-  ⚪ Trivial
-     WHEN: internal-only cosmetic issue, dev/staging env only, theoretical concern.
-     SLA: Next available cycle.
+${PRIORITY_RUBRIC}
 
   Severity drives the Jira priority field:
     Critical → Highest | High → High | Medium → Medium | Low → Low | Trivial → Lowest
@@ -1853,6 +1841,9 @@ async function findOrRegisterTracked(client, channelId, threadTs, botBotId, botU
 async function draftTicketsLean(context, slackThreadUrl, userDirective) {
   const system = `You draft Jira tickets from an Everfit Slack support thread. Return ONLY JSON:
 {"severity":"Low|Medium|High|Critical","tickets":[{"summary":"...","type":"Bug|Task","platform":"iOS Client|iOS Coach|Android Client|Android Coach|Web|API","assignee_names":[],"description":"..."}]}
+
+Severity must follow this rubric:
+${PRIORITY_RUBRIC}
 
 RULES:
 - summary: "[Client Report|Request][<platform>][<Feature>] Clear English title" — <=100 chars. Broken behavior → Bug + "Client Report"; data fix/config/account/enable/export/request → Task + "Request".
@@ -3324,4 +3315,4 @@ const SQUAD_PROJECTS = {
 };
 
 module.exports = { register, MONITORED_CHANNELS, registerFollowUp, isTracked, setTrackedAssignee,
-  PLATFORM_PARENTS, CLIENT_REPORT_FIX_VERSION_ID, SQUAD_PROJECTS, squadForThread };
+  PLATFORM_PARENTS, CLIENT_REPORT_FIX_VERSION_ID, SQUAD_PROJECTS, squadForThread, priorityForThread };

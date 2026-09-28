@@ -830,6 +830,65 @@ function clientReportSummary(summary, issueType) {
   return `${tag}${s.startsWith('[') ? '' : ' '}${s}`.substring(0, 250);
 }
 
+// ── ONE priority rubric for every flow ───────────────────────────────
+// Used by report analysis, QA-logged bugs/tasks and card drafting, so the
+// same issue gets the same priority no matter how it enters. Judge the
+// IMPACT on the affected user and whether a workaround exists — never
+// how many people reported it (a CS report is almost always ONE client;
+// that is reach, not severity).
+const PRIORITY_RUBRIC = `PRIORITY RUBRIC — Everfit (apply strictly)
+Scale: Critical=Highest · High · Medium · Low · Trivial=Lowest
+
+Decide by the IMPACT of the behaviour on a user who hits it, and whether a
+workaround exists. Do NOT lower priority because only one client/coach
+reported it — nearly every report comes from one person. Reach can only
+RAISE priority (many users affected → go up one level), never lower it.
+Only treat it as account-specific (usually Medium) when the cause is clearly
+that account's own data or configuration (e.g. a data fix for one coach).
+
+Critical (Highest) — the product is unusable or harm is done:
+  app crashes on launch · nobody can log in · data loss or corruption
+  (workouts, logs, messages deleted) · payments charged wrongly or failing
+  broadly · security or privacy leak · legal/GDPR risk
+
+High — a core flow is broken for the affected user and there is NO
+reasonable workaround:
+  cannot stay logged in / logged out every time the app is reopened ·
+  cannot log a workout or track a session · cannot send or receive messages ·
+  sync failure that loses or withholds data · crash on a common action ·
+  client cannot access purchased or assigned content · billing blocks a
+  paying coach · basic troubleshooting (reinstall, re-login, reconnect)
+  already tried and did not help · coach forced into recurring manual work
+
+Medium — broken, but a workaround exists or it is not a core flow:
+  wrong data display that doesn't block work · non-core feature broken ·
+  confusing UX blocking one specific task · issue caused by one account's
+  own data/config · account or configuration request
+
+Low — cosmetic or rare:
+  spacing, colour, alignment · minor visual glitch · rare edge case ·
+  nice-to-have improvement
+
+Trivial (Lowest) — internal only: staging/dev-only issue, theoretical
+concern, typo in non-critical internal copy
+
+Tie-breakers: "tried basic troubleshooting, still broken" = no workaround.
+Recurring pain (every login, every workout) beats one-off pain.
+When torn between two levels, choose the HIGHER one.`;
+
+const SEVERITY_TO_JIRA = { Critical: 'Highest', High: 'High', Medium: 'Medium', Low: 'Low', Trivial: 'Lowest' };
+const JIRA_TO_SEVERITY = { Highest: 'Critical', High: 'High', Medium: 'Medium', Low: 'Low', Lowest: 'Trivial' };
+
+// An explicit priority in the request always wins ("create card, high priority")
+function explicitPriority(text) {
+  const m = (text || '').match(/\b(critical|highest|high|medium|low|lowest|trivial)\s+priority\b|\bpriority\s*[:=]?\s*(critical|highest|high|medium|low|lowest|trivial)\b|\b(P[0-4])\b/i);
+  if (!m) return null;
+  const w = (m[1] || m[2] || m[3]).toLowerCase();
+  const map = { critical: 'Highest', highest: 'Highest', high: 'High', medium: 'Medium', low: 'Low', lowest: 'Lowest', trivial: 'Lowest',
+                p0: 'Highest', p1: 'High', p2: 'Medium', p3: 'Low', p4: 'Lowest' };
+  return map[w] || null;
+}
+
 // ── slackify: normalize AI output for Slack ──────────────────────────
 // Models (especially gpt-4o-mini) leak markdown: **bold**, ### headers,
 // [text](url). Slack needs *bold* and <url|text>. Also auto-link every
@@ -876,5 +935,6 @@ module.exports = {
   resolveUserName, resolveInlineMentions, warmUserNames, replaceMentionsCached, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
   slackify, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, clientReportSummary,
+  PRIORITY_RUBRIC, SEVERITY_TO_JIRA, JIRA_TO_SEVERITY, explicitPriority,
   DISCOVERY_PROJECT, createDiscoveryItem, updateIssueDescription, addIssueComment, mdToAdfDoc,
 };

@@ -459,6 +459,7 @@ Examples:
 - "App crashes on launch for iOS 17 users" → Highest
 
 NEVER return null/undefined/empty. Always make a reasonable guess based on the first message.` },
+      { role: 'system', content: lib.PRIORITY_RUBRIC + '\n\nSet each ticket\'s "priority" (Highest/High/Medium/Low/Lowest) by this rubric.' },
       { role: 'user', content: `${userDirective ? `REQUESTER DIRECTIVE (obey this): ${userDirective}\n\n` : ''}QA bug report thread:\n\n${context}` },
     ],
   });
@@ -562,6 +563,7 @@ PRIORITY RUBRIC (for tasks, default to Medium unless thread suggests otherwise):
 - "Lowest" — Trivial / cleanup
 
 NEVER return null/undefined/empty. Always make a reasonable guess based on the thread.` },
+      { role: 'system', content: lib.PRIORITY_RUBRIC + '\n\nSet each ticket\'s "priority" (Highest/High/Medium/Low/Lowest) by this rubric.' },
       { role: 'user', content: `${userDirective ? `REQUESTER DIRECTIVE (obey this): ${userDirective}\n\n` : ''}Task request thread:\n\n${context}` },
     ],
   });
@@ -1991,6 +1993,20 @@ HARD RULES — follow exactly:
       } else {
         logger.info(`[QABot] ${ids.length} assignees → creating ${ids.length} cards (one per assignee)`);
         for (const id of ids) expandedTickets.push({ ...ticket, _assigneeIds: [id] });
+      }
+    }
+
+    // Priority precedence: an explicit priority in the request, then (in
+    // report threads) the priority the analysis already told the team,
+    // then the parser's own rubric-based pick.
+    const explicitPrio = lib.explicitPriority(event.text);
+    const threadPrio   = (!explicitPrio && inReportChannel)
+      ? await clientReport.priorityForThread(client, event.channel, threadTs) : null;
+    for (const t of expandedTickets) {
+      const chosen = explicitPrio || threadPrio;
+      if (chosen && chosen !== t.priority) {
+        logger.info(`[QABot] Priority ${t.priority || '-'} → ${chosen} (${explicitPrio ? 'requested' : 'from the analysis'})`);
+        t.priority = chosen;
       }
     }
 
