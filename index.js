@@ -1388,7 +1388,18 @@ function extractChannelKeywords(channelName) {
 // ── Find the best parent epic in the ACTIVE SPRINT ──────────────────────
 // More reliable than canvas reading: always queries live Jira data.
 // Filters by platform prefix, then ranks by keyword overlap with channel name.
-async function findSprintParent(activeSprintId, platform, channelName) {
+// Significant words for judging whether an epic relates to a card: no
+// platform names, no generic project words, no short words.
+function epicRelevanceTokens(text) {
+  const STOP = new Set(['web','ios','android','api','client','coach','app','apps','phase','enhance','enhancement',
+    'update','improve','improvement','fixe','fix','issue','sprint','squad','all','core','misc',
+    'product','feature','the','and','for','with','from','into','this','that','review','task']);
+  const stem = (w) => w.replace(/ies$/, 'y').replace(/(?<=[a-z]{3})es$/, '').replace(/(?<=[a-z]{3})s$/, '');
+  return new Set((text || '').toLowerCase().split(/[^a-z0-9]+/)
+    .map(stem).filter(w => w.length >= 4 && !STOP.has(w) && !/^p\d/.test(w)));
+}
+
+async function findSprintParent(activeSprintId, platform, channelName, ticketSummary = '', ticketText = '', issueType = 'Bug') {
   if (!activeSprintId) return null;
   try {
     const platformPrefix = {
@@ -1419,16 +1430,35 @@ async function findSprintParent(activeSprintId, platform, channelName) {
     if (issues.length === 1) return issues[0].key;
 
     // Multiple candidates — rank by keyword overlap with channel name
-    const keywords = extractChannelKeywords(channelName);
-    let best = null, bestScore = -1;
+    // Only take an epic that RELATES to this card. Previously the first
+    // platform-prefixed epic won when nothing matched ("Web | Caching and
+    // Loading Enhancement" for a PI-title review task). Unsure → null, and
+    // the requester is asked to pick.
+    const titleWordsCard = epicRelevanceTokens(ticketSummary);          // the card's title decides
+    const cardWords = epicRelevanceTokens(`${ticketSummary} ${ticketText}`);
+    const chanWords = extractChannelKeywords(channelName);
+    let best = null, bestScore = 0;
     for (const issue of issues) {
-      const titleWords = issue.fields.summary.toLowerCase().split(/[\s|\-]+/);
-      const score = keywords.filter(k => titleWords.some(w => w.includes(k))).length;
+      const title = (issue.fields.summary || '').toLowerCase();
+      const isFixesBucket = /\bfixes\b/.test(title);
+      if (isFixesBucket) {
+        // Catch-all "… | Fixes of … | Sprint N" buckets suit BUGS only
+        if (!/^bug$/i.test(issueType || '')) continue;
+        const score = 1 + (/misc/.test(title) ? 0.5 : 0);
+        if (score > bestScore) { bestScore = score; best = issue.key; }
+        continue;
+      }
+      const epicWords = epicRelevanceTokens(title);
+      // Must share a word with the card's TITLE (descriptions quote examples
+      // and noise), and at least two with the card overall.
+      const sharedTitle = [...epicWords].filter(w => titleWordsCard.has(w)).length;
+      const shared = [...epicWords].filter(w => cardWords.has(w)).length;
+      const chan = chanWords.filter(k => title.includes(k)).length * 0.5;
+      const score = (sharedTitle >= 1 && shared >= 2) ? shared + sharedTitle + chan : 0;
       if (score > bestScore) { bestScore = score; best = issue.key; }
     }
-    const result = best || issues[0].key;
-    console.log(`[QABot] Sprint parent found: ${result} (score=${bestScore}, platform=${platform}, channel=${channelName})`);
-    return result;
+    console.log(`[QABot] Sprint parent: ${best || 'none — will ask'} (score=${bestScore}, platform=${platform}, type=${issueType})`);
+    return best;
   } catch (err) {
     console.warn('[QABot] findSprintParent failed:', err.message);
     return null;
@@ -1956,7 +1986,7 @@ HARD RULES — follow exactly:
     const explicitType = availableTypes
       .filter(t => !/^(bug|task)$/i.test(t))
       .sort((a, b) => b.length - a.length)
-      .find(t => new RegExp(`\\b${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(event.text));
+      .find(t => new RegExp(`\\b${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:s|es)?\\b`, 'i').test(event.text));
     if (explicitType) issueType = explicitType;
     const isTask = issueType !== 'Bug';   // non-Bug types use the task parser + skip dup-guard
     logger.info(`[QABot] Issue type: ${issueType}${explicitType ? ' (explicit)' : ' (classified)'}`);
@@ -2209,7 +2239,7 @@ HARD RULES — follow exactly:
           (async () => {
             const channelInfo = await client.conversations.info({ channel: event.channel });
             const channelName = channelInfo.channel?.name || '';
-            const found = await findSprintParent(sprintId, ticket.platform, channelName);
+            const found = await findSprintParent(sprintId, ticket.platform, channelName, ticket.summary || '', ticket.description || '', issueType);
             if (found) logger.info(`[QABot] Parent from active sprint: ${found} (channel: ${channelName})`);
             return found;
           })(),
@@ -2423,7 +2453,7 @@ HARD RULES — follow exactly:
     // In the report channels every card is tracked automatically, so no
     // button — just say so. Elsewhere, offer the Follow up button.
     const autoTracked = !!clientReport.MONITORED_CHANNELS[event.channel];
-    const followButtons = autoTracked ? [] : createdJiras.slice(0, 5).map(({ jira, assigneeSlackIds }) => ({
+    const followButtons = autoTracked ? [] : createdJiras.slice(0, 25).map(({ jira, assigneeSlackIds }) => ({
       type: 'button',
       action_id: `qa_followup_start_${jira.key}`,
       text: { type: 'plain_text', text: createdJiras.length > 1 ? `Follow up ${jira.key}` : 'Follow up', emoji: true },
@@ -2444,35 +2474,50 @@ HARD RULES — follow exactly:
       ...(replyBlocks ? { blocks: replyBlocks } : {}),
     });
 
-    // No epic found → ask whoever triggered the creation to pick one.
-    for (const { jira } of createdJiras) {
-      if (jira.applied?.epic) continue;
+    // No epic found → ask whoever triggered the creation to pick one: ONE
+    // picker per project for all epic-less cards of this request, with the
+    // epics most related to the cards listed first.
+    const epicLess = createdJiras.filter(({ jira }) => !jira.applied?.epic);
+    const byProject = new Map();
+    for (const cj of epicLess) {
+      const p = cj.jira.key.split('-')[0];
+      if (!byProject.has(p)) byProject.set(p, []);
+      byProject.get(p).push(cj);
+    }
+    for (const [projectKey, group] of byProject) {
       try {
-        const projectKey = jira.key.split('-')[0];
-        const epics = projectKey === lib.CHALLENGER_PROJECT
-          ? await lib.listOpenEpics('UP', 100, 'Challenger')      // CHAL's epics live in UP
+        let epics = projectKey === lib.CHALLENGER_PROJECT
+          ? await lib.listOpenEpics('UP', 100, 'Challenger')          // CHAL's epics live in UP
           : await lib.listOpenEpics(projectKey);
         if (!epics.length) continue;
+        const cardTitles = epicRelevanceTokens(group.map(g => g.ticket.summary || '').join(' '));
+        const rel = (e) => [...epicRelevanceTokens(e.summary)].filter(w => cardTitles.has(w)).length;
+        epics = [...epics].map((e, i) => ({ e, i, r: rel(e) }))
+          .sort((a, b) => b.r - a.r || a.i - b.i).map(x => x.e);          // related first, then most recent
         const options = epics.slice(0, 100).map(e => ({
           text:  { type: 'plain_text', text: `${e.key} — ${e.summary}`.substring(0, 75) },
           value: e.key,
         }));
+        const keys = group.map(g => g.jira.key);
+        const keyList = keys.length === 1
+          ? `<${group[0].jira.url}|${keys[0]}>`
+          : `${keys.length} cards (${keys.join(', ')})`;
         const who = event.user ? `<@${event.user}>` : 'Someone';
         await client.chat.postMessage({
           channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-          text: `${who}, I couldn't find an epic for ${jira.key} — please select one.`,
+          text: `${who}, I couldn't find the right epic for ${keys.join(', ')} — please select one.`,
           blocks: [
-            { type: 'section', text: { type: 'mrkdwn', text: `${who}, I couldn't find an epic for <${jira.url}|${jira.key}>. Please select one:` } },
-            { type: 'actions', block_id: `qa_epic:${jira.key}`, elements: [
+            { type: 'section', text: { type: 'mrkdwn', text: `${who}, I couldn't find the right epic for ${keyList}. Please select one${keys.length > 1 ? ' — it applies to all of them' : ''}:` } },
+            { type: 'actions', block_id: `qa_epic:${keys.join(',')}`.substring(0, 255), elements: [
               { type: 'static_select', action_id: 'qa_epic_pick',
                 placeholder: { type: 'plain_text', text: 'Select an epic' }, options },
-              { type: 'button', action_id: 'qa_epic_skip', value: jira.key,
+              { type: 'button', action_id: 'qa_epic_skip', value: keys.join(',').substring(0, 2000),
                 text: { type: 'plain_text', text: 'Skip' } },
             ] },
           ],
         });
       } catch (err) {
-        logger.warn(`[QABot] Epic prompt for ${jira.key} failed:`, err.data?.error || err.message);
+        logger.warn(`[QABot] Epic prompt for ${projectKey} failed:`, err.data?.error || err.message);
       }
     }
 
@@ -2664,20 +2709,20 @@ slackApp.action('qa_bulk_create_go', async ({ ack, body, client, logger }) => {
 slackApp.action('qa_epic_pick', async ({ ack, body, client, logger }) => {
   await ack();
   const action  = body.actions?.[0] || {};
-  const cardKey = (action.block_id || '').replace(/^qa_epic:/, '');
+  const cardKeys = (action.block_id || '').replace(/^qa_epic:/, '').split(',').filter(Boolean);
   const epicKey = action.selected_option?.value;
   const epicTxt = action.selected_option?.text?.text || epicKey;
   const clicker = body.user?.id;
-  if (!cardKey || !epicKey) return;
-  let line;
-  try {
-    await lib.setIssueParent(cardKey, epicKey);
-    line = `Added <${JIRA_HOST}/browse/${cardKey}|${cardKey}> to *${epicTxt}* · by <@${clicker}>`;
-    logger.info(`[QABot] ${cardKey} → epic ${epicKey} (picked by ${clicker})`);
-  } catch (err) {
-    line = `I couldn't add ${cardKey} to ${epicKey} (${err.response?.status || err.message}). Please link it in Jira.`;
-    logger.warn(`[QABot] Epic pick failed for ${cardKey}:`, err.response?.data || err.message);
+  if (!cardKeys.length || !epicKey) return;
+  const ok = [], bad = [];
+  for (const k of cardKeys) {
+    try { await lib.setIssueParent(k, epicKey); ok.push(k); }
+    catch (err) { bad.push(k); logger.warn(`[QABot] Epic pick failed for ${k}:`, err.response?.data || err.message); }
   }
+  logger.info(`[QABot] ${ok.join(', ')} → epic ${epicKey} (picked by ${clicker})`);
+  const link = (k) => `<${JIRA_HOST}/browse/${k}|${k}>`;
+  let line = ok.length ? `Added ${ok.map(link).join(', ')} to *${epicTxt}* · by <@${clicker}>` : '';
+  if (bad.length) line += `${line ? '\n' : ''}I couldn't add ${bad.join(', ')} to ${epicKey} — please link ${bad.length > 1 ? 'them' : 'it'} in Jira.`;
   try {
     await client.chat.update({
       channel: body.channel.id, ts: body.message.ts, text: line,
@@ -2688,8 +2733,8 @@ slackApp.action('qa_epic_pick', async ({ ack, body, client, logger }) => {
 
 slackApp.action('qa_epic_skip', async ({ ack, body, client }) => {
   await ack();
-  const cardKey = body.actions?.[0]?.value || '';
-  const line = `No epic set for <${JIRA_HOST}/browse/${cardKey}|${cardKey}> · skipped by <@${body.user?.id}>`;
+  const keys = (body.actions?.[0]?.value || '').split(',').filter(Boolean);
+  const line = `No epic set for ${keys.map(k => `<${JIRA_HOST}/browse/${k}|${k}>`).join(', ')} · skipped by <@${body.user?.id}>`;
   try {
     await client.chat.update({
       channel: body.channel.id, ts: body.message.ts, text: line,
