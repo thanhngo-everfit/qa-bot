@@ -13,6 +13,7 @@ const {
 } = lib;
 
 const clientReport = require('./client-report');
+const release = require('./release');
 console.log(`[Boot] QA Agent build ${(process.env.RAILWAY_GIT_COMMIT_SHA || 'local').substring(0, 7)} · node ${process.version} · mem limit ${Math.round(require('os').totalmem() / 1048576)}MB`);
 
 // Survive unexpected errors: Node exits on unhandled rejections by default,
@@ -1696,6 +1697,12 @@ const coreMentionHandler = async ({ event, client, logger }) => {
     return;
   }
 
+  // Release coordination: "draft release for Web 4.37.1" / "release plan"
+  if (release.isReleaseCommand(event.text)) {
+    await release.handleCommand({ event, client, logger });
+    return;
+  }
+
   // Health self-report: '@QA Agent status' / 'are you alive'
   if (/^(status|health|are you (alive|ok|up)|ping)\b/i.test((event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim())) {
     const up = Math.round((Date.now() - BOOT_AT) / 1000);
@@ -2945,4 +2952,6 @@ slackApp.action('qa_core_dup_cancel', async ({ ack, body, client }) => {
   await slackApp.start(process.env.PORT || 3001);
   console.log('✅ QABot running on port', process.env.PORT || 3001);
   clientReport.register(slackApp, openai);
+  release.register(slackApp);
+  release.startScheduler(slackApp.client);
 })();
