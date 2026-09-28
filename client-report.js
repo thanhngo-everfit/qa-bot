@@ -44,7 +44,7 @@ const SQUAD_ROSTER = {
     domains: [
       'workout', 'training', 'exercise', 'program', 'autoflow', 'video workout',
       'task assignment', 'master planner', 'gamification', 'leaderboard',
-      'studio', 'on-demand', 'sequence',
+      'studio', 'on-demand',
       'onboarding', 'onboarding flow', 'onboarding form', 'form', 'questionnaire',
       'form assignment', 'assignment',
     ],
@@ -127,9 +127,14 @@ const SQUAD_ROSTER = {
       'license', 'licence', 'seat', 'not eligible', 'license assignment',
       'remaining license', 'assigned license',
       'macrosnap', 'macro snap',
-      // Packages: selling packages, purchase, client cancellation / self-cancel
+      // Packages & sequences (payment products) and every asset they deliver:
+      // selling, purchase, activation/trial, cancellation / self-cancel, and
+      // the assignment or removal of the included assets
       'package', 'packages', 'self-cancel', 'self cancel', 'cancel package',
       'package cancellation', 'cancel subscription', 'purchase', 'checkout',
+      'sequence', 'sequences', 'activate package', 'package activation',
+      'trial package', 'package asset', 'package assets', 'sequence asset',
+      'sequence assets', 'assets from package', 'assets from sequence',
     ],
   },
   'Booking': {
@@ -295,6 +300,14 @@ function buildSlackThreadUrl(channelId, threadTs) {
 
 // ── Keyword-based squad detection (fast, no API call) ──
 function detectSquadFromKeywords(text) {
+  // Precedence: assets (programs, workouts, forms, …) granted or removed by a
+  // package or sequence belong to Payment & Billing — even though 'program',
+  // 'workout' and 'assignment' are Training & Automation words.
+  if (/\b(packages?|sequences?)\b/i.test(text || '')) return 'Payment & Billing';
+  return detectSquadFromKeywordsScored(text);
+}
+
+function detectSquadFromKeywordsScored(text) {
   const lower = text.toLowerCase();
   let best = null, bestScore = 0;
   for (const [squad, roster] of Object.entries(SQUAD_ROSTER)) {
@@ -774,6 +787,8 @@ SQUAD ROUTING HINTS:
   Valid squads (use these EXACT names):
   - "Core Product - Training & Automation": Autoflow, Onboarding Flow, onboarding
     forms, form assignment, questionnaires, task assignment, workouts, programs
+    — EXCEPT when those assets were granted or removed by a package or
+    sequence (see Payment & Billing)
   - "Core Product - Platform Capability": login/auth, permissions, workspace &
     account settings, white label, localization, AND all integrations/middleware
     (Apple Health, Garmin, Fitbit, Whoop, Zapier, webhooks, sync, Google Calendar)
@@ -787,8 +802,12 @@ SQUAD ROUTING HINTS:
     Olly / Olly Voice / Ask Olly, Smart Response, Knowledge Base, BI Dashboard,
     Push-up Challenge, Compare Check-in, anything AI-generated
   - "Payment & Billing": payments, subscriptions, invoices, refunds, Stripe,
-    licenses/seats, MacroSnap, and PACKAGES — selling packages, purchase /
-    checkout, client cancellation and the client self-cancel setting.
+    licenses/seats, MacroSnap, PACKAGES and SEQUENCES (payment products) —
+    selling, purchase / checkout, activation and trials, cancellation and the
+    client self-cancel setting, AND every asset delivered through them: if a
+    client got the wrong assets, missing assets, or lost assets after
+    activating, trialling or cancelling a package or sequence, it is Payment &
+    Billing, not Training & Automation.
     A package/subscription behaving wrongly (e.g. a client can cancel when
     self-cancel is disabled) is Payment & Billing, NOT Platform Capability,
     even if the symptom is described as a permission not being enforced.
