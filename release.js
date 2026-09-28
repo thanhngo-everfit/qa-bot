@@ -43,6 +43,12 @@ const FAMILY_GROUPS = {
 
 const DONE_STATUSES = new Set(['qa success', 'done', 'released', 'closed', 'will not fix', 'ba success', 'qa completed']);
 const NOT_A_RELEASE = /^(?:n\s*\/?\s*a|to be confirmed|will not release)\b|\(tbd\)|\btbd\b/i;   // placeholders, not releases
+// A real release version is "<Platform> <number>" — e.g. iOS Coach 2.83.1,
+// Web 4.37.1, Academy CMS 0.2.4, API Challenger 1.0.0. Two-part numbers
+// (iOS Coach 2.83) are the team's normal minor format. Anything else —
+// "Training - Mobile cards" — is a PC's draft placeholder.
+const VALID_VERSION_RE = /^(?:(?:iOS|Android)\s+(?:Coach|Client)|Web|API|Internal API|Academy\s+(?:Web|CMS)|CMS|MP API|(?:Web|API|iOS|Android)\s+Challenger)\s+\d+(?:\.\d+){1,3}$/i;
+const isRealVersionName = (name) => VALID_VERSION_RE.test((name || '').trim());
 
 const headers = () => ({ Authorization: jiraAuth(), Accept: 'application/json' });
 const vnNow   = () => new Date(Date.now() + 7 * 3600 * 1000);
@@ -51,6 +57,8 @@ const prettyDate = (iso) => {
   const d = new Date(`${iso}T00:00:00Z`);
   return d.toLocaleString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
 };
+// Slack link labels must escape & < > (a version like "Training - API & Web")
+const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const versionUrl = (id) => `${JIRA_HOST}/projects/${RELEASE_PROJECT}/versions/${id}/tab/release-report-all-issues`;
 
 // ── Families ─────────────────────────────────────────────────────────
@@ -110,7 +118,7 @@ async function upcomingGroups({ workdays = LOOKAHEAD_WORKDAYS, onlyVersion = nul
   const days = new Set(upcomingWorkdays(workdays));
   const pick = onlyVersion
     ? versions.filter(v => v.name.toLowerCase() === onlyVersion.toLowerCase() || v.name.toLowerCase().startsWith(onlyVersion.toLowerCase()))
-    : versions.filter(v => v.releaseDate && days.has(v.releaseDate));
+    : versions.filter(v => v.releaseDate && days.has(v.releaseDate) && isRealVersionName(v.name));   // draft names are alerted, never drafted
   const groups = new Map();
   for (const v of pick) {
     const fam = versionFamily(v.name);
@@ -256,10 +264,10 @@ function renderAnnouncement(d) {
   const lines = [];
   lines.push(`*Em gửi release cho ${g.family === 'Challenger' ? '[CHALLENGER APP]' : g.family}* ${tags}`.trim());
   if (d.perVersion.length === 1) {
-    lines.push(`• Fix version: <${versionUrl(d.perVersion[0].id)}|${d.perVersion[0].name}>`);
+    lines.push(`• Fix version: <${versionUrl(d.perVersion[0].id)}|${esc(d.perVersion[0].name)}>`);
   } else {
     lines.push('• Fix version:');
-    for (const v of d.perVersion) lines.push(`    ◦ ${mobile && appSide(v.name) ? `${appSide(v.name)}: ` : ''}<${versionUrl(v.id)}|${v.name}>`);
+    for (const v of d.perVersion) lines.push(`    ◦ ${mobile && appSide(v.name) ? `${appSide(v.name)}: ` : ''}<${versionUrl(v.id)}|${esc(v.name)}>`);
   }
   lines.push(`• ${mobile ? 'Submit date' : 'Release date'}: ${g.releaseDate ? prettyDate(g.releaseDate) : 'TBD'}`);
   if (mobile) lines.push(`• Description: ${d.notes || 'TBD'}`);
@@ -387,6 +395,82 @@ async function alreadyAnnouncedInChannel(client, group) {
   } catch { return false; }
 }
 
+// ── Fix version check ───────────────────────────────────────────────
+// Three problems a PC should fix before a release can be coordinated:
+//   · draft name  — not "<Platform> <number>" (PC hasn't decided yet)
+//   · overdue     — release date passed, never marked released
+//   · no date     — has cards but no release date
+// Only versions that actually hold cards are reported.
+async function hasCards(versionId) {
+  try {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
+      params: { jql: `fixVersion = ${versionId}`, maxResults: 50, fields: 'key' }, headers: headers(),
+    });
+    const n = (res.data?.issues || []).length;
+    return { n, more: !!res.data?.nextPageToken };
+  } catch { return { n: 0, more: false }; }
+}
+
+async function versionCheck() {
+  const today = isoDay(vnNow());
+  const versions = await listVersions();
+  const flags = { draft: [], overdue: [], noDate: [] };
+  for (const v of versions) {
+    const draft = !isRealVersionName(v.name);
+    const overdue = !!v.releaseDate && v.releaseDate < today;
+    const noDate = !v.releaseDate;
+    if (!draft && !overdue && !noDate) continue;
+    const c = await hasCards(v.id);
+    if (!c.n) continue;                                        // empty versions aren't worth anyone's time
+    const entry = { id: String(v.id), name: v.name, date: v.releaseDate || null, cards: c.more ? `${c.n}+` : String(c.n) };
+    if (draft) flags.draft.push(entry);
+    else if (overdue) flags.overdue.push(entry);
+    else flags.noDate.push(entry);
+  }
+  flags.overdue.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+  return flags;
+}
+
+function renderVersionCheck(flags) {
+  const line = (e) => `• <${versionUrl(e.id)}|${esc(e.name)}> · ${e.cards} card${e.cards === '1' ? '' : 's'}${e.date ? ` · ${prettyDate(e.date)}` : ''}`;
+  const section = (title, hint, list) => list.length
+    ? `*${title}* — ${hint}\n${list.slice(0, 10).map(line).join('\n')}${list.length > 10 ? `\n_…and ${list.length - 10} more_` : ''}` : null;
+  const parts = [
+    section('Draft version names', "not a real \"<Platform> <number>\" version yet — the PC still needs to decide it", flags.draft),
+    section('Release date passed', 'still not marked released in Jira — release it, or move the date', flags.overdue),
+    section('No release date', 'cards are assigned but the version has no date', flags.noDate),
+  ].filter(Boolean);
+  return parts.join('\n\n');
+}
+
+const checkSignature = (f) => JSON.stringify([f.draft, f.overdue, f.noDate].map(l => l.map(e => `${e.id}:${e.date}`).sort()));
+let _lastCheck = { sig: null, day: null };
+
+async function alertVersionIssues(client, { force = false, channel = RELEASE_REVIEW_CHANNEL, threadTs = null } = {}) {
+  const flags = await versionCheck();
+  const total = flags.draft.length + flags.overdue.length + flags.noDate.length;
+  if (!total) {
+    if (force) await client.chat.postMessage({ channel, thread_ts: threadTs, text: 'Fix versions look clean — no draft names, overdue or undated versions with cards.' });
+    return;
+  }
+  // Repeat only when something changed, or every 2 working days while unresolved
+  const sig = checkSignature(flags), today = isoDay(vnNow());
+  if (!force && sig === _lastCheck.sig && businessDaysSince(_lastCheck.day) < 2) return;
+  _lastCheck = { sig, day: today };
+  await client.chat.postMessage({
+    channel, thread_ts: threadTs, unfurl_links: false, unfurl_media: false,
+    text: `${threadTs ? '' : `${notifyTags()} `}*Fix version check* — ${total} version${total > 1 ? 's need' : ' needs'} a PC's attention before release:\n\n${renderVersionCheck(flags)}`,
+  });
+}
+
+function businessDaysSince(isoDate) {
+  if (!isoDate) return Infinity;
+  let n = 0;
+  const d = new Date(`${isoDate}T00:00:00Z`), end = new Date(`${isoDay(vnNow())}T00:00:00Z`);
+  while (d < end) { d.setUTCDate(d.getUTCDate() + 1); const w = d.getUTCDay(); if (w !== 0 && w !== 6) n++; }
+  return n;
+}
+
 // ── Scheduled work ───────────────────────────────────────────────────
 async function draftUpcoming(client, logger = console) {
   const groups = await upcomingGroups();
@@ -478,7 +562,7 @@ function startScheduler(client) {
     try {
       const vn = vnNow(), day = isoDay(vn), dow = vn.getUTCDay(), hm = vn.getUTCHours() * 60 + vn.getUTCMinutes();
       if (dow === 0 || dow === 6) return;
-      if (hm >= 9 * 60 + 30 && _lastDraftDay !== day) { _lastDraftDay = day; await draftUpcoming(client); }
+      if (hm >= 9 * 60 + 30 && _lastDraftDay !== day) { _lastDraftDay = day; await draftUpcoming(client); await alertVersionIssues(client); }
       if (hm >= 10 * 60 && _lastReadyDay !== day)     { _lastReadyDay = day; await postReadiness(client); }
       if (hm >= 15 * 60 && _lastRemindDay !== day)    { _lastRemindDay = day; await remindPending(client); }
     } catch (err) {
@@ -488,11 +572,17 @@ function startScheduler(client) {
 }
 
 // ── On-demand: "@QA Agent draft release for Web 4.37.1" ──────────────
+const VERSION_CHECK_RE = /\b(?:check|review|audit)\b[\s\S]*?\b(?:fix\s*versions?|versions?)\b/i;
+function isVersionCheckCommand(text) { return VERSION_CHECK_RE.test((text || '').replace(/<@[A-Z0-9]+>/g, '')); }
 const RELEASE_CMD_RE = /\b(?:draft|prepare)\s+(?:the\s+|a\s+)?(?:next\s+)?release\b|\brelease\s+(?:draft|announcement|plan)s?\b/i;
-function isReleaseCommand(text) { return RELEASE_CMD_RE.test((text || '').replace(/<@[A-Z0-9]+>/g, '')); }
+function isReleaseCommand(text) { const t = (text || '').replace(/<@[A-Z0-9]+>/g, ''); return RELEASE_CMD_RE.test(t) || VERSION_CHECK_RE.test(t); }
 
 async function handleCommand({ event, client, logger }) {
   const tTs = event.thread_ts || event.ts;
+  if (isVersionCheckCommand(event.text)) {
+    await alertVersionIssues(client, { force: true, channel: event.channel, threadTs: tTs });
+    return;
+  }
   const text = (event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim();
   const vMatch = text.match(/\b((?:iOS|Android)\s+(?:Coach|Client)|Internal API|Academy\s+(?:Web|CMS)|Web Challenger|API|Web|CMS)\s+(\d+(?:\.\d+){1,3})\b/i);
   let groups;
@@ -636,4 +726,5 @@ module.exports = {
   // exported for tests
   versionFamily, upcomingWorkdays, itemLabel, renderAnnouncement, renderReadiness, buildDraft, upcomingGroups,
   versionTagRegex, findCandidates, moveToVersion, PLACEHOLDER_VERSION_IDS, draftUpcoming, remindPending,
+  isRealVersionName, versionCheck, renderVersionCheck, alertVersionIssues,
 };
