@@ -834,7 +834,7 @@ function buildAdfDescription(text) {
   return { type: 'doc', version: 1, content };
 }
 
-async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, parentKey, reporterJiraId, issueType = 'Bug', projectKey = JIRA_PROJECT) {
+async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, parentKey, reporterJiraId, issueType = 'Bug', projectKey = JIRA_PROJECT, excludeKeys = []) {
   const fields = {
     project:     { key: projectKey },
     summary:     ticket.summary,
@@ -852,7 +852,7 @@ async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, pa
   // Reporter — safe to set at creation (standard Jira field)
   if (reporterJiraId) fields.reporter = { accountId: reporterJiraId };
 
-  const { key: issueKey, notes: createNotes } = await lib.createJiraIssueResilient(fields);
+  const { key: issueKey, notes: createNotes } = await lib.createJiraIssueResilient(fields, { excludeKeys });
   if (createNotes.length) console.log(`[QABot] ${issueKey} created with adjustments: ${createNotes.join(' · ')}`);
 
   // QA field — set via update because it may not be on the Create screen for UP project
@@ -2093,7 +2093,7 @@ HARD RULES — follow exactly:
       }
       logger.info(`[QABot] Creating ${issueType}: ${ticket.summary} epic=${epicKey || 'none'} parent=${parentKey || 'none'}`);
       await agentSt.update('📝 _QA Agent is creating the Jira ticket(s)…_');
-      const jira = await createJiraIssue(ticket, jiraIds, epicKey, ticketFixVersionId, parentKey, reporterJiraId, issueType, targetProject);
+      const jira = await createJiraIssue(ticket, jiraIds, epicKey, ticketFixVersionId, parentKey, reporterJiraId, issueType, targetProject, createdJiras.map(c => c.jira.key));
       if (epicKey && !jira.applied?.epic) jira.notes = [...(jira.notes || []), `couldn't attach to epic ${epicKey} — please link it in Jira`];
       if (!epicKey && !jira.applied?.epic) jira.notes = [...(jira.notes || []), 'no epic set'];
       if (skippedAtts.length) jira.notes = [...(jira.notes || []), `${skippedAtts.length} file(s) too large to attach (${skippedAtts.map(s => s.name).join(', ')})`];

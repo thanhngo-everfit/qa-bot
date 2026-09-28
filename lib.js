@@ -451,19 +451,24 @@ function mdToAdfDoc(text) {
 // created — and reports exactly what was adjusted.
 // Find an issue created in the last few minutes with this exact summary —
 // used to detect a create that succeeded despite a client-side timeout.
-async function findRecentIssueBySummary(summary, projectKey = JIRA_PROJECT) {
+async function findRecentIssueBySummary(summary, projectKey = JIRA_PROJECT, { assigneeId = null, excludeKeys = [] } = {}) {
   try {
     const safe = (summary || '').replace(/["\\]/g, ' ').substring(0, 180);
+    // Must match the ASSIGNEE too: several cards with the same title are
+    // created on purpose when a request names several people (one card
+    // each) — the first card must never be mistaken for the second.
+    const who = assigneeId ? ` AND assignee = "${assigneeId}"` : ' AND assignee is EMPTY';
     const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
-      params: { jql: `project = ${projectKey} AND created >= -10m AND summary ~ "${safe}" ORDER BY created DESC`, maxResults: 1, fields: 'summary' },
+      params: { jql: `project = ${projectKey} AND created >= -10m AND summary ~ "${safe}"${who} ORDER BY created DESC`, maxResults: 10, fields: 'summary' },
       headers: { Authorization: jiraAuth(), Accept: 'application/json' },
       timeout: 15000,
     });
-    return res.data?.issues?.[0]?.key || null;
+    const skip = new Set(excludeKeys);
+    return (res.data?.issues || []).map(i => i.key).find(k => !skip.has(k)) || null;
   } catch { return null; }
 }
 
-async function createJiraIssueResilient(fields) {
+async function createJiraIssueResilient(fields, { excludeKeys = [] } = {}) {
   const notes = [];
   let lastErr = null;
   // "Epic Link" (legacy customfield_10014) and "parent" are two names for
@@ -492,7 +497,7 @@ async function createJiraIssueResilient(fields) {
       // Look for it by summary before retrying, so we never duplicate.
       if (!status && /timeout|timed out|ECONNABORTED/i.test(`${err.message || ''}`)) {
         console.warn('[Jira] create timed out client-side — checking whether it landed');
-        const found = await findRecentIssueBySummary(fields.summary, fields.project?.key || JIRA_PROJECT);
+        const found = await findRecentIssueBySummary(fields.summary, fields.project?.key || JIRA_PROJECT, { assigneeId: fields.assignee?.accountId || null, excludeKeys });
         if (found) {
           notes.push('Jira was slow to respond, but the ticket was created');
           return { key: found, notes };
