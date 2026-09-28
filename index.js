@@ -1152,6 +1152,7 @@ async function findSlackUserByName(client, name) {
 // ── Bucket a platform string into a broad category (api/web/ios/android) ──
 // Used to decide whether the LLM-parsed platform matches the assignee's role.
 function getPlatformBucket(platform) {
+  if (platform === 'Product') return 'product';
   if (platform === 'Data') return 'data';
   if (platform === 'API') return 'api';
   if (platform === 'Web') return 'web';
@@ -1293,10 +1294,11 @@ async function inferPlatformFromAssignee(client, slackUserId, fallbackPlatform, 
     if (bucket) console.log(`[QABot] Roster match: ${profile.real_name || profile.display_name} → ${bucket}`);
 
     // 1) Everfit convention: parenthesized role tag in the display name, e.g. "Hong (BE)"
-    const tagMatch = bucket ? null : haystack.match(/\(\s*(be|fe|backend|frontend|ios|android|web|dl|data)\s*\)/i);   // tolerates "( DL )"
+    const tagMatch = bucket ? null : haystack.match(/\(\s*(be|fe|backend|frontend|ios|android|web|dl|data|ba)\s*\)/i);   // tolerates "( DL )"
     if (tagMatch) {
       const tag = tagMatch[1].toLowerCase();
-      if      (tag === 'dl' || tag === 'data')                         bucket = 'data';   // data labelling
+      if      (tag === 'ba')                                            bucket = 'product'; // business analyst
+      else if (tag === 'dl' || tag === 'data')                         bucket = 'data';   // data labelling
       else if (tag === 'be' || tag === 'backend')                      bucket = 'api';
       else if (tag === 'fe' || tag === 'frontend' || tag === 'web')    bucket = 'web';
       else if (tag === 'ios')                                          bucket = 'ios';
@@ -1305,7 +1307,8 @@ async function inferPlatformFromAssignee(client, slackUserId, fallbackPlatform, 
 
     // 2) Fall back to job title keywords (only if no tag was found)
     if (!bucket) {
-      if      (/data label|data annotat|data entry/.test(title))         bucket = 'data';
+      if      (/business analyst|product analyst|\bba\b/.test(title))  bucket = 'product';
+      else if (/data label|data annotat|data entry/.test(title))         bucket = 'data';
       else if (/back[\s-]?end|api engineer|server engineer/.test(title)) bucket = 'api';
       else if (/front[\s-]?end|web engineer/.test(title))                bucket = 'web';
       else if (/\bios\b/.test(title))                                    bucket = 'ios';
@@ -1322,6 +1325,7 @@ async function inferPlatformFromAssignee(client, slackUserId, fallbackPlatform, 
     // Mismatch → switch to the assignee's bucket. For mobile, decide Client
     // vs Coach from the original platform, then from the report wording
     // (client-app reports are common in the report channels).
+    if (bucket === 'product') return 'Product';
     if (bucket === 'data')    return 'Data';
     if (bucket === 'api')     return 'API';
     if (bucket === 'web')     return 'Web';
@@ -1340,7 +1344,7 @@ async function inferPlatformFromAssignee(client, slackUserId, fallbackPlatform, 
 // we swap the first bracketed block when the assignee's role overrides the platform.
 function rewriteSummaryPrefix(summary, newPlatform) {
   const prefix = `[${newPlatform}]`;
-  const PLATFORM_TAG = /\[(?:iOS|Android)(?: (?:Client|Coach))?\]|\[(?:API|Web|BE|FE|Backend|Frontend|Mobile|Data)\]/i;
+  const PLATFORM_TAG = /\[(?:iOS|Android)(?: (?:Client|Coach))?\]|\[(?:API|Web|BE|FE|Backend|Frontend|Mobile|Data|Product)\]/i;
   // Replace the platform tag wherever it sits (it may follow [Client Report]);
   // never touch the leading [Client Report]/[Client Request] tag.
   if (PLATFORM_TAG.test(summary)) return summary.replace(PLATFORM_TAG, prefix);
