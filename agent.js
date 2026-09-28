@@ -13,6 +13,7 @@ const {
   aiComplete, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient,
   resolveInlineMentions, resolveUserName, gatherChannelContext, slackify, toolsSupported,
 } = require('./lib');
+const lib = require('./lib');
 
 // ── Tool schemas the model sees ──────────────────────────────────────
 const TOOLS = [
@@ -53,6 +54,17 @@ const TOOLS = [
     description: 'Assign an existing Jira issue to a person.',
     parameters: { type: 'object', required: ['key', 'user_query'], properties: {
       key: { type: 'string' }, user_query: { type: 'string', description: 'Email or full name' },
+    } },
+  } },
+  { type: 'function', function: {
+    name: 'jira_update_issue',
+    description: 'Update an EXISTING Jira issue: move it under a parent epic, rename it, change its priority or its issue type (e.g. "Product Task"). Only pass the fields to change. The parent must be an Epic — if not, the result says what it is and suggests its epic.',
+    parameters: { type: 'object', required: ['key'], properties: {
+      key:        { type: 'string', description: 'Issue to update, e.g. UP-79584' },
+      parent:     { type: 'string', description: 'Epic key to put the issue under, e.g. UP-79078' },
+      summary:    { type: 'string' },
+      priority:   { type: 'string', enum: ['Highest', 'High', 'Medium', 'Low', 'Lowest'] },
+      issue_type: { type: 'string', description: 'e.g. Bug, Task, Product Task' },
     } },
   } },
   { type: 'function', function: {
@@ -232,6 +244,32 @@ async function execTool(name, args, ctx) {
         });
         return { assigned: args.key, to: u.displayName };
       }
+      case 'jira_update_issue': {
+        const applied = {};
+        if (args.parent) {
+          const parentKey = String(args.parent).toUpperCase();
+          const cand = await lib.resolveEpicCandidate(parentKey);
+          if (!cand.ok) {
+            return { error: cand.type
+              ? `${parentKey} is a ${cand.type}, not an epic, so it can't be a parent.${cand.epicOfIt ? ` Its epic is ${cand.epicOfIt.key} (${cand.epicOfIt.title}) — suggest that.` : ''}`
+              : `${parentKey} was not found.` };
+          }
+          await lib.setIssueParent(args.key, parentKey);
+          applied.parent = `${parentKey} ${cand.title}`;
+        }
+        const fields = {};
+        if (args.summary)    fields.summary   = args.summary;
+        if (args.priority)   fields.priority  = { name: args.priority };
+        if (args.issue_type) fields.issuetype = { name: args.issue_type };
+        if (Object.keys(fields).length) {
+          await axios.put(`${JIRA_HOST}/rest/api/3/issue/${args.key}`, { fields }, {
+            headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json' },
+          });
+          Object.assign(applied, { ...(args.summary ? { summary: args.summary } : {}), ...(args.priority ? { priority: args.priority } : {}), ...(args.issue_type ? { issue_type: args.issue_type } : {}) });
+        }
+        if (!Object.keys(applied).length) return { error: 'Nothing to update — pass parent, summary, priority or issue_type.' };
+        return { updated: args.key, applied };
+      }
       case 'jira_transition': {
         const tRes = await axios.get(`${JIRA_HOST}/rest/api/3/issue/${args.key}/transitions`, {
           headers: { Authorization: jiraAuth(), Accept: 'application/json' },
@@ -350,4 +388,4 @@ Rules:
     (messages.filter(m => m.role === 'tool').slice(-2).map(m => m.content.substring(0, 300)).join(' · ') || 'no progress recorded');
 }
 
-module.exports = { runAgent };
+module.exports = { runAgent, execTool };

@@ -909,6 +909,28 @@ async function bulkSetParentForChannel(channelId, epicKey, { onProgress } = {}) 
   return { total: keys.length, moved, failed };
 }
 
+// ── Is this key usable as a parent epic? ──────────────────────────────
+// A card can only go under an EPIC. If the named key is another card (a
+// Task, Story…), report what it is and the epic it sits under, so the
+// requester can be offered that instead of a silent failure or a guess.
+async function resolveEpicCandidate(key) {
+  try {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/issue/${key}`, {
+      params: { fields: 'summary,issuetype,parent' },
+      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+    });
+    const f = res.data?.fields || {};
+    const type = f.issuetype?.name || 'issue';
+    if (/^epic$/i.test(type) || f.issuetype?.hierarchyLevel === 1) return { ok: true, key, title: f.summary || key };
+    const p = f.parent;
+    const epicOfIt = p && (/^epic$/i.test(p.fields?.issuetype?.name || '') || p.fields?.issuetype?.hierarchyLevel === 1)
+      ? { key: p.key, title: p.fields?.summary || p.key } : null;
+    return { ok: false, key, type, title: f.summary || key, epicOfIt };
+  } catch (err) {
+    return { ok: false, key, type: null, title: null, epicOfIt: null, missing: err.response?.status === 404 };
+  }
+}
+
 // ── Names for the ticket confirmation (cached) ───────────────────────
 let _lastSprint = null;
 function getLastActiveSprint() { return _lastSprint; }
@@ -1228,7 +1250,7 @@ module.exports = {
   SMART_MODEL, aiComplete, aiCall, toolsSupported,
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient, getIssueEpic,
   shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion, listOpenEpics, setIssueParent,
-  getLastActiveSprint, getVersionName, getIssueTitle, bulkSetParentForChannel, BULK_MOVE_RE, isBulkMoveRequest,
+  getLastActiveSprint, getVersionName, getIssueTitle, bulkSetParentForChannel, BULK_MOVE_RE, isBulkMoveRequest, resolveEpicCandidate,
   isNoTicketReportRequest, findThreadsWithoutTickets, isBulkCreateRequest, BULK_CREATE_RE, postLabel,
   CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, challengerEpicFor, challengerSummary,
   LOW_PRIORITY_SPRINT_ID, LOW_PRIORITY_STATUS, LOW_PRIORITIES, LOW_PRIORITY_RULES, lowPriorityRule, getSprintInfo, transitionToStatus,

@@ -2092,6 +2092,17 @@ HARD RULES — follow exactly:
     const epicExplicit = event.text.match(/\b(?:epic|under|parent)\s+(?:epic\s+)?(PLAN-\d+|UP-\d+|PAY-\d+|AIT-\d+|CHAL-\d+)\b/i);
     const epicAny      = event.text.match(/\b(PLAN-\d+|UP-\d+|PAY-\d+|AIT-\d+|CHAL-\d+)\b/i);
     let epicKey        = (epicExplicit ? epicExplicit[1] : epicAny ? epicAny[1] : null)?.toUpperCase() || null;
+    // A card can only go under an EPIC. Check the named key first: if it's
+    // another card, say so and offer its epic in the picker — never guess.
+    let epicNamed = !!epicExplicit, epicRejected = null;
+    if (epicKey && !/^PLAN-/i.test(epicKey)) {
+      const cand = await lib.resolveEpicCandidate(epicKey);
+      if (!cand.ok) {
+        if (epicExplicit) epicRejected = cand;           // requester asked for it → explain + ask
+        logger.info(`[QABot] ${epicKey} is not an epic (${cand.type || 'not found'})${cand.epicOfIt ? `; its epic is ${cand.epicOfIt.key}` : ''}`);
+        epicKey = null;
+      }
+    }
 
     // "same epic as that previous bug/ticket" → inherit the epic from a
     // ticket already in this thread (no key typed in the message).
@@ -2239,7 +2250,7 @@ HARD RULES — follow exactly:
         else logger.warn(`[QABot] No Client Report epic mapped for platform "${ticket.platform}"`);
       }
       try {
-        if (!parentKey && !projectRoute?.challenger) parentKey = await Promise.race([
+        if (!parentKey && !projectRoute?.challenger && !epicNamed) parentKey = await Promise.race([
           (async () => {
             const channelInfo = await client.conversations.info({ channel: event.channel });
             const channelName = channelInfo.channel?.name || '';
@@ -2254,7 +2265,7 @@ HARD RULES — follow exactly:
       }
       logger.info(`[QABot] Parent resolution: ${parentKey || 'none'} in ${((Date.now() - tParent) / 1000).toFixed(1)}s`);
       // Fall back to canvas-based lookup if sprint search found nothing
-      if (!parentKey && !projectRoute?.challenger && Date.now() - tParent < 20000) {
+      if (!parentKey && !projectRoute?.challenger && !epicNamed && Date.now() - tParent < 20000) {
         parentKey = await pickParentFromCanvas(client, event.channel, ticket.platform);
         logger.info(`[QABot] Parent from canvas: ${parentKey || 'none'} for platform=${ticket.platform}`);
       }
@@ -2293,7 +2304,10 @@ HARD RULES — follow exactly:
       logger.info(`[QABot] Creating ${issueType}: ${ticket.summary} epic=${epicKey || 'none'} parent=${parentKey || 'none'}`);
       await agentSt.update('📝 _QA Agent is creating the Jira ticket(s)…_');
       const jira = await createJiraIssue(ticket, jiraIds, epicKey, ticketFixVersionId, parentKey, reporterJiraId, issueType, targetProject, createdJiras.map(c => c.jira.key));
-      if (epicKey && !jira.applied?.epic) jira.notes = [...(jira.notes || []), `couldn't attach to epic ${epicKey} — please link it in Jira`];
+      if (epicKey && !jira.applied?.epic) jira.notes = [...(jira.notes || []), `Jira wouldn't attach it to ${epicKey} — pick an epic below`];
+      if (epicRejected) jira.notes = [...(jira.notes || []), epicRejected.type
+        ? `${epicRejected.key} is a ${epicRejected.type}, not an epic, so it can't be a parent${epicRejected.epicOfIt ? ` — its epic is ${epicRejected.epicOfIt.key} ${epicRejected.epicOfIt.title}, listed first below` : ''}`
+        : `I couldn't find ${epicRejected.key} — pick an epic below`];
       if (!epicKey && !jira.applied?.epic) jira.notes = [...(jira.notes || []), 'no epic set'];
       if (skippedAtts.length) jira.notes = [...(jira.notes || []), `${skippedAtts.length} file(s) too large to attach (${skippedAtts.map(s => s.name).join(', ')})`];
 
@@ -2389,7 +2403,7 @@ HARD RULES — follow exactly:
     }
 
     // ── Build Slack response ──────────────────
-    const headline = isTask ? "📋 Done — I've created a Task" : "🐛 Done — I've logged this bug";
+    const headline = isTask ? `📋 Done — I've created a ${issueType || 'Task'}` : "🐛 Done — I've logged this bug";
     // Release attachment buffers as soon as uploads are done
     for (const att of attachments) att.buffer = null;
 
@@ -2498,6 +2512,10 @@ HARD RULES — follow exactly:
         const rel = (e) => [...epicRelevanceTokens(e.summary)].filter(w => cardTitles.has(w)).length;
         epics = [...epics].map((e, i) => ({ e, i, r: rel(e) }))
           .sort((a, b) => b.r - a.r || a.i - b.i).map(x => x.e);          // related first, then most recent
+        const preferred = epicRejected?.epicOfIt;
+        if (preferred && preferred.key.startsWith(projectKey === lib.CHALLENGER_PROJECT ? 'UP' : projectKey)) {
+          epics = [{ key: preferred.key, summary: preferred.title }, ...epics.filter(e => e.key !== preferred.key)];
+        }
         const options = epics.slice(0, 100).map(e => ({
           text:  { type: 'plain_text', text: `${e.key} — ${e.summary}`.substring(0, 75) },
           value: e.key,
