@@ -330,6 +330,7 @@ async function getActiveSprintId() {
     if (!eligible.length) return null;
     eligible.sort((a, b) => new Date(b.startDate || 0) - new Date(a.startDate || 0));
     console.log(`[Sprint] Selected active sprint: ${eligible[0].name} (${eligible[0].id})`);
+    _lastSprint = { id: eligible[0].id, name: eligible[0].name };
     return eligible[0].id;
   } catch { return null; }
 }
@@ -621,6 +622,35 @@ async function setIssueParent(issueKey, epicKey) {
   }
 }
 
+// ── Names for the ticket confirmation (cached) ───────────────────────
+let _lastSprint = null;
+function getLastActiveSprint() { return _lastSprint; }
+
+const _versionNames = new Map();
+async function getVersionName(versionId) {
+  if (!versionId) return null;
+  if (_versionNames.has(versionId)) return _versionNames.get(versionId);
+  let name = null;
+  try {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/version/${versionId}`, {
+      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+    });
+    name = res.data?.name || null;
+  } catch (_) {}
+  _versionNames.set(versionId, name);
+  return name;
+}
+
+const _issueTitles = new Map();
+async function getIssueTitle(issueKey) {
+  if (!issueKey) return null;
+  if (_issueTitles.has(issueKey)) return _issueTitles.get(issueKey);
+  const snap = await getIssueSnapshot(issueKey);
+  const title = snap?.summary?.trim() || null;
+  if (title) _issueTitles.set(issueKey, title);
+  return title;
+}
+
 // ── Jira: quick issue snapshot ───────────────────────────────────────
 async function getIssueSnapshot(issueKey) {
   try {
@@ -842,6 +872,7 @@ module.exports = {
   SMART_MODEL, aiComplete, aiCall, toolsSupported,
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient, getIssueEpic,
   shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion, listOpenEpics, setIssueParent,
+  getLastActiveSprint, getVersionName, getIssueTitle,
   resolveUserName, resolveInlineMentions, warmUserNames, replaceMentionsCached, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
   slackify, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, clientReportSummary,

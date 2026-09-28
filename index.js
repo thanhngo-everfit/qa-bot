@@ -872,6 +872,7 @@ async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, pa
       // what Jira actually accepted (resilient creator may have dropped fields)
       epic:       fields.customfield_10014 || fields.parent?.key || null,
       fixVersion: !!fields.fixVersions,
+      fixVersionId: fields.fixVersions?.[0]?.id || null,
     },
   };
 }
@@ -2144,11 +2145,24 @@ HARD RULES — follow exactly:
     // Release attachment buffers as soon as uploads are done
     for (const att of attachments) att.buffer = null;
 
+    // Resolve the NAMES of what was applied, so the reply says which epic,
+    // Fix Version and sprint — not just that "something" was set.
+    for (const cj of createdJiras) {
+      const a = cj.jira.applied || {};
+      cj.facts = {
+        epicKey:     a.epic || null,
+        epicName:    a.epic ? await lib.getIssueTitle(a.epic) : null,
+        versionName: a.fixVersionId ? await lib.getVersionName(a.fixVersionId) : null,
+        sprintName:  cj.sprintAdded ? (lib.getLastActiveSprint()?.name || 'Active Sprint') : null,
+        project:     cj.jira.key.split('-')[0],
+      };
+    }
+
     // The tickets EXIST at this point — a formatting error must never
     // swallow the confirmation. Fall back to a minimal reply on throw.
     let lines;
     try {
-    lines = createdJiras.map(({ jira, ticket, assigneeSlackIds, uploaded, acCount, sprintAdded }) => {
+    lines = createdJiras.map(({ jira, ticket, assigneeSlackIds, uploaded, acCount, sprintAdded, facts }) => {
       const assigneeLine = assigneeSlackIds.length > 0
         ? `assigned to ${assigneeSlackIds.map(id => `<@${id}>`).join(', ')}`
         : "_I couldn't match an assignee — please assign in Jira_";
@@ -2158,15 +2172,22 @@ HARD RULES — follow exactly:
         `${headline} → <${jira.url}|${jira.key}>\n` +
         `*${ticket.summary}*\n` +
         `*${ticket.priority}* priority · *${ticket.platform}* · ${assigneeLine}${attachLine}${acLine}\n` +
-        // Report ONLY what was actually applied — never a hardcoded claim
+        // Report ONLY what was actually applied — never a hardcoded claim —
+        // by NAME: the epic as a link titled with its name, plus the exact
+        // Fix Version and sprint.
         (() => {
-          const bits = [];
-          if (jira.applied?.epic) bits.push(`Epic ${jira.applied.epic}`);
-          if (jira.applied?.fixVersion) bits.push('Fix Version');
-          if (sprintAdded) bits.push('Active Sprint');
-          const set = bits.length ? `${bits.join(', ')} set` : 'no epic/sprint set';
+          const f = facts || {};
+          const out = [];
+          out.push(f.epicKey
+            ? `*Epic:* <${JIRA_HOST}/browse/${f.epicKey}|${(f.epicName || f.epicKey).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}>`
+            : `*Epic:* none yet — pick one below`);
+          out.push(`*Fix Version:* ${f.versionName || (jira.applied?.fixVersion ? 'set' : 'none')}`);
+          out.push(f.sprintName
+            ? `*Sprint:* ${f.sprintName}`
+            : `*Sprint:* ${f.project && f.project !== JIRA_PROJECT ? `not added — ${f.project} triages it into its own sprint` : 'not added (no active sprint found)'}`);
           const problems = (jira.notes || []).filter(n => n !== 'no epic set');
-          return `_${set}${problems.length ? ` · ${problems.join(' · ')}` : ''}${jira.notes?.includes('no epic set') ? ' · no epic yet — pick one below' : ''}._`;
+          if (problems.length) out.push(`_${problems.join(' · ')}_`);
+          return out.join('\n');
         })()
       );
     });
@@ -2176,7 +2197,7 @@ HARD RULES — follow exactly:
         `✅ <${jira.url}|${jira.key}> — ${ticket.summary}`);
     }
 
-    const epicLine = epicKey ? `\nEpic: <${JIRA_HOST}/browse/${epicKey}|${epicKey}>` : '';
+    const epicLine = '';   // epic is reported per card, by name
 
     let responseText = lines.join('\n\n') + epicLine;
     await agentSt.done();
