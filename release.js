@@ -20,6 +20,12 @@ const { JIRA_HOST, jiraAuth } = lib;
 const RELEASE_CHANNEL   = process.env.RELEASE_CHANNEL   || 'C02K8962G9J';   // #internal-release-process
 const RELEASE_APPROVERS = (process.env.RELEASE_APPROVERS || 'U0142GU335F').split(',').map(s => s.trim()).filter(Boolean);
 const RELEASE_PROJECT   = process.env.RELEASE_PROJECT   || 'UP';
+// Automatic review + reminders happen in the leads' channel, tagging them.
+const RELEASE_REVIEW_CHANNEL = process.env.RELEASE_REVIEW_CHANNEL || 'C0BND0T6Y3C';   // #core-scrum-team
+const RELEASE_NOTIFY = (process.env.RELEASE_NOTIFY || 'U0142GU335F,U0445EQS1ED').split(',').map(s => s.trim()).filter(Boolean);   // Thanh, Bao Ho
+const notifyTags = () => RELEASE_NOTIFY.map(u => `<@${u}>`).join(' ');
+const threadLink = (channel, ts, threadTs) =>
+  `https://everfitt.slack.com/archives/${channel}/p${String(ts).replace('.', '')}${threadTs ? `?thread_ts=${threadTs}&cid=${channel}` : ''}`;
 const LOOKAHEAD_WORKDAYS = parseInt(process.env.RELEASE_LOOKAHEAD_WORKDAYS || '2', 10);
 const CC_GROUP = process.env.RELEASE_CC_GROUP || 'S0B57DFQUKU';   // cc'd on every Core release post
 
@@ -394,26 +400,31 @@ async function draftUpcoming(client, logger = console) {
   }
   if (!ready.length) return;
   // One short top-level message for the approver; every draft lives in its thread
+  const list = ready.map(d => `• ${d.group.family} · ${d.group.releaseDate ? prettyDate(d.group.releaseDate) : 'no date'} — ${d.perVersion.map(v => v.name).join(' / ')}`).join('\n');
   const head = await client.chat.postMessage({
-    channel: RELEASE_CHANNEL, unfurl_links: false,
-    text: `${RELEASE_APPROVERS.map(u => `<@${u}>`).join(' ')} ${ready.length} release draft${ready.length > 1 ? 's are' : ' is'} ready for your review in this thread — nothing is posted until you approve.`,
+    channel: RELEASE_REVIEW_CHANNEL, unfurl_links: false,
+    text: `${notifyTags()} ${ready.length} release${ready.length > 1 ? 's are' : ' is'} due soon — draft${ready.length > 1 ? 's' : ''} in this thread for review. Nothing is posted to <#${RELEASE_CHANNEL}> until approved.\n${list}`,
   });
-  for (const d of ready) await sendDraft(client, d, { channel: RELEASE_CHANNEL, threadTs: head.ts });
+  for (const d of ready) await sendDraft(client, d, { channel: RELEASE_REVIEW_CHANNEL, threadTs: head.ts });
   logger.info?.(`[Release] Sent ${ready.length} release draft(s) for approval`);
 }
 
 async function remindPending(client) {
   const tomorrow = upcomingWorkdays(1)[1];
-  for (const [id, st] of DRAFTS) {
-    if (st.d.group.releaseDate !== tomorrow || REMINDED.has(id)) continue;
+  const due = [...DRAFTS.entries()].filter(([id, st]) => st.d.group.releaseDate === tomorrow && !REMINDED.has(id));
+  if (!due.length) return;
+  const lines = due.map(([id, st]) => {
     REMINDED.add(id);
     const mobile = isMobileFamily(st.d.group.family);
     const missing = [mobile && !st.d.notes ? 'release notes' : null, mobile && !st.d.force ? 'force/optional update' : null].filter(Boolean);
-    await client.chat.postMessage({
-      channel: st.channel, thread_ts: st.threadTs,
-      text: `${RELEASE_APPROVERS.map(u => `<@${u}>`).join(' ')} reminder: the ${st.d.group.family} release (${prettyDate(st.d.group.releaseDate)}) is tomorrow and this draft isn't approved yet${missing.length ? ` — still TBD: ${missing.join(', ')}` : ''}.`,
-    }).catch(() => {});
-  }
+    const notReady = st.d.notReady?.length ? ` · ${st.d.notReady.length} card(s) not QA Success yet` : '';
+    return `• <${threadLink(st.channel, st.ts, st.threadTs)}|${st.d.group.family} — ${st.d.perVersion.map(v => v.name).join(' / ')}>` +
+      `${missing.length ? ` · still TBD: ${missing.join(', ')}` : ''}${notReady}`;
+  });
+  await client.chat.postMessage({
+    channel: RELEASE_REVIEW_CHANNEL, unfurl_links: false,
+    text: `${notifyTags()} ${due.length} release${due.length > 1 ? 's are' : ' is'} due tomorrow (${prettyDate(tomorrow)}) and not approved yet:\n${lines.join('\n')}`,
+  }).catch(err => console.warn('[Release] reminder failed:', err.data?.error || err.message));
 }
 
 async function postReadiness(client, logger = console) {
@@ -585,7 +596,11 @@ function register(slackApp) {
         text: 'That draft expired (I restarted), so I didn\'t post it. Ask me to "draft release for <version>" again — or press Skip to remove it.' }).catch(() => {});
       return;
     }
-    if (!RELEASE_APPROVERS.includes(body.user?.id)) return;
+    if (!RELEASE_APPROVERS.includes(body.user?.id)) {
+      await client.chat.postEphemeral({ channel: body.channel.id, user: body.user.id, thread_ts: body.message?.thread_ts,
+        text: `Only ${RELEASE_APPROVERS.map(u => `<@${u}>`).join(' ')} can approve release posts.` }).catch(() => {});
+      return;
+    }
     // Re-read Jira so the post reflects the latest state
     const fresh = await buildDraft(client, st.d.group);
     fresh.force = st.d.force; fresh.notes = st.d.notes;
@@ -604,5 +619,5 @@ module.exports = {
   register, startScheduler, isReleaseCommand, handleCommand,
   // exported for tests
   versionFamily, upcomingWorkdays, itemLabel, renderAnnouncement, renderReadiness, buildDraft, upcomingGroups,
-  versionTagRegex, findCandidates, moveToVersion, PLACEHOLDER_VERSION_IDS, draftUpcoming,
+  versionTagRegex, findCandidates, moveToVersion, PLACEHOLDER_VERSION_IDS, draftUpcoming, remindPending,
 };
