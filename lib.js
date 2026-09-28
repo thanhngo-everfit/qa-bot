@@ -450,11 +450,11 @@ function mdToAdfDoc(text) {
 // created — and reports exactly what was adjusted.
 // Find an issue created in the last few minutes with this exact summary —
 // used to detect a create that succeeded despite a client-side timeout.
-async function findRecentIssueBySummary(summary) {
+async function findRecentIssueBySummary(summary, projectKey = JIRA_PROJECT) {
   try {
     const safe = (summary || '').replace(/["\\]/g, ' ').substring(0, 180);
     const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
-      params: { jql: `project = ${JIRA_PROJECT} AND created >= -10m AND summary ~ "${safe}" ORDER BY created DESC`, maxResults: 1, fields: 'summary' },
+      params: { jql: `project = ${projectKey} AND created >= -10m AND summary ~ "${safe}" ORDER BY created DESC`, maxResults: 1, fields: 'summary' },
       headers: { Authorization: jiraAuth(), Accept: 'application/json' },
       timeout: 15000,
     });
@@ -491,7 +491,7 @@ async function createJiraIssueResilient(fields) {
       // Look for it by summary before retrying, so we never duplicate.
       if (!status && /timeout|timed out|ECONNABORTED/i.test(`${err.message || ''}`)) {
         console.warn('[Jira] create timed out client-side — checking whether it landed');
-        const found = await findRecentIssueBySummary(fields.summary);
+        const found = await findRecentIssueBySummary(fields.summary, fields.project?.key || JIRA_PROJECT);
         if (found) {
           notes.push('Jira was slow to respond, but the ticket was created');
           return { key: found, notes };
@@ -549,6 +549,40 @@ async function getIssueEpic(issueKey) {
     const f = res.data?.fields || {};
     return (typeof f.customfield_10014 === 'string' ? f.customfield_10014 : null) || f.parent?.key || null;
   } catch { return null; }
+}
+
+// ── Jira: the project's monthly "To be confirmed - <Mon YYYY>" version ──
+// PAY and AIT park unscheduled client-report cards on a per-month
+// placeholder version (e.g. "To be confirmed - Sep 2026"). Pick the one
+// for the current month (VN time); fall back to the nearest unreleased
+// placeholder so a missing month never blocks creation.
+const _tbdCache = new Map();   // projectKey → { at, id }
+async function getMonthlyTbdVersion(projectKey) {
+  const hit = _tbdCache.get(projectKey);
+  if (hit && Date.now() - hit.at < 6 * 3600 * 1000) return hit.id;
+  let id = null;
+  try {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/project/${projectKey}/versions`, {
+      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+    });
+    const vs = (res.data || []).filter(v => !v.released && !v.archived && /^to be confirmed/i.test(v.name || ''));
+    const vn = new Date(Date.now() + 7 * 3600 * 1000);
+    const month = vn.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' });
+    const wanted = `to be confirmed - ${month} ${vn.getUTCFullYear()}`.toLowerCase();
+    const exact = vs.find(v => (v.name || '').trim().toLowerCase() === wanted);
+    if (exact) id = exact.id;
+    else {
+      const today = vn.toISOString().substring(0, 10);
+      const future = vs.filter(v => !v.releaseDate || v.releaseDate >= today)
+        .sort((a, b) => (a.releaseDate || '9999').localeCompare(b.releaseDate || '9999'));
+      id = (future[0] || vs[0])?.id || null;
+      if (id) console.log(`[Jira] ${projectKey}: no "${wanted}" version, using nearest placeholder ${id}`);
+    }
+  } catch (err) {
+    console.warn(`[Jira] ${projectKey} versions lookup failed:`, err.response?.status || err.message);
+  }
+  _tbdCache.set(projectKey, { at: Date.now(), id });
+  return id;
 }
 
 // ── Jira: quick issue snapshot ───────────────────────────────────────
@@ -634,7 +668,7 @@ async function gatherChannelContext(client, channelId, { days = 14, maxThreads =
         const who = m.user ? await resolveUserName(client, m.user) : (m.bot_id ? 'QA Agent' : 'unknown');
         const txt = (await resolveInlineMentions(client, m.text || '')).replace(/\s+/g, ' ').substring(0, 400);
         if (txt) lines.push(`[${who}]: ${txt}`);
-        for (const k of (m.text || '').match(/UP-\d+/g) || []) ticketKeys.add(k);
+        for (const k of (m.text || '').match(/\b(?:UP|PAY|AIT)-\d+\b/g) || []) ticketKeys.add(k);
       };
       await push(parent);
       if (parent.reply_count) {
@@ -740,7 +774,7 @@ function slackify(text) {
   out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<$2|$1>');   // [t](url) → <url|t>
   out = out.replace(/^#{1,4}\s+(.+)$/gm, '*$1*');                          // headers → bold
   out = out.replace(/\*\*([^*\n]+)\*\*/g, '*$1*');                        // **b** → *b*
-  out = out.replace(/(<[^>]*>)|\b(UP|PLAN)-(\d+)\b/g, (m, link, proj, num) =>
+  out = out.replace(/(<[^>]*>)|\b(UP|PLAN|PAY|AIT)-(\d+)\b/g, (m, link, proj, num) =>
     link ? link : `<${JIRA_HOST}/browse/${proj}-${num}|${proj}-${num}>`);  // bare keys → links
   return out;
 }
@@ -771,7 +805,7 @@ module.exports = {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiComplete, aiCall, toolsSupported,
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient, getIssueEpic,
-  shutdownLiveStatuses, LIVE_STATUSES,
+  shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion,
   resolveUserName, resolveInlineMentions, warmUserNames, replaceMentionsCached, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
   slackify, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, clientReportSummary,

@@ -369,6 +369,25 @@ function resolveSquad(analysis, context) {
   return aiSquad || detectSquadFromKeywords(context);
 }
 
+// The squad a report thread belongs to: the bot's analysis reply already
+// states it (after AI + keyword + cc'd-PC resolution); otherwise resolve
+// from the report text the same way the analysis would.
+async function squadForThread(client, channelId, threadTs) {
+  try {
+    const rr = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 });
+    const msgs = rr.messages || [];
+    for (const m of msgs) {
+      if (!m.bot_id) continue;
+      // Slack stores & < > as HTML entities ("Training &amp; Automation")
+      const text = (m.text || '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+      const mm = text.match(/(?:^|\n)\*?(?:Related )?[Ss]quad:\*?\s*([^\n*]+?)\s*(?:\n|$)/);
+      if (mm && SQUAD_ROSTER[mm[1].trim()]) return mm[1].trim();
+    }
+    const parentText = msgs[0]?.text || '';
+    return resolveSquad({ tickets: [{}] }, parentText) || null;
+  } catch (_) { return null; }
+}
+
 function getSquadContacts(squad) {
   return SQUAD_ROSTER[squad]?.contacts || null;
 }
@@ -1364,7 +1383,7 @@ async function rebuildFollowUpsFromJira() {
         params: {
           // Old client-report cards carry fixVersion 27643; cards created by the
           // unified pipeline carry the [Client Report]/[Client Request] prefix.
-          jql: `project = ${JIRA_PROJECT} AND (fixVersion = 27643 OR summary ~ "\\"Client Report\\"" OR summary ~ "\\"Client Request\\"") AND statusCategory != Done ORDER BY created DESC`,
+          jql: `project in (UP, PAY, AIT) AND (fixVersion = 27643 OR summary ~ "\\"Client Report\\"" OR summary ~ "\\"Client Request\\"") AND statusCategory != Done ORDER BY created DESC`,
           maxResults: 100, startAt,
           fields: 'summary,status,description',
         },
@@ -1436,10 +1455,10 @@ async function rebuildFollowUpsFromHistory(client) {
           for (const r of replies.messages || []) {
             const t = textOf(r);
             combined.push(t);
-            if (!jiraKey) { const mm = t.match(/UP-\d+/); if (mm) jiraKey = mm[0]; }
+            if (!jiraKey) { const mm = t.match(/\b(?:UP|PAY|AIT)-\d+\b/); if (mm) jiraKey = mm[0]; }
             if (!squad && r.bot_id) {
               const sm = t.match(/(?:Squad|Related squad):\s*\*?([^*\n]+?)\*?\s*$/m);
-              if (sm) squad = sm[1].trim();
+              if (sm) squad = sm[1].replace(/&amp;/g, '&').trim();
             }
           }
           if (!jiraKey || followUpStore.has(jiraKey)) continue;
@@ -1470,7 +1489,7 @@ async function scanThreadForTickets(client, channelId, threadTs) {
     const messages = (await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 })).messages || [];
     const keys = new Set();
     for (const msg of messages) {
-      const matches = (msg.text || '').match(/UP-\d+/g) || [];
+      const matches = (msg.text || '').match(/\b(?:UP|PAY|AIT)-\d+\b/g) || [];
       matches.forEach(k => keys.add(k));
     }
     return [...keys].map(k => ({ key: k, url: `${JIRA_HOST}/browse/${k}` }));
@@ -1559,11 +1578,18 @@ function businessHoursBetween(startMs, endMs) {
 //   'released'    → every real fix version is released
 //   'pending'     → at least one real fix version is not released yet
 //   'unset'       → no fix version at all
+// "N/A" and the monthly "Will not release - <Mon>" versions mean no release.
+// "To be confirmed…", "…(TBD)" are placeholders — no release decided yet —
+// so they count as unset, never as a scheduled release.
+const NO_RELEASE_RE  = /^n\s*\/?\s*a$|^will not release/i;
+const PLACEHOLDER_RE = /^to be confirmed|\(tbd\)|\btbd\b/i;
+
 function releaseState(fixVersions) {
   const vs = fixVersions || [];
   if (!vs.length) return { state: 'unset', versions: [] };
-  if (vs.every(v => /^n\s*\/?\s*a$/i.test((v.name || '').trim()))) return { state: 'none-needed', versions: vs };
-  const real = vs.filter(v => !/^n\s*\/?\s*a$/i.test((v.name || '').trim()));
+  if (vs.every(v => NO_RELEASE_RE.test((v.name || '').trim()))) return { state: 'none-needed', versions: vs };
+  const real = vs.filter(v => !NO_RELEASE_RE.test((v.name || '').trim()) && !PLACEHOLDER_RE.test((v.name || '').trim()));
+  if (!real.length) return { state: 'unset', versions: vs };        // only placeholders
   const pending = real.filter(v => !v.released);
   return pending.length ? { state: 'pending', versions: pending } : { state: 'released', versions: real };
 }
@@ -1688,7 +1714,8 @@ function startFollowUpScheduler(client) {
           }
           // Verified with no Fix Version: nobody can tell when it goes live.
           if (await once('qa_success', 'passed QA')) {
-            await post(`${link} passed QA, but it has no Fix Version, so I can't tell when it goes live. ${pcMention || smMention}, please set the Fix Version (or *N/A* if no release is needed).` + fyi(reporter));
+            const why = rel.versions.length ? `its Fix Version is still a placeholder (${describeVersions(rel.versions)})` : 'it has no Fix Version';
+            await post(`${link} passed QA, but ${why}, so I can't tell when it goes live. ${pcMention || smMention}, please set the release version (or *N/A* / *Will not release* if no release is needed).` + fyi(reporter));
             item.announced.qa_success = true;
           }
           continue;
@@ -1791,7 +1818,7 @@ async function findOrRegisterTracked(client, channelId, threadTs, botBotId, botU
 
     // Find first UP-XXXXX in any message
     for (const msg of messages) {
-      const match = (msg.text || '').match(/UP-\d+/);
+      const match = (msg.text || '').match(/\b(?:UP|PAY|AIT)-\d+\b/);
       if (match) {
         jiraKey = match[0];
         jiraUrl = `${JIRA_HOST}/browse/${jiraKey}`;
@@ -2134,12 +2161,12 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
         return;
       }
 
-      const specificKey = (event.text.match(/UP-\d+/i) || [])[0]?.toUpperCase();
+      const specificKey = (event.text.match(/\b(?:UP|PAY|AIT)-\d+\b/i) || [])[0]?.toUpperCase();
       const threadMsgsCA = (await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 50 }).catch(() => ({ messages: [] }))).messages || [];
       const threadKeys = [];
       for (const msg of [...threadMsgsCA].reverse()) {
         if (msg.bot_id !== botBotId) continue;
-        for (const k of (msg.text || '').match(/UP-\d+/g) || []) {
+        for (const k of (msg.text || '').match(/\b(?:UP|PAY|AIT)-\d+\b/g) || []) {
           if (!threadKeys.includes(k)) threadKeys.push(k);
         }
       }
@@ -2209,7 +2236,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
 
         // An explicit ticket key in the request wins over any matching
         // ("do follow up with @Hanh for UP-79009").
-        const explicitKey = (event.text.match(/\bUP-\d+\b/i) || [])[0]?.toUpperCase() || null;
+        const explicitKey = (event.text.match(/\b(?:UP|PAY|AIT)-\d+\b/i) || [])[0]?.toUpperCase() || null;
 
         const matches = [];
         for (const key of (explicitKey ? [explicitKey] : threadKeys).slice(0, 12)) {
@@ -2451,7 +2478,7 @@ Max 8 steps total. Plain English only.`,
     const existingSummaries = [];
     for (const msg of allThreadMsgs) {
       if (msg.bot_id !== botBotId) continue;
-      (msg.text || '').match(/UP-\d+/g)?.forEach(k => { if (!existingKeys.includes(k)) existingKeys.push(k); });
+      (msg.text || '').match(/\b(?:UP|PAY|AIT)-\d+\b/g)?.forEach(k => { if (!existingKeys.includes(k)) existingKeys.push(k); });
       const sm = (msg.text || '').match(/\*(.+?)\*/);
       if (sm) existingSummaries.push(sm[1].toLowerCase());
     }
@@ -2493,7 +2520,7 @@ Max 8 steps total. Plain English only.`,
         .filter(t => !/^(bug|task)$/i.test(t))
         .sort((a, b) => b.length - a.length)
         .find(t => new RegExp(`\\b${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(event.text));
-      const parentMatch = event.text.match(/\b(?:epic|under|parent)\s+(?:this\s+)?(?:epic\s+|parent\s+)?(UP-\d+)\b/i);
+      const parentMatch = event.text.match(/\b(?:epic|under|parent)\s+(?:this\s+)?(?:epic\s+|parent\s+)?((?:UP|PAY|AIT)-\d+)\b/i);
       for (const t of analysis.tickets) {
         if (explicitType) t.type = explicitType;
         if (parentMatch) t.explicitParent = parentMatch[1].toUpperCase();
@@ -2525,7 +2552,7 @@ Max 8 steps total. Plain English only.`,
 
     // Keys the requester referenced in the command itself (e.g. "under epic
     // UP-51189", "duplicate of UP-123") are context, NOT duplicate signals.
-    const referencedInTrigger = new Set((event.text.match(/\b(?:UP|PLAN)-\d+\b/gi) || []).map(k => k.toUpperCase()));
+    const referencedInTrigger = new Set((event.text.match(/\b(?:UP|PLAN|PAY|AIT)-\d+\b/gi) || []).map(k => k.toUpperCase()));
     const dedupKeys = liveKeys.filter(k => !referencedInTrigger.has(k));
 
     // Shortcut: "assign to @X" when a LIVE ticket already exists
@@ -2955,7 +2982,7 @@ async function enrichThread(client, channelId, msg, botUserId) {
 
       // Find first Jira ticket — anywhere in the message incl. unfurls
       if (!jiraKey) {
-        const match = fullText.match(/UP-\d+/);
+        const match = fullText.match(/\b(?:UP|PAY|AIT)-\d+\b/);
         if (match) { jiraKey = match[0]; jiraUrl = `${JIRA_HOST}/browse/${jiraKey}`; }
       }
 
@@ -2963,7 +2990,7 @@ async function enrichThread(client, channelId, msg, botUserId) {
         // Extract squad from bot's analysis reply
         if (!squad) {
           const m = text.match(/(?:Squad|Related squad):\s*\*?([^*\n]+?)\*?\s*$/m);
-          if (m) squad = m[1].trim();
+          if (m) squad = m[1].replace(/&amp;/g, '&').trim();
         }
         // Extract English summary from bot's analysis reply (new + old formats)
         if (!englishSummary) {
@@ -3286,5 +3313,15 @@ function setTrackedAssignee(jiraKey, slackId) {
 // cards created in the monitored channels.
 const CLIENT_REPORT_FIX_VERSION_ID = '27643';   // "Client Report (TBD)"
 
+// Squads with their own Jira project. Client-report cards for these squads
+// go to that project, under its Client Report epic, on the project's
+// monthly "To be confirmed - <Mon YYYY>" version, and are NOT added to a
+// sprint (the squad triages them). Every Core squad stays in UP.
+const SQUAD_PROJECTS = {
+  'Payment & Billing': { project: 'PAY', parent: 'PAY-3517' },   // "PAY | Client Report"
+  'Booking':           { project: 'PAY', parent: 'PAY-3517' },   // booking work lives in PAY
+  'AI Features':       { project: 'AIT', parent: 'AIT-2179' },   // "AI | Client Report"
+};
+
 module.exports = { register, MONITORED_CHANNELS, registerFollowUp, isTracked, setTrackedAssignee,
-  PLATFORM_PARENTS, CLIENT_REPORT_FIX_VERSION_ID };
+  PLATFORM_PARENTS, CLIENT_REPORT_FIX_VERSION_ID, SQUAD_PROJECTS, squadForThread };

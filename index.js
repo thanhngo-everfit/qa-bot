@@ -832,9 +832,9 @@ function buildAdfDescription(text) {
   return { type: 'doc', version: 1, content };
 }
 
-async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, parentKey, reporterJiraId, issueType = 'Bug') {
+async function createJiraIssue(ticket, jiraAccountIds, epicKey, fixVersionId, parentKey, reporterJiraId, issueType = 'Bug', projectKey = JIRA_PROJECT) {
   const fields = {
-    project:     { key: JIRA_PROJECT },
+    project:     { key: projectKey },
     summary:     ticket.summary,
     issuetype:   { name: issueType },
     priority:    { name: ticket.priority },
@@ -985,7 +985,7 @@ async function pickParentFromCanvas(client, channelId, bugPlatform) {
   if (!canvasContent) return null;
 
   // Extract all UP- and PLAN- keys from canvas
-  const upKeys   = [...new Set((canvasContent.match(/UP-\d+/g)   || []))];
+  const upKeys   = [...new Set((canvasContent.match(/\b(?:UP|PAY|AIT)-\d+\b/g)   || []))];
   const planKeys = [...new Set((canvasContent.match(/PLAN-\d+/g) || []))];
   console.log(`[QABot] Canvas keys: UP=${upKeys.join(',')} PLAN=${planKeys.join(',')}`);
 
@@ -1470,7 +1470,7 @@ async function scanThreadTicketKeys(client, channelId, threadTs) {
       return parts.join(' ');
     };
     for (const m of replies.messages || []) {
-      for (const k of textOf(m).match(/UP-\d+/g) || []) if (!keys.includes(k)) keys.push(k);
+      for (const k of textOf(m).match(/\b(?:UP|PAY|AIT)-\d+\b/g) || []) if (!keys.includes(k)) keys.push(k);
     }
   } catch (_) {}
   return keys;
@@ -1829,7 +1829,7 @@ HARD RULES — follow exactly:
       const threadResult = await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 50 });
       for (const msg of (threadResult.messages || [])) {
         if (msg.bot_id !== botBotId) continue;
-        const keyMatches = (msg.text || '').match(/UP-\d+/g) || [];
+        const keyMatches = (msg.text || '').match(/\b(?:UP|PAY|AIT)-\d+\b/g) || [];
         existingKeys.push(...keyMatches);
         const summaryMatch = (msg.text || '').match(/\*(.+?)\*/);
         if (summaryMatch) existingSummaries.push(summaryMatch[1].toLowerCase());
@@ -1915,8 +1915,8 @@ HARD RULES — follow exactly:
     }
 
     // Parse Epic from trigger message (PLAN-XXX or UP-XXX)
-    const epicExplicit = event.text.match(/\b(?:epic|under|parent)\s+(?:epic\s+)?(PLAN-\d+|UP-\d+)\b/i);
-    const epicAny      = event.text.match(/\b(PLAN-\d+|UP-\d+)\b/i);
+    const epicExplicit = event.text.match(/\b(?:epic|under|parent)\s+(?:epic\s+)?(PLAN-\d+|UP-\d+|PAY-\d+|AIT-\d+)\b/i);
+    const epicAny      = event.text.match(/\b(PLAN-\d+|UP-\d+|PAY-\d+|AIT-\d+)\b/i);
     let epicKey        = (epicExplicit ? epicExplicit[1] : epicAny ? epicAny[1] : null)?.toUpperCase() || null;
 
     // "same epic as that previous bug/ticket" → inherit the epic from a
@@ -1939,6 +1939,17 @@ HARD RULES — follow exactly:
     // everywhere else uses the default "To be confirmed".
     const inReportChannel = !!clientReport.MONITORED_CHANNELS[event.channel];
     const fixVersionId = inReportChannel ? clientReport.CLIENT_REPORT_FIX_VERSION_ID : '12023';
+
+    // Squad-owned projects: Payment & Billing / Booking → PAY, AI Features →
+    // AIT. Only Core squads stay in UP. Report channels only.
+    let targetProject = JIRA_PROJECT, projectRoute = null;
+    if (inReportChannel) {
+      const threadSquad = await clientReport.squadForThread(client, event.channel, threadTs);
+      projectRoute = threadSquad ? clientReport.SQUAD_PROJECTS[threadSquad] || null : null;
+      if (projectRoute) targetProject = projectRoute.project;
+      logger.info(`[QABot] Squad "${threadSquad || 'unknown'}" → project ${targetProject}`);
+    }
+    const ticketFixVersionId = projectRoute ? await lib.getMonthlyTbdVersion(targetProject) : fixVersionId;
 
     // Resolve reporter: the person who tagged the bot (NOT the thread author)
     const reporterSlackId = event.user;
@@ -2008,7 +2019,10 @@ HARD RULES — follow exactly:
       // Report channels: cards go under the platform's Client Report epic
       // (iOS → Client Report (iOS), etc.) unless the request names an epic
       // or parent. The sprint-epic search below is for other channels only.
-      if (inReportChannel && !epicKey) {
+      if (inReportChannel && !epicKey && projectRoute) {
+        parentKey = projectRoute.parent;
+        logger.info(`[QABot] ${targetProject} Client Report epic: ${parentKey}`);
+      } else if (inReportChannel && !epicKey) {
         parentKey = clientReport.PLATFORM_PARENTS[ticket.platform] || null;
         if (parentKey) logger.info(`[QABot] Client Report epic for ${ticket.platform}: ${parentKey}`);
         else logger.warn(`[QABot] No Client Report epic mapped for platform "${ticket.platform}"`);
@@ -2062,7 +2076,7 @@ HARD RULES — follow exactly:
       }
       logger.info(`[QABot] Creating ${issueType}: ${ticket.summary} epic=${epicKey || 'none'} parent=${parentKey || 'none'}`);
       await agentSt.update('📝 _QA Agent is creating the Jira ticket(s)…_');
-      const jira = await createJiraIssue(ticket, jiraIds, epicKey, fixVersionId, parentKey, reporterJiraId, issueType);
+      const jira = await createJiraIssue(ticket, jiraIds, epicKey, ticketFixVersionId, parentKey, reporterJiraId, issueType, targetProject);
       if (epicKey && !jira.applied?.epic) jira.notes = [...(jira.notes || []), `couldn't attach to epic ${epicKey} — please link it in Jira`];
       if (!epicKey && !jira.applied?.epic) jira.notes = [...(jira.notes || []), 'no epic set'];
       if (skippedAtts.length) jira.notes = [...(jira.notes || []), `${skippedAtts.length} file(s) too large to attach (${skippedAtts.map(s => s.name).join(', ')})`];
@@ -2084,7 +2098,7 @@ HARD RULES — follow exactly:
         }
       };
 
-      const sprintAdded = sprintId
+      const sprintAdded = (sprintId && !projectRoute)
         ? await withBudget('sprint add', 20000, () => addIssueToSprint(jira.key, sprintId), false)
         : false;
 
