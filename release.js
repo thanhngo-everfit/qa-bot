@@ -395,6 +395,55 @@ async function alreadyAnnouncedInChannel(client, group) {
   } catch { return false; }
 }
 
+// ── Evidence of shipping: #release_production_request ────────────────
+// The release workflow posts "<Platform> Production Release Request: … for
+// platform: Web - version: v4.36.0" and the dev clicks Continue as the
+// release goes out. A request with a Continue click = shipped to production.
+const PROD_RELEASE_CHANNEL = process.env.PROD_RELEASE_CHANNEL || 'CTT4J643Y';   // #release_production_request
+
+function requestToVersionNames(platform, version) {
+  const p = (platform || '').toLowerCase().replace(/[^a-z]/g, '');
+  const raw = String(version || '');
+  const side = /^client_?/i.test(raw) ? 'Client' : /^coach_?/i.test(raw) ? 'Coach' : null;
+  const num = (raw.match(/(\d+(?:\.\d+){1,3})/) || [])[1];
+  if (!num) return [];
+  const fams = p === 'web' ? ['Web']
+    : p === 'api' ? ['API']
+    : p === 'internalapi' ? ['Internal API']
+    : p === 'academyweb' ? ['Academy Web', 'Academy CMS']       // the workflow uses academy-web for both
+    : p === 'academycms' ? ['Academy CMS']
+    : p === 'cms' ? ['CMS']
+    : p === 'ios' ? (side ? [`iOS ${side}`] : ['iOS Coach', 'iOS Client'])
+    : p === 'android' ? (side ? [`Android ${side}`] : ['Android Coach', 'Android Client'])
+    : [];                                                        // payment-api, olly, landing page: not UP
+  return fams.map(f => `${f} ${num}`);
+}
+
+async function shippedRequests(client, days = 45) {
+  const oldest = String((Date.now() - days * 86400 * 1000) / 1000);
+  const out = [];                                              // newest first
+  let cursor;
+  for (let page = 0; page < 5; page++) {
+    let res;
+    try { res = await client.conversations.history({ channel: PROD_RELEASE_CHANNEL, oldest, limit: 200, cursor }); }
+    catch (err) { console.warn('[Release] #release_production_request read failed:', err.data?.error || err.message); break; }
+    for (const m of res.messages || []) {
+      const t = JSON.stringify([m.text || '', m.blocks || [], m.attachments || []]);
+      if (!/Production Release Request/i.test(t)) continue;
+      const pv = t.match(/for platform:\s*(.+?)\s*-\s*version:\s*([A-Za-z_]*v?\d+(?:\.\d+){1,3})/i);
+      if (!pv) continue;
+      const click = t.match(/<@([A-Z0-9]+)(?:\|[^>]*)?>\s*clicked\s*\*?`?Continue/i);
+      if (!click) continue;                                      // never continued → not shipped
+      out.push({ names: requestToVersionNames(pv[1], pv[2]), by: click[1], ts: m.ts,
+                 day: isoDay(new Date(parseFloat(m.ts) * 1000 + 7 * 3600 * 1000)),
+                 link: `https://everfitt.slack.com/archives/${PROD_RELEASE_CHANNEL}/p${m.ts.replace('.', '')}` });
+    }
+    cursor = res.response_metadata?.next_cursor;
+    if (!cursor) break;
+  }
+  return out;
+}
+
 // ── Fix version check ───────────────────────────────────────────────
 // Three problems a PC should fix before a release can be coordinated:
 //   · draft name  — not "<Platform> <number>" (PC hasn't decided yet)
@@ -411,11 +460,29 @@ async function hasCards(versionId) {
   } catch { return { n: 0, more: false }; }
 }
 
-async function versionCheck() {
+async function versionCheck(client = null) {
   const today = isoDay(vnNow());
   const versions = await listVersions();
-  const flags = { draft: [], overdue: [], noDate: [] };
+  const flags = { shipped: [], draft: [], overdue: [], noDate: [] };
+  // Released to production (per #release_production_request) but still
+  // unreleased in Jira — the strongest signal, reported first
+  const shippedByName = new Map();
+  if (client) {
+    for (const r of await shippedRequests(client)) {
+      for (const n of r.names) if (!shippedByName.has(n.toLowerCase())) shippedByName.set(n.toLowerCase(), r);
+    }
+  }
+  const handled = new Set();
   for (const v of versions) {
+    const r = shippedByName.get((v.name || '').trim().toLowerCase());
+    if (!r) continue;
+    const c = await hasCards(v.id);
+    flags.shipped.push({ id: String(v.id), name: v.name, date: v.releaseDate || null, cards: c.more ? `${c.n}+` : String(c.n),
+                         shippedDay: r.day, by: r.by, link: r.link });
+    handled.add(String(v.id));
+  }
+  for (const v of versions) {
+    if (handled.has(String(v.id))) continue;
     const draft = !isRealVersionName(v.name);
     const overdue = !!v.releaseDate && v.releaseDate < today;
     const noDate = !v.releaseDate;
@@ -438,7 +505,15 @@ function renderVersionCheck(flags) {
   };
   const section = (title, hint, list) => list.length
     ? `*${title}* — ${hint}\n${list.slice(0, 10).map(line).join('\n')}${list.length > 10 ? `\n_…and ${list.length - 10} more_` : ''}` : null;
+  const shippedLine = (e) => {
+    const age = e.openDays > 0 ? ` · _open ${e.openDays} working day${e.openDays > 1 ? 's' : ''}_` : ' · _new_';
+    return `• <${versionUrl(e.id)}|${esc(e.name)}> · ${e.cards} card${e.cards === '1' ? '' : 's'} · released ${prettyDate(e.shippedDay)} by ${lib.replaceMentionsCached(`<@${e.by}>`)} (<${e.link}|request>)${age}`;
+  };
+  const shipped = flags.shipped?.length
+    ? `*Released to production, not marked released in Jira* — from <#${PROD_RELEASE_CHANNEL}>\n${flags.shipped.slice(0, 10).map(shippedLine).join('\n')}${flags.shipped.length > 10 ? `\n_…and ${flags.shipped.length - 10} more_` : ''}`
+    : null;
   const parts = [
+    shipped,
     section('Draft version names', "not a real \"<Platform> <number>\" version yet — the PC still needs to decide it", flags.draft),
     section('Release date passed', 'still not marked released in Jira — release it, or move the date', flags.overdue),
     section('No release date', 'cards are assigned but the version has no date', flags.noDate),
@@ -453,8 +528,9 @@ let _lastCheck = { sig: null, day: null };
 const DAILY_ALL_CLEAR = (process.env.VERSION_CHECK_ALL_CLEAR || 'true') !== 'false';
 
 async function alertVersionIssues(client, { force = false, channel = RELEASE_REVIEW_CHANNEL, threadTs = null } = {}) {
-  const flags = await versionCheck();
+  const flags = await versionCheck(client);
   const today = isoDay(vnNow());
+  await lib.warmUserNames(client, (flags.shipped || []).map(e => e.by)).catch(() => {});
   // Age each finding; forget ones that got fixed
   const live = new Set();
   for (const [kind, list] of Object.entries(flags)) {
@@ -467,7 +543,7 @@ async function alertVersionIssues(client, { force = false, channel = RELEASE_REV
   }
   for (const k of [...FIRST_SEEN.keys()]) if (!live.has(k)) FIRST_SEEN.delete(k);
 
-  const total = flags.draft.length + flags.overdue.length + flags.noDate.length;
+  const total = flags.shipped.length + flags.draft.length + flags.overdue.length + flags.noDate.length;
   if (!force && _lastCheck.day === today) return;            // once per working day
   _lastCheck = { sig: checkSignature(flags), day: today };
 
@@ -478,10 +554,14 @@ async function alertVersionIssues(client, { force = false, channel = RELEASE_REV
     }
     return;
   }
-  await client.chat.postMessage({
-    channel, thread_ts: threadTs, unfurl_links: false, unfurl_media: false,
-    text: `${threadTs ? '' : `${notifyTags()} `}*Fix version check* (${prettyDate(today)}) — ${total} version${total > 1 ? 's need' : ' needs'} a PC's attention before release:\n\n${renderVersionCheck(flags)}`,
-  });
+  const text = `${threadTs ? '' : `${notifyTags()} `}*Fix version check* (${prettyDate(today)}) — ${total} version${total > 1 ? 's need' : ' needs'} a PC's attention before release:\n\n${renderVersionCheck(flags)}`;
+  const buttons = (flags.shipped || []).slice(0, 10).map(e => ({
+    type: 'button', action_id: `rel_mark_released_${e.id}`, value: `${e.id}|${e.shippedDay}|${e.name}`.substring(0, 2000),
+    text: { type: 'plain_text', text: `Mark ${e.name} released`.substring(0, 75) },
+  }));
+  const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: text.substring(0, 2900) } }];
+  if (buttons.length) blocks.push({ type: 'actions', elements: buttons });
+  await client.chat.postMessage({ channel, thread_ts: threadTs, unfurl_links: false, unfurl_media: false, text, blocks });
 }
 
 function businessDaysSince(isoDate) {
@@ -685,6 +765,30 @@ function register(slackApp) {
       text: `Moved ${moved.length} card(s) to ${cand.versionName}${moved.length ? `: ${moved.join(', ')}` : ''}${failed.length ? `\nCouldn't move: ${failed.join(', ')}` : ''}` }).catch(() => {});
   });
 
+  slackApp.action(/^rel_mark_released_/, async ({ ack, body, client, logger }) => {
+    await ack();
+    const [versionId, day, name] = (body.actions?.[0]?.value || '').split('|');
+    if (!RELEASE_APPROVERS.includes(body.user?.id)) {
+      await client.chat.postEphemeral({ channel: body.channel.id, user: body.user.id, text: `Only ${RELEASE_APPROVERS.map(u => `<@${u}>`).join(' ')} can mark versions released.` }).catch(() => {});
+      return;
+    }
+    let reply;
+    try {
+      await axios.put(`${JIRA_HOST}/rest/api/3/version/${versionId}`, { released: true, releaseDate: day },
+        { headers: { ...headers(), 'Content-Type': 'application/json' } });
+      reply = `Marked *${esc(name)}* released in Jira (release date ${prettyDate(day)}) — by <@${body.user.id}>.`;
+      // Drop the button so it can't be clicked twice
+      const blocks = (body.message?.blocks || []).map(b => b.type !== 'actions' ? b
+        : { ...b, elements: (b.elements || []).filter(el => el.action_id !== body.actions[0].action_id) })
+        .filter(b => b.type !== 'actions' || b.elements.length);
+      await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: body.message.text || 'Fix version check', blocks }).catch(() => {});
+    } catch (err) {
+      reply = `I couldn't mark ${esc(name)} released (${err.response?.status || err.message}${err.response?.status === 403 ? ' — my Jira account needs the Manage versions permission' : ''}).`;
+      logger?.warn?.('[Release] mark released failed:', err.response?.data || err.message);
+    }
+    await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message?.ts, text: reply }).catch(() => {});
+  });
+
   slackApp.action('rel_skip', async ({ ack, body, client }) => {
     await ack();
     const id = body.actions?.[0]?.value;
@@ -747,5 +851,5 @@ module.exports = {
   // exported for tests
   versionFamily, upcomingWorkdays, itemLabel, renderAnnouncement, renderReadiness, buildDraft, upcomingGroups,
   versionTagRegex, findCandidates, moveToVersion, PLACEHOLDER_VERSION_IDS, draftUpcoming, remindPending,
-  isRealVersionName, versionCheck, renderVersionCheck, alertVersionIssues,
+  isRealVersionName, versionCheck, renderVersionCheck, alertVersionIssues, requestToVersionNames, shippedRequests,
 };
