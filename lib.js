@@ -497,7 +497,7 @@ async function findRecentIssueBySummary(summary, projectKey = JIRA_PROJECT, { as
     // created on purpose when a request names several people (one card
     // each) — the first card must never be mistaken for the second.
     const who = assigneeId ? ` AND assignee = "${assigneeId}"` : ' AND assignee is EMPTY';
-    const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
       params: { jql: `project = ${projectKey} AND created >= -10m AND summary ~ "${safe}"${who} ORDER BY created DESC`, maxResults: 10, fields: 'summary' },
       headers: { Authorization: jiraAuth(), Accept: 'application/json' },
       timeout: 15000,
@@ -639,7 +639,7 @@ async function listOpenEpics(projectKey, max = 100, summaryContains = null) {
   if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.epics;
   let epics = [];
   try {
-    const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
       params: {
         jql: `project = ${projectKey} AND issuetype = Epic AND statusCategory != Done${summaryContains ? ` AND summary ~ "${summaryContains}"` : ''} ORDER BY updated DESC`,
         maxResults: Math.min(max, 100), fields: 'summary',
@@ -698,7 +698,7 @@ async function challengerEpicFor(platform) {
   if (!_chalEpics || Date.now() - _chalEpicsAt > 6 * 3600 * 1000) {
     const found = {};
     try {
-      const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
+      const res = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
         params: {
           jql: `project = UP AND issuetype = Epic AND statusCategory != Done AND summary ~ "Challenger" AND summary ~ "\\"Post-release fixes\\"" ORDER BY created DESC`,
           maxResults: 50, fields: 'summary',
@@ -785,17 +785,24 @@ async function transitionToStatus(issueKey, statusName) {
 // Cards are found by the channel id in their description (the Slack thread
 // link every card carries). Epics and sub-tasks can't take an epic parent,
 // so they're excluded. Paced to stay well inside Jira's rate limits.
+// "move all tickets from this channel to epic UP-x" (issues/cards/parent too)
+const BULK_MOVE_RE = /\bmove\b[\s\S]*?\b(?:tickets?|issues?|cards?)\b[\s\S]*?\bchannel\b[\s\S]*?\b(?:epic|parent)\s+((?:UP|PAY|AIT|CHAL)-\d+)\b/i;
+function isBulkMoveRequest(text) {
+  return BULK_MOVE_RE.test((text || '').replace(/<@[A-Z0-9]+>/g, ''));
+}
+
 async function bulkSetParentForChannel(channelId, epicKey, { onProgress } = {}) {
   const jql = `text ~ "${channelId}" AND (parent is EMPTY OR parent != ${epicKey}) AND issuetype not in (Epic, Sub-task) ORDER BY created DESC`;
   const keys = [];
-  for (let startAt = 0; startAt < 1000; startAt += 100) {
-    const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
-      params: { jql, startAt, maxResults: 100, fields: 'summary' },
+  let nextPageToken = null;
+  for (let page = 0; page < 10; page++) {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
+      params: { jql, maxResults: 100, fields: 'summary', ...(nextPageToken ? { nextPageToken } : {}) },
       headers: { Authorization: jiraAuth(), Accept: 'application/json' },
     });
-    const batch = (res.data?.issues || []).map(i => i.key);
-    keys.push(...batch);
-    if (batch.length < 100) break;
+    keys.push(...(res.data?.issues || []).map(i => i.key));
+    nextPageToken = res.data?.nextPageToken || null;
+    if (!nextPageToken || res.data?.isLast) break;
   }
   const moved = [], failed = [];
   for (let i = 0; i < keys.length; i++) {
@@ -1126,7 +1133,7 @@ module.exports = {
   SMART_MODEL, aiComplete, aiCall, toolsSupported,
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient, getIssueEpic,
   shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion, listOpenEpics, setIssueParent,
-  getLastActiveSprint, getVersionName, getIssueTitle, bulkSetParentForChannel,
+  getLastActiveSprint, getVersionName, getIssueTitle, bulkSetParentForChannel, BULK_MOVE_RE, isBulkMoveRequest,
   CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, challengerEpicFor, challengerSummary,
   LOW_PRIORITY_SPRINT_ID, LOW_PRIORITY_STATUS, LOW_PRIORITIES, LOW_PRIORITY_RULES, lowPriorityRule, getSprintInfo, transitionToStatus,
   PROJECT_BOARDS, getActiveSprintForProject,

@@ -153,11 +153,11 @@ async function execTool(name, args, ctx) {
         return g.note ? { error: g.note } : { days, transcript: g.context };
       }
       case 'jira_search': {
-        const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
+        const res = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
           params: { jql: args.jql, maxResults: Math.min(args.max_results || 20, 50), fields: 'summary,status,assignee,priority,updated' },
           headers: { Authorization: jiraAuth(), Accept: 'application/json' },
         });
-        return { total: res.data?.total, issues: (res.data?.issues || []).map(i => ({
+        return { count: (res.data?.issues || []).length, more: !!res.data?.nextPageToken, issues: (res.data?.issues || []).map(i => ({
           key: i.key, summary: i.fields?.summary, status: i.fields?.status?.name,
           assignee: i.fields?.assignee?.displayName || null, priority: i.fields?.priority?.name,
           updated: i.fields?.updated, url: `${JIRA_HOST}/browse/${i.key}`,

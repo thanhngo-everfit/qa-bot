@@ -1403,7 +1403,7 @@ async function findSprintParent(activeSprintId, platform, channelName) {
     const jql =
       `project = UP AND issuetype = Epic AND sprint = ${activeSprintId} ORDER BY key DESC`;
 
-    const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
       params: { jql, maxResults: 60, fields: 'summary,status' },
       headers: { Authorization: jiraAuth(), Accept: 'application/json' },
     });
@@ -1554,7 +1554,7 @@ const coreMentionHandler = async ({ event, client, logger }) => {
   // Bulk admin command: "move all tickets from this channel to epic UP-x".
   // Edits many cards at once, so it's limited to BULK_ADMINS (default: Thanh).
   const bulkText = (event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim();
-  const bulkMatch = bulkText.match(/\bmove\b[\s\S]*?\b(?:tickets?|issues?|cards?)\b[\s\S]*?\bchannel\b[\s\S]*?\b(?:epic|parent)\s+((?:UP|PAY|AIT|CHAL)-\d+)\b/i);
+  const bulkMatch = bulkText.match(lib.BULK_MOVE_RE);
   if (bulkMatch) {
     const epicKey = bulkMatch[1].toUpperCase();
     const tTs = event.thread_ts || event.ts;

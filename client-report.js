@@ -11,7 +11,7 @@ const path = require('path');
 const {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiCall,
-  agentStatus, getActiveSprintId, createJiraIssueResilient, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest,
+  agentStatus, getActiveSprintId, createJiraIssueResilient, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, isBulkMoveRequest,
   warmUserNames, replaceMentionsCached, PRIORITY_RUBRIC,
   resolveInlineMentions, qaTaskWork,
 } = require('./lib');
@@ -1379,15 +1379,15 @@ function extractTextAndLinks(adfNode, out) {
 
 async function rebuildFollowUpsFromJira() {
   const DONE_STATUSES = ['qa success', 'done', 'released', 'closed'];
-  let restored = 0, startAt = 0;
+  let restored = 0, nextPageToken = null;
   try {
     for (let page = 0; page < 4; page++) {           // up to 400 tickets
-      const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
+      const res = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
         params: {
           // Old client-report cards carry fixVersion 27643; cards created by the
           // unified pipeline carry the [Client Report]/[Client Request] prefix.
           jql: `project in (UP, PAY, AIT, CHAL) AND (fixVersion = 27643 OR summary ~ "\\"Client Report\\"" OR summary ~ "\\"Client Request\\"") AND statusCategory != Done ORDER BY created DESC`,
-          maxResults: 100, startAt,
+          maxResults: 100, ...(nextPageToken ? { nextPageToken } : {}),
           fields: 'summary,status,description',
         },
         headers: { Authorization: jiraAuth(), Accept: 'application/json' },
@@ -1418,8 +1418,9 @@ async function rebuildFollowUpsFromJira() {
         });
         restored++;
       }
-      startAt += issues.length;
-      if (issues.length < 100) break;
+      // /search/jql pages with a token (no startAt, no total)
+      nextPageToken = res.data?.nextPageToken || null;
+      if (!nextPageToken || res.data?.isLast) break;
     }
     console.log(`[FollowUp] Jira rebuild: re-registered ${restored} open client-report ticket(s)`);
   } catch (err) {
@@ -1936,7 +1937,7 @@ const crMentionHandler = async ({ event, client, logger }) => {
   // channels — one prompt, one mechanism, no parity drift. This module
   // keeps what it uniquely owns: auto-analysis, follow-ups, weekly
   // reports, troubleshooting, reassignment, retraction.
-  if (isCreationRequest(event.text) || isDiscoveryRequest(event.text)
+  if (isCreationRequest(event.text) || isDiscoveryRequest(event.text) || isBulkMoveRequest(event.text)
       || /^(status|health|are you (alive|ok|up)|ping)\b/i.test((event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim())) {
     logger.info('[Bot] Creation/discovery request → deferring to core pipeline');
     return;
