@@ -2166,7 +2166,7 @@ HARD RULES — follow exactly:
           if (sprintAdded) bits.push('Active Sprint');
           const set = bits.length ? `${bits.join(', ')} set` : 'no epic/sprint set';
           const problems = (jira.notes || []).filter(n => n !== 'no epic set');
-          return `_${set}${problems.length ? ` · ${problems.join(' · ')}` : ''}${jira.notes?.includes('no epic set') ? ' · no epic — mention one to link it' : ''}._`;
+          return `_${set}${problems.length ? ` · ${problems.join(' · ')}` : ''}${jira.notes?.includes('no epic set') ? ' · no epic yet — pick one below' : ''}._`;
         })()
       );
     });
@@ -2206,6 +2206,36 @@ HARD RULES — follow exactly:
       text: responseText || "Something went wrong on my side — I wasn't able to create the ticket this time. Try tagging me again in a moment.",
       ...(replyBlocks ? { blocks: replyBlocks } : {}),
     });
+
+    // No epic found → ask whoever triggered the creation to pick one.
+    for (const { jira } of createdJiras) {
+      if (jira.applied?.epic) continue;
+      try {
+        const projectKey = jira.key.split('-')[0];
+        const epics = await lib.listOpenEpics(projectKey);
+        if (!epics.length) continue;
+        const options = epics.slice(0, 100).map(e => ({
+          text:  { type: 'plain_text', text: `${e.key} — ${e.summary}`.substring(0, 75) },
+          value: e.key,
+        }));
+        const who = event.user ? `<@${event.user}>` : 'Someone';
+        await client.chat.postMessage({
+          channel: event.channel, thread_ts: threadTs, unfurl_links: false,
+          text: `${who}, I couldn't find an epic for ${jira.key} — please select one.`,
+          blocks: [
+            { type: 'section', text: { type: 'mrkdwn', text: `${who}, I couldn't find an epic for <${jira.url}|${jira.key}>. Please select one:` } },
+            { type: 'actions', block_id: `qa_epic:${jira.key}`, elements: [
+              { type: 'static_select', action_id: 'qa_epic_pick',
+                placeholder: { type: 'plain_text', text: 'Select an epic' }, options },
+              { type: 'button', action_id: 'qa_epic_skip', value: jira.key,
+                text: { type: 'plain_text', text: 'Skip' } },
+            ] },
+          ],
+        });
+      } catch (err) {
+        logger.warn(`[QABot] Epic prompt for ${jira.key} failed:`, err.data?.error || err.message);
+      }
+    }
 
     await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
     await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
@@ -2344,6 +2374,44 @@ slackApp.action('qa_core_dup_follow', async ({ ack, body, client, logger }) => {
     lines.length
       ? `🔍 <@${body.user.id}> chose *follow up on existing*:\n${lines.join('\n')}\n_I'm tracking the open ones — I'll follow up every 2 business days until closed._`
       : `🔍 I couldn't find live tickets in this thread anymore.`);
+});
+
+// ── "Select an epic" prompt for cards created without one ─────────────
+slackApp.action('qa_epic_pick', async ({ ack, body, client, logger }) => {
+  await ack();
+  const action  = body.actions?.[0] || {};
+  const cardKey = (action.block_id || '').replace(/^qa_epic:/, '');
+  const epicKey = action.selected_option?.value;
+  const epicTxt = action.selected_option?.text?.text || epicKey;
+  const clicker = body.user?.id;
+  if (!cardKey || !epicKey) return;
+  let line;
+  try {
+    await lib.setIssueParent(cardKey, epicKey);
+    line = `Added <${JIRA_HOST}/browse/${cardKey}|${cardKey}> to *${epicTxt}* · by <@${clicker}>`;
+    logger.info(`[QABot] ${cardKey} → epic ${epicKey} (picked by ${clicker})`);
+  } catch (err) {
+    line = `I couldn't add ${cardKey} to ${epicKey} (${err.response?.status || err.message}). Please link it in Jira.`;
+    logger.warn(`[QABot] Epic pick failed for ${cardKey}:`, err.response?.data || err.message);
+  }
+  try {
+    await client.chat.update({
+      channel: body.channel.id, ts: body.message.ts, text: line,
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: line } }],
+    });
+  } catch (_) {}
+});
+
+slackApp.action('qa_epic_skip', async ({ ack, body, client }) => {
+  await ack();
+  const cardKey = body.actions?.[0]?.value || '';
+  const line = `No epic set for <${JIRA_HOST}/browse/${cardKey}|${cardKey}> · skipped by <@${body.user?.id}>`;
+  try {
+    await client.chat.update({
+      channel: body.channel.id, ts: body.message.ts, text: line,
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: line } }],
+    });
+  } catch (_) {}
 });
 
 // ── Follow up button on the ticket confirmation ──────────────────────

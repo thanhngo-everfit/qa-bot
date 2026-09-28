@@ -585,6 +585,42 @@ async function getMonthlyTbdVersion(projectKey) {
   return id;
 }
 
+// ── Jira: open epics of a project (for the "pick an epic" prompt) ────
+// Most recently updated first; Slack menus hold at most 100 options.
+const _epicsCache = new Map();   // projectKey → { at, epics }
+async function listOpenEpics(projectKey, max = 100) {
+  const hit = _epicsCache.get(projectKey);
+  if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.epics;
+  let epics = [];
+  try {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/search`, {
+      params: {
+        jql: `project = ${projectKey} AND issuetype = Epic AND statusCategory != Done ORDER BY updated DESC`,
+        maxResults: Math.min(max, 100), fields: 'summary',
+      },
+      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+    });
+    epics = (res.data?.issues || []).map(i => ({ key: i.key, summary: i.fields?.summary || '' }));
+  } catch (err) {
+    console.warn(`[Jira] ${projectKey} epic list failed:`, err.response?.status || err.message);
+  }
+  _epicsCache.set(projectKey, { at: Date.now(), epics });
+  return epics;
+}
+
+// Attach an issue to an epic: modern parent link first, Epic Link fallback.
+async function setIssueParent(issueKey, epicKey) {
+  const put = (fields) => axios.put(`${JIRA_HOST}/rest/api/3/issue/${issueKey}`, { fields }, {
+    headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json' },
+  });
+  try { await put({ parent: { key: epicKey } }); return true; }
+  catch (err) {
+    if (err.response?.status !== 400) throw err;
+    await put({ customfield_10014: epicKey });            // legacy Epic Link
+    return true;
+  }
+}
+
 // ── Jira: quick issue snapshot ───────────────────────────────────────
 async function getIssueSnapshot(issueKey) {
   try {
@@ -805,7 +841,7 @@ module.exports = {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiComplete, aiCall, toolsSupported,
   agentStatus, getActiveSprintId, getIssueSnapshot, getProjectIssueTypes, createJiraIssueResilient, getIssueEpic,
-  shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion,
+  shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion, listOpenEpics, setIssueParent,
   resolveUserName, resolveInlineMentions, warmUserNames, replaceMentionsCached, qaTaskWork,
   detectChannelScope, parseWindowDays, gatherChannelContext,
   slackify, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, clientReportSummary,
