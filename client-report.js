@@ -35,7 +35,8 @@ const MONITORED_CHANNELS = {
 // production-issues channel — QA/BA findings in production — gets its own
 // prefix and the Production Audit epic, with the default Fix Version.
 const CHANNEL_PROFILES = {
-  'C0BG6LT3MH7': { kind: 'production-audit', prefix: '[Production Audit]', epic: 'UP-79457' },
+  'C0BG6LT3MH7': { kind: 'production-audit', prefix: '[Production Audit]', epic: 'UP-79457',
+                   sprint: process.env.PROD_AUDIT_SPRINT_ID || '5097' },   // every card, any priority
 };
 function channelProfile(channelId) {
   if (CHANNEL_PROFILES[channelId]) return CHANNEL_PROFILES[channelId];

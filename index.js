@@ -2253,6 +2253,17 @@ HARD RULES — follow exactly:
           jira.notes = [...(jira.notes || []), `review sprint ${lowRule.sprint} is ${info ? 'closed' : 'unavailable'}${cardSprintId ? ' — used the active sprint' : ' — no sprint set'}`];
         }
       }
+      // #production-issues: every UP card goes to that channel's sprint,
+      // whatever its priority (Low/Lowest still also get Need Review).
+      if (inProdAudit && chProfile.sprint && targetProject === JIRA_PROJECT) {
+        const info = await lib.getSprintInfo(chProfile.sprint);
+        if (info && info.state !== 'closed') {
+          cardSprintId = chProfile.sprint;
+          cardSprintName = info.name;
+        } else {
+          jira.notes = [...(jira.notes || []), `sprint ${chProfile.sprint} is ${info ? 'closed' : 'unavailable'} — used the active sprint`];
+        }
+      }
       const sprintAdded = cardSprintId
         ? await withBudget('sprint add', 20000, () => addIssueToSprint(jira.key, cardSprintId), false)
         : false;
