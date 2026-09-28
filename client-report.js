@@ -164,6 +164,7 @@ const PLATFORM_PARENTS = {
   'iOS Client': 'UP-23735', 'iOS Coach': 'UP-23735',
   'Android Client': 'UP-23734', 'Android Coach': 'UP-23734',
   'Web': 'UP-23736', 'API': 'UP-23733',
+  'Data': 'UP-23733',   // data-labelling fixes live under Client Report (API)
 };
 
 // ── Severity definitions (maps to Jira priority + SLA) ──
