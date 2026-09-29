@@ -1212,14 +1212,24 @@ function buildAnalysisReply(analysis, squad, contacts, reporterId = null) {
   const smPc = contacts ? `${contacts.smMention} ${contacts.pcMention}` : `<!subteam^${GROUP_SM}>`;
 
   if (tickets?.length) {
-    for (const t of tickets) {
-      const role   = roleOf(t.platform);
-      const action = t.summary.replace(/\[[^\]]*\]/g, '').trim(); // text after brackets
-      if (t.type === 'Bug') {
-        lines.push(`• ${smPc} — assign a *${role}* dev to investigate & fix "${action}"${askCsFirst}`);
-      } else {
-        lines.push(`• ${smPc} — assign a *${role}* dev to "${action}"${askCsFirst}`);
-      }
+    // Tag the people ONCE. One ticket → one line; several → one line per
+    // action underneath (previously each ticket repeated the tags and the
+    // 'ideally after…' clause, which read as a duplicated section).
+    const phrase = (t) => {
+      const action = t.summary.replace(/\[[^\]]*\]/g, '').trim();   // text after the [tags]
+      return t.type === 'Bug' ? `investigate & fix "${action}"` : `"${action}"`;
+    };
+    const article = (role) => /^[aeiou]/i.test(role) ? 'an' : 'a';
+    if (tickets.length === 1) {
+      const role = roleOf(tickets[0].platform);
+      lines.push(`• ${smPc} — assign ${article(role)} *${role}* dev to ${phrase(tickets[0])}${askCsFirst}`);
+    } else {
+      lines.push(`• ${smPc} — ${tickets.length} pieces of work:`);
+      tickets.forEach((t, i) => {
+        const role = roleOf(t.platform);
+        lines.push(`    ${i + 1}. ${article(role).replace(/^a/, 'A')} *${role}* dev to ${phrase(t)}`);
+      });
+      if (askCsFirst) lines.push(`_Ideally after the reporter answers the questions above._`);
     }
   } else {
     lines.push(`• ${smPc} — review this thread and decide next action`);
