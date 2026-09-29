@@ -1,4 +1,22 @@
 require('dotenv').config();
+// ── Recent log lines, readable from Slack ('@QA Agent logs') ──────────
+// Railway logs aren't reachable from Slack; keep the last lines in memory
+// so admins can debug without opening Railway. Resets on restart.
+const LOG_RING = [];
+const LOG_RING_MAX = parseInt(process.env.LOG_RING_MAX || '800', 10);
+for (const lvl of ['log', 'info', 'warn', 'error']) {
+  const orig = console[lvl].bind(console);
+  console[lvl] = (...args) => {
+    try {
+      const t = new Date(Date.now() + 7 * 3600 * 1000).toISOString().substring(5, 19).replace('T', ' ');
+      const line = args.map(a => typeof a === 'string' ? a : (a && a.stack) ? a.stack.split('\n').slice(0, 3).join(' | ') : JSON.stringify(a)).join(' ');
+      LOG_RING.push(`${t}${lvl === 'warn' ? ' WARN' : lvl === 'error' ? ' ERROR' : ''} ${line}`.substring(0, 600));
+      if (LOG_RING.length > LOG_RING_MAX) LOG_RING.shift();
+    } catch (_) {}
+    orig(...args);
+  };
+}
+
 const { App } = require('@slack/bolt');
 const OpenAI = require('openai');
 const axios = require('axios');
@@ -1700,6 +1718,34 @@ const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }
   // Release coordination: "draft release for Web 4.37.1" / "release plan"
   if (release.isReleaseCommand(event.text)) {
     await release.handleCommand({ event, client, logger });
+    return;
+  }
+
+  // Logs: "@QA Agent logs" / "logs analyze" / "show logs for UP-79340"
+  const logsMatch = (event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim().match(/^(?:(?:show|check|get)\s+(?:the\s+)?(?:bot\s+)?logs?|logs)\b(?:\s+(?:for|about|with|of)?\s*(.+))?$/i);
+  if (logsMatch) {
+    const tTs = event.thread_ts || event.ts;
+    const admins = new Set((process.env.LOG_ADMINS || 'U0142GU335F,U0445EQS1ED').split(',').map(s => s.trim()));
+    if (!admins.has(event.user)) {
+      await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, text: 'Logs can include names and emails, so they are limited to admins.' });
+      return;
+    }
+    const filter = (logsMatch[1] || '').trim().toLowerCase();
+    const words = filter ? filter.split(/\s+/).filter(Boolean) : [];
+    const matching = LOG_RING.filter(l => !words.length || words.every(w => l.toLowerCase().includes(w)));
+    const picked = [];
+    let size = 0;
+    for (let k = matching.length - 1; k >= 0 && picked.length < 60; k--) {        // newest first, then show in order
+      const line = matching[k].replace(/xox[abp]-[\w-]+/g, 'xox…').replace(/\bsk-[\w-]{6,}/g, 'sk-…');
+      if (size + line.length > 3400) break;
+      picked.unshift(line); size += line.length + 1;
+    }
+    await client.chat.postMessage({
+      channel: event.channel, thread_ts: tTs, unfurl_links: false, unfurl_media: false,
+      text: picked.length
+        ? `Last ${picked.length} log line${picked.length > 1 ? 's' : ''}${filter ? ` matching "${filter}"` : ''} (build \`${BUILD}\`, since ${new Date(BOOT_AT + 7 * 3600 * 1000).toISOString().substring(5, 16).replace('T', ' ')} VN):\n\`\`\`\n${picked.join('\n')}\n\`\`\``
+        : `No log lines${filter ? ` matching "${filter}"` : ''} since the last restart (${new Date(BOOT_AT + 7 * 3600 * 1000).toISOString().substring(5, 16).replace('T', ' ')} VN).`,
+    });
     return;
   }
 

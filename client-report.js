@@ -1976,6 +1976,7 @@ const crMentionHandler = async ({ event, client, logger }) => {
   // keeps what it uniquely owns: auto-analysis, follow-ups, weekly
   // reports, troubleshooting, reassignment, retraction.
   if (isCreationRequest(event.text) || isDiscoveryRequest(event.text) || isBulkMoveRequest(event.text) || isNoTicketReportRequest(event.text) || isBulkCreateRequest(event.text)
+      || /^(?:(?:show|check|get)\s+(?:the\s+)?(?:bot\s+)?logs?|logs)\b/i.test((event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim())
       || /^(status|health|are you (alive|ok|up)|ping)\b/i.test((event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim())) {
     logger.info('[Bot] Creation/discovery request → deferring to core pipeline');
     return;
