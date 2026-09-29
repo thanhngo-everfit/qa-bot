@@ -1174,7 +1174,9 @@ Critical (Highest) — the product is unusable or harm is done:
 High — a core flow is broken for the affected user and there is NO
 reasonable workaround:
   cannot stay logged in / logged out every time the app is reopened ·
-  cannot log a workout or track a session · cannot send or receive messages ·
+  cannot log a workout or track a session · cannot log a meal or food ·
+  cannot send or receive messages · an error or validation message blocks
+  saving the user's data (a log, a check-in, a form) ·
   sync failure that loses or withholds data · crash on a common action ·
   client cannot access purchased or assigned content · billing blocks a
   paying coach · basic troubleshooting (reinstall, re-login, reconnect)
@@ -1193,6 +1195,8 @@ Trivial (Lowest) — internal only: staging/dev-only issue, theoretical
 concern, typo in non-critical internal copy
 
 Tie-breakers: "tried basic troubleshooting, still broken" = no workaround.
+A blocking error on a core action stays High even if it may only affect
+some items (one meal, one workout) — unknown scope is not a workaround.
 Recurring pain (every login, every workout) beats one-off pain.
 When torn between two levels, choose the HIGHER one.`;
 
