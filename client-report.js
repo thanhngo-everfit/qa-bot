@@ -1279,7 +1279,7 @@ function buildTicketReply(createdJiras) {
 async function getJiraIssueDetails(issueKey) {
   try {
     const res = await axios.get(
-      `${JIRA_HOST}/rest/api/3/issue/${issueKey}?fields=status,assignee,fixVersions,updated,summary,created`,
+      `${JIRA_HOST}/rest/api/3/issue/${issueKey}?fields=status,assignee,fixVersions,updated,summary,created,issuetype`,
       { headers: { Authorization: jiraAuth(), Accept: 'application/json' } }
     );
     const fields = res.data?.fields || {};
@@ -1291,6 +1291,7 @@ async function getJiraIssueDetails(issueKey) {
       summary:         fields.summary || '',
       updatedMs:       fields.updated ? Date.parse(fields.updated) : null,
       createdMs:       fields.created ? Date.parse(fields.created) : null,
+      issueType:       fields.issuetype?.name || null,
       fixVersions:     (fields.fixVersions || []).map(v => ({
         name: v.name, released: !!v.released, releaseDate: v.releaseDate || null,
       })),
@@ -1512,7 +1513,7 @@ async function rebuildFollowUpsFromHistory(client) {
           for (const r of replies.messages || []) {
             const t = textOf(r);
             combined.push(t);
-            for (const k of (t.match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/g) || [])) {
+            for (const k of ticketKeysInMessage(t)) {
               const prev = found.get(k);
               found.set(k, { byBot: (prev?.byBot) || !!r.bot_id, first: prev ? prev.first : found.size === 0 });
             }
@@ -1527,6 +1528,7 @@ async function rebuildFollowUpsFromHistory(client) {
             const details = await getJiraIssueDetails(jiraKey);
             if (!details) continue;                              // deleted ticket
             if (DONE_STATUSES.includes((details.status || '').toLowerCase())) continue;
+            if (/^epic$/i.test(details.issueType || '')) continue;       // an epic is not a card to chase
             const isNew = details.createdMs && Date.now() - details.createdMs <= 14 * 86400 * 1000;
             if (!meta.first && !meta.byBot && !isNew) continue;   // an old ticket pasted for reference
             registerFollowUp({
@@ -1551,7 +1553,7 @@ async function scanThreadForTickets(client, channelId, threadTs) {
     const messages = (await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 })).messages || [];
     const keys = new Set();
     for (const msg of messages) {
-      const matches = (msg.text || '').match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/g) || [];
+      const matches = ticketKeysInMessage(msg.text || '');       // not epic/parent reference links
       matches.forEach(k => keys.add(k));
     }
     return [...keys].map(k => ({ key: k, url: `${JIRA_HOST}/browse/${k}` }));
@@ -2218,7 +2220,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
         await agentSt.done();
       await client.chat.postMessage({
           channel: event.channel, thread_ts: threadTs,
-          text: `🛑 Follow-up cancelled for <${tracked.jiraUrl}|${tracked.jiraKey}>. Please keep the ticket updated in Jira.`,
+          text: `Follow-up cancelled for <${tracked.jiraUrl}|${tracked.jiraKey}> by <@${event.user}>. Please keep the ticket updated in Jira.`,
         });
         await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
       }
@@ -2240,49 +2242,52 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
         return;
       }
 
-      const specificKey = (event.text.match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/i) || [])[0]?.toUpperCase();
-      const threadMsgsCA = (await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 50 }).catch(() => ({ messages: [] }))).messages || [];
-      const threadKeys = [];
+      // A key in the request wins, in any formatting (_UP-79617_, links)
+      const specificKey = keysIn(event.text)[0] || null;
+      const threadMsgsCA = (await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 100 }).catch(() => ({ messages: [] }))).messages || [];
+      let threadKeys = [];
       for (const msg of [...threadMsgsCA].reverse()) {
         if (msg.bot_id !== botBotId) continue;
-        for (const k of (msg.text || '').match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/g) || []) {
-          if (!threadKeys.includes(k)) threadKeys.push(k);
-        }
+        for (const k of ticketKeysInMessage(msg.text || '')) if (!threadKeys.includes(k)) threadKeys.push(k);
       }
+      // Tracked cards of this thread count too (e.g. adopted from a reply)
+      for (const [k, t] of followUpStore) if (t.channelId === event.channel && t.threadTs === threadTs && !t.done && !threadKeys.includes(k)) threadKeys.push(k);
+      threadKeys = await dropEpics(threadKeys);
 
-      if (!threadKeys.length) {
+      if (!threadKeys.length && !specificKey) {
         await agentSt.done();
-      await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: "I couldn't find any Jira ticket in this thread to reassign. Create one first with _\"create card\"_." });
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: "I couldn't find a Jira ticket in this thread to reassign. Create one first with _\"create card\"_, or name it: _\"reassign UP-12345 to @person\"_." });
         await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
         return;
       }
 
+      // Several real tickets and none named → one button per ticket
       if (threadKeys.length > 1 && !specificKey) {
-        const list = threadKeys.map(k => `• <${JIRA_HOST}/browse/${k}|${k}>`).join('\n');
         await agentSt.done();
-      await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: `This thread has several tickets — which one should I reassign?\n${list}\nTell me like: _"reassign to @person ${threadKeys[0]}"_` });
+        const toId = mentionedUsers[0];
+        const toName = (await client.users.info({ user: toId }).catch(() => null))?.user?.real_name || 'them';
+        const buttons = [];
+        for (const k of threadKeys.slice(0, 5)) {
+          const d = await getJiraIssueDetails(k).catch(() => null);
+          buttons.push({ type: 'button', action_id: `cr_reassign_pick_${k}`,
+            text: { type: 'plain_text', text: `${k}${d?.assigneeDisplay ? ` (now ${d.assigneeDisplay})` : ''}`.substring(0, 75) },
+            value: JSON.stringify({ k, to: toId, by: event.user, c: event.channel, t: threadTs }) });
+        }
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs,
+          text: `Which ticket should go to ${toName}?`,
+          blocks: [
+            { type: 'section', text: { type: 'mrkdwn', text: `This thread has ${threadKeys.length} tickets — which one should go to *${toName}*?` } },
+            { type: 'actions', elements: buttons },
+          ] });
         await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
         return;
       }
 
-      const targetKey = (specificKey && threadKeys.includes(specificKey)) ? specificKey : threadKeys[0];
-      const newJiraId = await resolveJiraAccountId(client, mentionedUsers[0]);
-      if (!newJiraId) {
-        await agentSt.done();
-      await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: `I couldn't match <@${mentionedUsers[0]}> to a Jira account, so I've left the assignee unchanged — please set it in Jira, or give me someone else.` });
-      } else {
-        await axios.put(`${JIRA_HOST}/rest/api/3/issue/${targetKey}/assignee`, { accountId: newJiraId }, {
-          headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' },
-        });
-        const tracked = followUpStore.get(targetKey);
-        if (tracked) tracked.assigneeSlackIds = [mentionedUsers[0]];
-        await agentSt.done();
-      await client.chat.postMessage({
-          channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-          text: `✅ <${JIRA_HOST}/browse/${targetKey}|${targetKey}> reassigned to <@${mentionedUsers[0]}>.`,
-        });
-        await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
-      }
+      const targetKey = specificKey || threadKeys[0];
+      const result = await reassignTicket(client, { key: targetKey, toId: mentionedUsers[0], byId: event.user });
+      await agentSt.done();
+      await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, unfurl_links: false, text: result.text });
+      if (result.ok) await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       return;
     }
@@ -2315,7 +2320,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
 
         // An explicit ticket key in the request wins over any matching
         // ("do follow up with @Hanh for UP-79009").
-        const explicitKey = (event.text.match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/i) || [])[0]?.toUpperCase() || null;
+        const explicitKey = keysIn(event.text)[0] || null;
 
         const matches = [];
         for (const key of (explicitKey ? [explicitKey] : threadKeys).slice(0, 12)) {
@@ -2896,6 +2901,62 @@ function withWatchdog(name, handler, budgetMs, note = null) {
   };
 }
 
+// Reassign in Jira, move follow-up to the new person, and say who did what.
+async function reassignTicket(client, { key, toId, byId }) {
+  const before = await getJiraIssueDetails(key).catch(() => null);
+  const newJiraId = await resolveJiraAccountId(client, toId);
+  if (!newJiraId) return { ok: false, text: `I couldn't match <@${toId}> to a Jira account, so ${key} is unchanged — set it in Jira, or give me someone else.` };
+  await axios.put(`${JIRA_HOST}/rest/api/3/issue/${key}/assignee`, { accountId: newJiraId }, {
+    headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' },
+  });
+  // Follow-up reminders go to the new assignee (the old code set a field the
+  // follow-up flow never read, so nudges kept going to the previous person)
+  const tracked = followUpStore.get(key);
+  if (tracked) { tracked.assigneeSlackHint = toId; tracked.nudgeCount = 0; tracked.lastPingAt = Date.now(); }
+  const from = before?.assigneeDisplay ? ` from ${before.assigneeDisplay}` : '';
+  return { ok: true, text: `<${JIRA_HOST}/browse/${key}|${key}> reassigned${from} to <@${toId}>${byId ? ` by <@${byId}>` : ''}.` };
+}
+
+slackApp.action(/^cr_reassign_pick_/, async ({ ack, body, client }) => {
+  await ack();
+  let p = {};
+  try { p = JSON.parse(body.actions?.[0]?.value || '{}'); } catch (_) {}
+  if (!p.k || !p.to) return;
+  const result = await reassignTicket(client, { key: p.k, toId: p.to, byId: body.user?.id || p.by });
+  // Replace the buttons with the outcome so nobody clicks twice
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: result.text,
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: result.text } }] }).catch(() => {});
+});
+
+// ── The real tickets in a thread ──────────────────────────────────────// ── The real tickets in a thread ──────────────────────────────────────
+// Keys in any formatting (_UP-1_, *UP-1*, links). A key linked under a
+// different label is a reference, not a ticket — the bot's own
+// '*Epic:* <…/UP-23736|Client Report (Web)>' line was being offered as a
+// second ticket to reassign. Epics are dropped when Jira is asked.
+const ANY_KEY_RE = /(?<![A-Za-z0-9])((?:UP|PAY|AIT|CHAL)-\d+)(?!\d)/g;
+function keysIn(text) { return [...new Set([...(text || '').matchAll(ANY_KEY_RE)].map(m => m[1].toUpperCase()))]; }
+
+function ticketKeysInMessage(text) {
+  const t = text || '';
+  const refs = new Set();
+  for (const m of t.matchAll(/<https?:\/\/[^|>]*\/browse\/((?:UP|PAY|AIT|CHAL)-\d+)\|([^>]*)>/gi)) {
+    if (m[2].trim().toUpperCase() !== m[1].toUpperCase()) refs.add(m[1].toUpperCase());   // e.g. |Client Report (Web)>
+  }
+  for (const m of t.matchAll(/\*?(?:Epic|Parent):\*?\s*<[^|>]*\/browse\/((?:UP|PAY|AIT|CHAL)-\d+)/gi)) refs.add(m[1].toUpperCase());
+  return keysIn(t).filter(k => !refs.has(k));
+}
+
+async function dropEpics(keys) {
+  if (keys.length < 2) return keys;
+  const out = [];
+  for (const k of keys) {
+    const d = await getJiraIssueDetails(k).catch(() => null);
+    if (!d || /^epic$/i.test(d.issueType || '')) continue;
+    out.push(k);
+  }
+  return out.length ? out : keys;
+}
+
 // ── A new card posted in a report thread gets followed up too ────────
 // e.g. QA splits an improvement out of a failed ticket ("card khác để
 // improve nha mn <UP-79639>"): the bot starts following the new card with
@@ -2915,6 +2976,7 @@ async function adoptNewCardsInReply(client, event, logger = console) {
     const d = await getJiraIssueDetails(key);
     if (!d) continue;
     if (ADOPT_DONE.includes((d.status || '').toLowerCase())) continue;
+    if (/^epic$/i.test(d.issueType || '')) continue;
     if (!d.createdMs || Date.now() - d.createdMs > FOLLOWUP_ADOPT_DAYS * 86400 * 1000) continue;
     // Same squad as the thread's other tracked card, else from the thread
     const sibling = [...followUpStore.values()].find(t => t.channelId === event.channel && t.threadTs === event.thread_ts && !t.done && t.squad);
@@ -3512,4 +3574,5 @@ const SQUAD_PROJECTS = {
 };
 
 module.exports = { register, MONITORED_CHANNELS, CHANNEL_PROFILES, channelProfile, registerFollowUp, isTracked, setTrackedAssignee, stopTrackingThread,
+  ticketKeysInMessage, keysIn,
   PLATFORM_PARENTS, CLIENT_REPORT_FIX_VERSION_ID, SQUAD_PROJECTS, squadForThread, priorityForThread };

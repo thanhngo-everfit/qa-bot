@@ -1554,7 +1554,7 @@ async function scanThreadTicketKeys(client, channelId, threadTs) {
       return parts.join(' ');
     };
     for (const m of replies.messages || []) {
-      for (const k of textOf(m).match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/g) || []) if (!keys.includes(k)) keys.push(k);
+      for (const k of clientReport.ticketKeysInMessage(textOf(m))) if (!keys.includes(k)) keys.push(k);   // not epic/parent links
     }
   } catch (_) {}
   return keys;
