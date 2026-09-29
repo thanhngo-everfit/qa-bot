@@ -1717,6 +1717,13 @@ const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }
     return;
   }
 
+  // Setting the QA ("assign @Ly as QA for UP-73884") — the QA field, never a new card
+  if (clientReport.parseQaAssign(event.text)) {
+    const auth = await client.auth.test();
+    await clientReport.handleQaAssign({ client, event, threadTs: event.thread_ts || event.ts, botBotId: auth.bot_id });
+    return;
+  }
+
   // Reassigning an EXISTING ticket ("reassign to @x", "assign UP-123 to @x")
   // always goes through the confirm card — never straight to Jira.
   {

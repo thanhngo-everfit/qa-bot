@@ -1279,7 +1279,7 @@ function buildTicketReply(createdJiras) {
 async function getJiraIssueDetails(issueKey) {
   try {
     const res = await axios.get(
-      `${JIRA_HOST}/rest/api/3/issue/${issueKey}?fields=status,assignee,fixVersions,updated,summary,created,issuetype`,
+      `${JIRA_HOST}/rest/api/3/issue/${issueKey}?fields=status,assignee,fixVersions,updated,summary,created,issuetype,${QA_FIELD_ID}`,
       { headers: { Authorization: jiraAuth(), Accept: 'application/json' } }
     );
     const fields = res.data?.fields || {};
@@ -1292,6 +1292,8 @@ async function getJiraIssueDetails(issueKey) {
       updatedMs:       fields.updated ? Date.parse(fields.updated) : null,
       createdMs:       fields.created ? Date.parse(fields.created) : null,
       issueType:       fields.issuetype?.name || null,
+      qaDisplay:       fields[QA_FIELD_ID]?.displayName || null,
+      qaAccountId:     fields[QA_FIELD_ID]?.accountId || null,
       fixVersions:     (fields.fixVersions || []).map(v => ({
         name: v.name, released: !!v.released, releaseDate: v.releaseDate || null,
       })),
@@ -1811,7 +1813,13 @@ function startFollowUpScheduler(client) {
         if (status === 'qa ready') {
           const round = item.qaRound || 0;
           if (!item.notifiedQaReady && await once(`qa_ready_${round}`, 'QA Ready', { threadCheck: round === 0 })) {
-            await post(`${link} is *QA Ready*. ${smMention}, please assign a QA member to verify it.` + fyi(reporter));
+            const qaNow = (await getJiraIssueDetails(jiraKey).catch(() => null))?.qaDisplay;
+            const qaText = qaNow
+              ? `${link} is *QA Ready* — QA: *${qaNow}*.` + fyi(reporter)
+              : `${link} is *QA Ready*. ${smMention}, pick the QA to verify it:` + fyi(reporter);
+            await client.chat.postMessage({ channel: item.channelId, thread_ts: item.threadTs, unfurl_links: false, text: qaText,
+              ...(qaNow ? {} : { blocks: [section(qaText), { type: 'actions', block_id: `cr_qa:${JSON.stringify({ k: jiraKey, c: item.channelId, t: item.threadTs })}`.substring(0, 255),
+                elements: [{ type: 'users_select', action_id: 'cr_qa_user', placeholder: { type: 'plain_text', text: 'Pick the QA' } }] }] }) });
             item.announced[`qa_ready_${round}`] = true;
             item.lastPingAt = Date.now();
             item.notifiedQaReady = true;
@@ -2000,7 +2008,7 @@ const crMentionHandler = async ({ event, client, logger }) => {
   // keeps what it uniquely owns: auto-analysis, follow-ups, weekly
   // reports, troubleshooting, reassignment, retraction.
   if (isCreationRequest(event.text) || isDiscoveryRequest(event.text) || isBulkMoveRequest(event.text) || isNoTicketReportRequest(event.text) || isBulkCreateRequest(event.text)
-      || !!parseBulkMove(event.text)
+      || !!parseBulkMove(event.text) || !!parseQaAssign(event.text)
       || /^(?:(?:show|check|get)\s+(?:the\s+)?(?:bot\s+)?logs?|logs)\b/i.test((event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim())
       || /^(status|health|are you (alive|ok|up)|ping)\b/i.test((event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim())) {
     logger.info('[Bot] Creation/discovery request → deferring to core pipeline');
@@ -2926,6 +2934,104 @@ async function handleReassign({ client, event, threadTs, botUserId, botBotId }) 
   await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, unfurl_links: false, ...card });
 }
 
+// ── Assign the QA (the ticket's QA field — NOT the assignee, NOT a new card)
+// "assign @Ly as QA for UP-73884", "set QA @Ly", "QA là @Ly", "giao QA cho @Ly"
+function parseQaAssign(text) {
+  const t = text || '';
+  const m = t.match(/\b(?:assign|set|add|make|put)\b[\s\S]*?<@([A-Z0-9]+)(?:\|[^>]*)?>[\s\S]*?\bas\s+(?:the\s+)?QA\b/i)
+    || t.match(/\b(?:set|assign|add)\s+(?:the\s+)?QA\s+(?:to\s+|as\s+|=\s*)?<@([A-Z0-9]+)/i)
+    || t.match(/\bQA\s*(?:is|=|:|là)\s*<@([A-Z0-9]+)/i)
+    || t.match(/\b(?:giao|gán)\s+QA\s+(?:cho\s+)?<@([A-Z0-9]+)/i);
+  return m ? m[1] : null;
+}
+
+async function threadTicketsFor(client, channel, threadTs, botBotId) {
+  const msgs = (await client.conversations.replies({ channel, ts: threadTs, limit: 100 }).catch(() => ({ messages: [] }))).messages || [];
+  let keys = [];
+  for (const msg of [...msgs].reverse()) {
+    if (!(msg.bot_id && (!botBotId || msg.bot_id === botBotId))) continue;
+    for (const k of ticketKeysInMessage(msg.text || '')) if (!keys.includes(k)) keys.push(k);
+  }
+  for (const [k, t] of followUpStore) if (t.channelId === channel && t.threadTs === threadTs && !t.done && !keys.includes(k)) keys.push(k);
+  return dropEpics(keys);
+}
+
+async function handleQaAssign({ client, event, threadTs, botBotId }) {
+  const qaId = parseQaAssign(event.text);
+  const specificKey = keysIn(event.text)[0] || null;
+  const keys = specificKey ? [specificKey] : await threadTicketsFor(client, event.channel, threadTs, botBotId);
+  if (!keys.length) {
+    await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: "Which ticket? There's no Jira ticket in this thread yet.",
+      blocks: [section("There's no Jira ticket in this thread to set the QA on."), { type: 'actions', elements: [createCardButton(event.channel, threadTs)] }] });
+    return;
+  }
+  if (keys.length > 1) {
+    const name = await plainName(client, qaId);
+    await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: `Which ticket should ${name} QA?`,
+      blocks: [section(`Which ticket should *${name}* QA?`), { type: 'actions', elements: keys.slice(0, 5).map(k =>
+        btn(k, `cr_qa_pick_${k}`, JSON.stringify({ k, qa: qaId, by: event.user, c: event.channel, t: threadTs }))) }] });
+    return;
+  }
+  const card = await qaConfirmBlocks(client, { k: keys[0], qa: qaId, by: event.user, c: event.channel, t: threadTs });
+  await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, unfurl_links: false, ...card });
+}
+
+async function qaConfirmBlocks(client, p) {
+  const d = await getJiraIssueDetails(p.k).catch(() => null);
+  if (!d) return { text: `I couldn't find ${p.k} in Jira.`, blocks: [section(`I couldn't find ${p.k} in Jira — nothing changed.`)] };
+  const name = await plainName(client, p.qa);
+  const title = (d.summary || '').replace(/^(\s*\[[^\]]*\])+\s*/, '').substring(0, 110);
+  const text = `Set QA on <${JIRA_HOST}/browse/${p.k}|${p.k}> *${esc(title)}* (${d.statusName || d.status})\nfrom *${esc(d.qaDisplay || '—')}* → *${esc(name)}*?`;
+  const value = JSON.stringify(p);
+  return { text: `Set QA on ${p.k} to ${name}?`, blocks: [section(text), { type: 'actions', elements: [
+    btn('Confirm', 'cr_qa_confirm', value, 'primary'), btn('Cancel', 'cr_qa_cancel', value),
+  ] }] };
+}
+
+slackApp.action(/^cr_qa_pick_/, async ({ ack, body, client }) => {
+  await ack();
+  let p = {};
+  try { p = JSON.parse(body.actions?.[0]?.value || '{}'); } catch (_) {}
+  if (!p.k || !p.qa) return;
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, ...(await qaConfirmBlocks(client, { ...p, by: p.by || body.user?.id })) }).catch(() => {});
+});
+// QA picker (e.g. on the QA Ready message): choosing someone shows the confirm card
+slackApp.action('cr_qa_user', async ({ ack, body, client }) => {
+  await ack();
+  const action = body.actions?.[0] || {};
+  let meta = {};
+  try { meta = JSON.parse((action.block_id || '').replace(/^cr_qa:/, '')); } catch (_) {}
+  if (!meta.k || !action.selected_user) return;
+  const card = await qaConfirmBlocks(client, { k: meta.k, qa: action.selected_user, by: body.user?.id, c: meta.c, t: meta.t });
+  await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.thread_ts || body.message.ts, unfurl_links: false, ...card }).catch(() => {});
+});
+slackApp.action('cr_qa_confirm', async ({ ack, body, client }) => {
+  await ack();
+  let p = {};
+  try { p = JSON.parse(body.actions?.[0]?.value || '{}'); } catch (_) {}
+  const admins = new Set((process.env.BULK_ADMINS || 'U0142GU335F,U0445EQS1ED').split(',').map(s => s.trim()));
+  if (p.by && body.user?.id !== p.by && !admins.has(body.user?.id)) {
+    await client.chat.postEphemeral({ channel: body.channel.id, user: body.user.id, text: `Only <@${p.by}> (who asked) can confirm this.` }).catch(() => {});
+    return;
+  }
+  const accountId = await resolveJiraAccountId(client, p.qa);
+  let t;
+  if (!accountId) t = `I couldn't match <@${p.qa}> to a Jira account, so the QA on ${p.k} is unchanged.`;
+  else {
+    try {
+      await axios.put(`${JIRA_HOST}/rest/api/3/issue/${p.k}`, { fields: { [QA_FIELD_ID]: { accountId } } },
+        { headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' } });
+      t = `QA on <${JIRA_HOST}/browse/${p.k}|${p.k}> set to <@${p.qa}> by <@${body.user?.id}>.`;
+    } catch (err) { t = `I couldn't set the QA on ${p.k} (${err.response?.status || err.message}).`; }
+  }
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: t, blocks: [section(t)] }).catch(() => {});
+});
+slackApp.action('cr_qa_cancel', async ({ ack, body, client }) => {
+  await ack();
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: 'Cancelled',
+    blocks: [section(`Cancelled by <@${body.user?.id}> — the QA wasn't changed.`)] }).catch(() => {});
+});
+
 async function plainName(client, userId) {
   try { return (await client.users.info({ user: userId })).user?.real_name || 'them'; } catch { return 'them'; }
 }
@@ -3074,6 +3180,7 @@ async function dropEpics(keys) {
 // last FOLLOWUP_ADOPT_DAYS) that aren't done — an old ticket pasted for
 // reference doesn't start collecting reminders.
 const FOLLOWUP_ADOPT_DAYS = parseFloat(process.env.FOLLOWUP_ADOPT_DAYS || '3');
+const QA_FIELD_ID = process.env.QA_FIELD_ID || 'customfield_10131';   // the ticket's 'QA' user field
 const KEY_RE = /\b(?:UP|PAY|AIT|CHAL)-\d+\b/g;
 const ADOPT_DONE = ['qa success', 'done', 'released', 'closed', 'will not fix', 'qa completed', 'ba success'];
 
@@ -3684,5 +3791,5 @@ const SQUAD_PROJECTS = {
 };
 
 module.exports = { register, MONITORED_CHANNELS, CHANNEL_PROFILES, channelProfile, registerFollowUp, isTracked, setTrackedAssignee, stopTrackingThread,
-  ticketKeysInMessage, keysIn, handleReassign,
+  ticketKeysInMessage, keysIn, handleReassign, handleQaAssign, parseQaAssign,
   PLATFORM_PARENTS, CLIENT_REPORT_FIX_VERSION_ID, SQUAD_PROJECTS, squadForThread, priorityForThread };
