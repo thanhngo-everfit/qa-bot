@@ -790,10 +790,13 @@ function startScheduler(client) {
 }
 
 // ── On-demand: "@QA Agent draft release for Web 4.37.1" ──────────────
-const VERSION_CHECK_RE = /\b(?:check|review|audit)\b[\s\S]*?\b(?:fix\s*versions?|versions?)\b/i;
-function isVersionCheckCommand(text) { return VERSION_CHECK_RE.test((text || '').replace(/<@[A-Z0-9]+>/g, '')); }
+// Only a short request for the report itself ("check fix versions", "run the
+// version check") — never an instruction that merely mentions a fix version
+// ("check if these tickets have N/A fix version then move them…").
+const VERSION_CHECK_RE = /^(?:please\s+|pls\s+)?(?:check|review|audit|run)\s+(?:the\s+|all\s+)?(?:fix\s*-?\s*versions?|versions?)(?:\s+check)?\s*(?:now|please|pls)?\s*[?.!]*$|^(?:run\s+)?(?:the\s+)?(?:fix\s*)?version\s+check\s*[?.!]*$/i;
+function isVersionCheckCommand(text) { return VERSION_CHECK_RE.test((text || '').replace(/<@[A-Z0-9]+(?:\|[^>]*)?>/g, '').trim()); }
 const RELEASE_CMD_RE = /\b(?:draft|prepare)\s+(?:the\s+|a\s+)?(?:next\s+)?release\b|\brelease\s+(?:draft|announcement|plan)s?\b/i;
-function isReleaseCommand(text) { const t = (text || '').replace(/<@[A-Z0-9]+>/g, ''); return RELEASE_CMD_RE.test(t) || VERSION_CHECK_RE.test(t); }
+function isReleaseCommand(text) { const t = (text || '').replace(/<@[A-Z0-9]+(?:\|[^>]*)?>/g, '').trim(); return RELEASE_CMD_RE.test(t) || isVersionCheckCommand(t); }
 
 async function handleCommand({ event, client, logger }) {
   const tTs = event.thread_ts || event.ts;

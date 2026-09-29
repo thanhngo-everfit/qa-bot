@@ -1717,6 +1717,79 @@ const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }
     return;
   }
 
+  // Bulk status move: "move them all to QA Success", "close UP-1, UP-2 as
+  // Done", with an optional condition ("if they have N/A fix version") and
+  // optional work log ("log work = 1 min each"). Shows a checklist; nothing
+  // changes until the requester clicks Confirm.
+  const moveReq = lib.parseBulkMove(event.text);
+  if (moveReq) {
+    const tTs = event.thread_ts || event.ts;
+    const st = agentStatus(client, event.channel, tTs);
+    await st.start("I'm checking those tickets in Jira");
+    try {
+      // Tickets: named in the message, else the nearest message above that has some
+      let keys = clientReport.keysIn(event.text);
+      let source = 'your message';
+      if (!keys.length && event.thread_ts) {
+        const rr = await client.conversations.replies({ channel: event.channel, ts: event.thread_ts, limit: 200 });
+        const before = (rr.messages || []).filter(m => parseFloat(m.ts) < parseFloat(event.ts)).reverse();
+        for (const m of before) {
+          const ks = clientReport.keysIn(`${m.text || ''} ${JSON.stringify(m.attachments || [])}`);
+          if (ks.length) {
+            keys = ks;
+            if (!m.bot_id && m.user) await lib.warmUserNames(client, [m.user]).catch(() => {});
+            const who = m.bot_id ? null : lib.replaceMentionsCached(`<@${m.user}>`).replace(/^@/, '');
+            source = who && who !== 'member' ? `${who}'s message above` : 'the message above';
+            break;
+          }
+        }
+      }
+      const briefs = [];
+      for (const k of keys.slice(0, 20)) briefs.push(await lib.getIssueBrief(k));
+      const eligible = [], skipped = [];
+      for (const b of briefs) {
+        if (!b) continue;
+        if (b.isEpic) { skipped.push(`${b.key} — an epic, not a ticket`); continue; }
+        if (b.status.toLowerCase() === moveReq.status.toLowerCase()) { skipped.push(`${b.key} — already ${b.status}`); continue; }
+        if (moveReq.requireNA && !b.fixVersions.some(v => /^n\s*\/?\s*a$/i.test(v))) { skipped.push(`${b.key} — Fix Version is ${b.fixVersions.join(', ') || 'empty'}, not N/A`); continue; }
+        eligible.push(b);
+      }
+      await st.done();
+      const plan = `move to *${moveReq.status}*${moveReq.logSeconds ? ` and log *${lib.fmtDuration(moveReq.logSeconds)}* on each` : ''}`;
+      const said = (event.text.match(/\b(\d+)\s+(?:tickets?|cards?|issues?)\b/i) || [])[1];
+      const countNote = said && Number(said) !== eligible.length + skipped.length
+        ? `\n_You said ${said}; I found ${eligible.length + skipped.length} in ${source}._` : '';
+      if (!eligible.length) {
+        await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, unfurl_links: false,
+          text: `Nothing to ${plan.replace(/\*/g, '')}.${skipped.length ? `\n${skipped.map(s => `• ${s}`).join('\n')}` : ` I couldn't find tickets in ${source}.`}${countNote}` });
+        return;
+      }
+      const id = `${Date.now()}`;
+      BULK_MOVE_JOBS.set(id, { ...moveReq, by: event.user, channel: event.channel, threadTs: tTs });
+      const opts = eligible.slice(0, 10).map(b => ({
+        text: { type: 'mrkdwn', text: `*${b.key}* ${lib.postLabel(b.summary).substring(0, 60)}` },
+        description: { type: 'plain_text', text: `${b.status} · Fix Version ${b.fixVersions.join(', ') || '—'}`.substring(0, 75) },
+        value: b.key,
+      }));
+      await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, unfurl_links: false,
+        text: `Ready to ${plan.replace(/\*/g, '')} for ${eligible.length} card(s).`,
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: `From ${source}, ready to ${plan}${moveReq.requireNA ? ' — only cards with Fix Version N/A' : ''}. Untick any to leave out:` } },
+          { type: 'actions', block_id: 'bt_select', elements: [{ type: 'checkboxes', action_id: 'bt_pick', options: opts, initial_options: opts }] },
+          ...(skipped.length ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: `Left out: ${skipped.join(' · ')}` }] }] : []),
+          ...(countNote ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: countNote.trim() }] }] : []),
+          { type: 'actions', elements: [
+            { type: 'button', style: 'primary', action_id: 'bt_confirm', value: id, text: { type: 'plain_text', text: `Confirm` } },
+            { type: 'button', action_id: 'bt_cancel', value: id, text: { type: 'plain_text', text: 'Cancel' } },
+          ] },
+        ] });
+    } catch (err) {
+      await st.done();
+      await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, text: `I couldn't check those tickets: \`${(err.message || '').substring(0, 200)}\`` });
+    }
+    return;
+  }
+
   // Release coordination: "draft release for Web 4.37.1" / "release plan"
   if (release.isReleaseCommand(event.text)) {
     await release.handleCommand({ event, client, logger });
@@ -2986,6 +3059,55 @@ slackApp.event('message', async ({ event, client, logger }) => {
       logger.warn('[QAAgent] Deleted-thread clean-up failed:', err.data?.error || err.message);
     }
   }
+});
+
+// ── Bulk status move: checklist → Confirm ────────────────────────────
+const BULK_MOVE_JOBS = new Map();
+slackApp.action('bt_pick', async ({ ack }) => { await ack(); });
+slackApp.action('bt_cancel', async ({ ack, body, client }) => {
+  await ack();
+  BULK_MOVE_JOBS.delete(body.actions?.[0]?.value);
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: 'Cancelled',
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `Cancelled by <@${body.user.id}> — nothing changed.` } }] }).catch(() => {});
+});
+slackApp.action('bt_confirm', async ({ ack, body, client, logger }) => {
+  await ack();
+  const id = body.actions?.[0]?.value;
+  const job = BULK_MOVE_JOBS.get(id);
+  const admins = new Set((process.env.BULK_ADMINS || 'U0142GU335F,U0445EQS1ED').split(',').map(s => s.trim()));
+  if (!job) {
+    await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: 'Expired',
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'This confirmation expired (I restarted) — nothing changed.' } }] }).catch(() => {});
+    return;
+  }
+  if (body.user.id !== job.by && !admins.has(body.user.id)) {
+    await client.chat.postEphemeral({ channel: body.channel.id, user: body.user.id, text: `Only <@${job.by}> (who asked) can confirm this.` }).catch(() => {});
+    return;
+  }
+  BULK_MOVE_JOBS.delete(id);                                   // one run per confirmation
+  const picked = (body.state?.values?.bt_select?.bt_pick?.selected_options || []).map(o => o.value);
+  if (!picked.length) {
+    await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: 'Nothing selected',
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'Nothing was ticked — nothing changed.' } }] }).catch(() => {});
+    return;
+  }
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: 'Working…',
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `Moving ${picked.length} card(s) to *${job.status}*… (confirmed by <@${body.user.id}>)` } }] }).catch(() => {});
+  const lines = [];
+  for (const key of picked) {
+    const moved = await lib.transitionToStatus(key, job.status).catch(err => ({ ok: false, reason: err.response?.status || err.message }));
+    let logged = '';
+    if (moved.ok && job.logSeconds) {
+      const w = await lib.logWork(key, job.logSeconds).catch(err => ({ ok: false, reason: err.response?.status || err.message }));
+      logged = w.ok ? ` · logged ${lib.fmtDuration(job.logSeconds)}` : ` · couldn't log work (${w.reason})`;
+    }
+    lines.push(moved.ok ? `• <${JIRA_HOST}/browse/${key}|${key}> → ${moved.status}${logged}` : `• ${key} — couldn't move (${moved.reason})`);
+  }
+  const ok = lines.filter(l => l.includes('→')).length;
+  const summary = `Moved ${ok} of ${picked.length} card(s) to *${job.status}* — confirmed by <@${body.user.id}>:\n${lines.join('\n')}`;
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: summary,
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: summary.substring(0, 2900) } }] }).catch(() => {});
+  logger.info(`[QAAgent] Bulk move → ${job.status}: ${ok}/${picked.length}`);
 });
 
 // ── One-click follow-ups instead of "tag me again with …" ─────────────

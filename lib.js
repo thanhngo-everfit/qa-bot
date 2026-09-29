@@ -955,6 +955,43 @@ async function findThreadsWithoutTickets(client, channelId, { days = 120, botUse
   return { scanned: posts.length, linkedFromJira: linked.size, missing };
 }
 
+// ── Bulk status move ("move them all to QA Success, log work 1 min") ──
+const MOVE_STATUSES = ['qa success', 'qa completed', 'qa ready', 'qa failed', 'done', 'closed', 'in progress',
+  'in review', 'need review', 'will not fix', 'to do', 'ba success'];
+function parseBulkMove(text) {
+  const t = (text || '').replace(/<@[A-Z0-9]+(?:\|[^>]*)?>/g, ' ');
+  const m = t.match(new RegExp(`\\b(?:move|transition|close|set|mark|put|chuyển|đóng|đưa)\\b[\\s\\S]*?\\b(?:to|as|into|sang|về|qua)\\s+(?:status\\s+)?["'“]?(${MOVE_STATUSES.join('|')})\\b`, 'i'));
+  if (!m) return null;
+  const status = m[1].toLowerCase().split(' ').map(w => w === 'qa' || w === 'ba' ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1)).join(' ');
+  const requireNA = /\bn\s*\/\s*a\b/i.test(t) && /fix\s*-?\s*version/i.test(t);
+  const lw = t.match(/\blog\s*(?:work|time)?\s*(?:=|:|of)?\s*(\d+(?:[.,]\d+)?)\s*(m|min|mins|minutes?|p|phút|h|hr|hrs|hours?|giờ)\b/i);
+  let logSeconds = null;
+  if (lw) {
+    const n = parseFloat(lw[1].replace(',', '.'));
+    logSeconds = Math.round(/^(h|hr|hrs|hour|hours|giờ)$/i.test(lw[2]) ? n * 3600 : n * 60);
+  }
+  return { status, requireNA, logSeconds };
+}
+const fmtDuration = (s) => s < 3600 ? `${Math.round(s / 60)}m` : `${Math.floor(s / 3600)}h${s % 3600 ? ` ${Math.round((s % 3600) / 60)}m` : ''}`;
+
+async function getIssueBrief(key) {
+  try {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/issue/${key}`, {
+      params: { fields: 'summary,status,fixVersions,issuetype' }, headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+    });
+    const f = res.data?.fields || {};
+    return { key, summary: f.summary || '', status: f.status?.name || '?',
+      isEpic: /^epic$/i.test(f.issuetype?.name || '') || f.issuetype?.hierarchyLevel === 1,
+      fixVersions: (f.fixVersions || []).map(v => v.name) };
+  } catch { return null; }
+}
+
+async function logWork(key, seconds) {
+  await axios.post(`${JIRA_HOST}/rest/api/3/issue/${key}/worklog`, { timeSpentSeconds: seconds },
+    { headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' } });
+  return { ok: true };
+}
+
 // "move all tickets from this channel to epic UP-x" (issues/cards/parent too)
 const BULK_MOVE_RE = /\bmove\b[\s\S]*?\b(?:tickets?|issues?|cards?)\b[\s\S]*?\bchannel\b[\s\S]*?\b(?:epic|parent)\s+((?:UP|PAY|AIT|CHAL)-\d+)\b/i;
 function isBulkMoveRequest(text) {
@@ -1331,6 +1368,7 @@ module.exports = {
   shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion, listOpenEpics, setIssueParent,
   getLastActiveSprint, getVersionName, getIssueTitle, bulkSetParentForChannel, BULK_MOVE_RE, isBulkMoveRequest, resolveEpicCandidate,
   isNoTicketReportRequest, findThreadsWithoutTickets, isBulkCreateRequest, BULK_CREATE_RE, postLabel,
+  parseBulkMove, getIssueBrief, logWork, fmtDuration,
   CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, challengerEpicFor, challengerSummary,
   LOW_PRIORITY_SPRINT_ID, LOW_PRIORITY_STATUS, LOW_PRIORITIES, LOW_PRIORITY_RULES, lowPriorityRule, getSprintInfo, transitionToStatus,
   PROJECT_BOARDS, getActiveSprintForProject,

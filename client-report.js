@@ -11,7 +11,7 @@ const path = require('path');
 const {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiCall,
-  agentStatus, getActiveSprintId, createJiraIssueResilient, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, isBulkMoveRequest, isNoTicketReportRequest, isBulkCreateRequest,
+  agentStatus, getActiveSprintId, createJiraIssueResilient, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, isBulkMoveRequest, isNoTicketReportRequest, isBulkCreateRequest, parseBulkMove,
   warmUserNames, replaceMentionsCached, PRIORITY_RUBRIC,
   resolveInlineMentions, qaTaskWork,
 } = require('./lib');
@@ -1998,6 +1998,7 @@ const crMentionHandler = async ({ event, client, logger }) => {
   // keeps what it uniquely owns: auto-analysis, follow-ups, weekly
   // reports, troubleshooting, reassignment, retraction.
   if (isCreationRequest(event.text) || isDiscoveryRequest(event.text) || isBulkMoveRequest(event.text) || isNoTicketReportRequest(event.text) || isBulkCreateRequest(event.text)
+      || !!parseBulkMove(event.text)
       || /^(?:(?:show|check|get)\s+(?:the\s+)?(?:bot\s+)?logs?|logs)\b/i.test((event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim())
       || /^(status|health|are you (alive|ok|up)|ping)\b/i.test((event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim())) {
     logger.info('[Bot] Creation/discovery request → deferring to core pipeline');
