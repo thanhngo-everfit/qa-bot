@@ -120,7 +120,7 @@ async function aiComplete(paramsIn) {
     console.log(`[AI] → ${model} max_tokens=${params.max_tokens || '-'} json=${!!params.response_format} tools=${params.tools ? params.tools.length : 0} sys=${sysLen}c user=${usrLen}c`);
     const heartbeat = setInterval(() => console.log(`[AI] … still waiting on ${model} (${Math.round((Date.now() - t0) / 1000)}s)`), 20000);
     try {
-      const { __timeoutMs, __jsonWordRetried, __slowRetried, ...callParams } = params;
+      const { __timeoutMs, __jsonWordRetried, __slowRetried, __imagesStripped, ...callParams } = params;
       if (!callParams.reasoning_effort && !_stripReasoningEffort) {
         const eff = model === FALLBACK_MODEL ? BULK_EFFORT : SMART_EFFORT;
         if (eff) callParams.reasoning_effort = eff;
@@ -158,6 +158,17 @@ async function aiComplete(paramsIn) {
       if (!_useMaxCompletionTokens && /max_tokens.*not supported|use ['"]?max_completion_tokens/i.test(msg)) {
         _useMaxCompletionTokens = true;
         console.warn('[AI] Endpoint wants max_completion_tokens — adapting all calls.');
+        continue;
+      }
+      // Model / gateway can't take images → retry once with text only (the
+      // analysis still runs; it just can't see the screenshots)
+      if (!params.__imagesStripped && /image|vision|multimodal|image_url|content type/i.test(msg)
+          && (params.messages || []).some(m => Array.isArray(m.content))) {
+        console.warn('[AI] Endpoint rejected images — retrying text-only');
+        params = { ...params, __imagesStripped: true,
+          messages: params.messages.map(m => Array.isArray(m.content)
+            ? { ...m, content: m.content.filter(p => p.type === 'text').map(p => p.text).join('\n') + '\n\n(Note: the screenshots could not be read.)' }
+            : m) };
         continue;
       }
       // Non-reasoning model / gateway rejects reasoning_effort → stop sending it

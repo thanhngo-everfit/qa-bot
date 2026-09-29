@@ -657,6 +657,30 @@ async function downloadSlackFile(url) {
   return Buffer.from(res.data);
 }
 
+// Screenshots from the report, for the analysis to actually SEE. CS often
+// writes one line and puts the error, the screen and the account in the
+// screenshot — text-only analysis was blind to all of it.
+const MAX_REPORT_IMAGES = parseInt(process.env.ANALYSIS_MAX_IMAGES || '3', 10);
+async function reportImages(files) {
+  const imgs = (files || [])
+    .filter(f => /^image\/(png|jpe?g|gif|webp)$/i.test(f.mimetype || '') && f.url_private_download && (f.size || 0) <= 4 * 1024 * 1024)
+    .slice(0, MAX_REPORT_IMAGES);
+  const out = [];
+  for (const f of imgs) {
+    try { out.push(`data:${f.mimetype};base64,${(await downloadSlackFile(f.url_private_download)).toString('base64')}`); }
+    catch (err) { console.warn(`[Bot] Screenshot download failed (${f.name}):`, err.message); }
+  }
+  return out;
+}
+
+async function threadImages(client, channelId, threadTs) {
+  try {
+    const rr = await client.conversations.replies({ channel: channelId, ts: threadTs, limit: 50 });
+    const files = (rr.messages || []).filter(m => !m.bot_id).flatMap(m => m.files || []);
+    return await reportImages(files);
+  } catch { return []; }
+}
+
 async function uploadAttachmentToJira(issueKey, filename, fileBuffer, mimetype) {
   try {
     const form = new FormData();
@@ -799,7 +823,7 @@ async function createJiraIssue(ticket, jiraAccountIds) {
 // CORE AI ANALYSIS  ─  single Sonnet 4 call
 // ─────────────────────────────────────────────
 
-async function analyzeThread(context, slackThreadUrl, userDirective = '') {
+async function analyzeThread(context, slackThreadUrl, userDirective = '', images = []) {
   // Trim KB to avoid hitting token limits while keeping the most useful sections
   const kbSection = KNOWLEDGE_BASE
     ? `\n\n---\n📚 KNOWLEDGE BASE — use patterns below to determine severity and resolution steps:\n${KNOWLEDGE_BASE.substring(0, 7000)}\n---\n`
@@ -999,11 +1023,17 @@ Do NOT include the Slack thread link in the description — it is appended autom
   // Auto-analysis runs on every new report: keep it lean and give it a
   // short leash (45s) so a slow endpoint falls back fast instead of
   // leaving 'I'm analyzing the report' hanging in the thread.
+  // Screenshots go WITH the text: the error, the screen and the account are
+  // often only visible there.
+  const content = images.length
+    ? [{ type: 'text', text: `${userContent}\n\nSCREENSHOTS: ${images.length} image(s) from the report are attached. Read them carefully — the exact error text, which screen / feature it is (e.g. logging a meal), the platform (phone vs browser, coach vs client app), and any email or name shown. Base the summary, platform, squad, priority and cause on what they show, and do NOT list anything visible in them as missing.` },
+       ...images.map(url => ({ type: 'image_url', image_url: { url, detail: 'high' } }))]
+    : userContent;
   const rawResponse = await aiCall(
-    systemPrompt, userContent,
+    systemPrompt, content,
     userDirective ? 6000 : 2500, true,
     userDirective ? 'gpt-4o' : 'gpt-4o-mini',
-    userDirective ? null : 40000,
+    userDirective ? null : (images.length ? 50000 : 40000),
   ); // jsonMode
 
   // Robust JSON extraction: strip fences, then take first { … last }
@@ -1089,11 +1119,11 @@ Do NOT include the Slack thread link in the description — it is appended autom
 // Run the analysis under a hard budget. If it overruns or fails, post a
 // minimal reply that still carries the Assign button — the team can act
 // even when the AI endpoint is slow.
-async function analyzeWithBudget(context, slackThreadUrl, budgetMs = 100000) {
+async function analyzeWithBudget(context, slackThreadUrl, budgetMs = 100000, images = []) {
   const t0 = Date.now();
   try {
     const out = await Promise.race([
-      analyzeThread(context, slackThreadUrl),
+      analyzeThread(context, slackThreadUrl, '', images),
       new Promise((_, rej) => setTimeout(() => rej(new Error(`analysis exceeded ${budgetMs / 1000}s`)), budgetMs)),
     ]);
     console.log(`[Bot] Analysis done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -2109,7 +2139,8 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
     if (doAnalyze) {
       await agentSt.start('⏳ _Dispatching to QA Agent — analyzing this thread…_');
       logger.info('[Bot] Analyze triggered manually');
-      const { analysis, degraded } = await analyzeWithBudget(context, slackThreadUrl);
+      const images = await threadImages(client, event.channel, threadTs);
+      const { analysis, degraded } = await analyzeWithBudget(context, slackThreadUrl, 100000, images);
       if (!analysis) {
         await agentSt.done();
         const t = degradedAnalysisText(degraded);
@@ -2883,7 +2914,9 @@ const autoAnalysisHandler = withWatchdog('auto-analysis', async ({ event, client
     const context = text;
 
     await status.update('🧠 _QA Agent is analyzing the report…_');
-    const { analysis, degraded } = await analyzeWithBudget(context, slackThreadUrl);
+    const images = await reportImages(event.files);
+    if (images.length) logger.info(`[Bot] Auto-analyze with ${images.length} screenshot(s)`);
+    const { analysis, degraded } = await analyzeWithBudget(context, slackThreadUrl, 100000, images);
     if (!analysis) {
       await status.done();
       const t = degradedAnalysisText(degraded);
