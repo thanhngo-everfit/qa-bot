@@ -1581,7 +1581,7 @@ async function qaChatReply(context, userText) {
   } catch { return null; }
 }
 
-const coreMentionHandler = async ({ event, client, logger }) => {
+const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }) => {
   // Client-report channels are handled by the client-report module
   // Monitored (client-report) channels own their specialised flows —
   // EXCEPT ticket creation, which runs through this one proven pipeline in
@@ -1753,6 +1753,7 @@ const coreMentionHandler = async ({ event, client, logger }) => {
   }
 
   const bootSt = agentStatus(client, event.channel, event.thread_ts || event.ts);
+  _cleanups.push(() => bootSt.done());
   await bootSt.start("I'm on it");
 
   const authRes   = await client.auth.test();
@@ -1951,6 +1952,7 @@ HARD RULES — follow exactly:
         // agent: tools + iterative decisions (read channel, search Jira,
         // create/assign/transition/comment, follow-ups, retract) until done.
         const agentLoopSt = agentStatus(client, event.channel, threadTs);
+        _cleanups.push(() => agentLoopSt.done());
         await agentLoopSt.start('🤖 _QA Agent is on it…_');
         let result = null;
         try {
@@ -1985,6 +1987,7 @@ HARD RULES — follow exactly:
 
     await bootSt.done();
     agentSt = agentStatus(client, event.channel, threadTs);
+    _cleanups.push(() => agentSt.done());
     await agentSt.start('⏳ _Dispatching to QA Agent — reading the thread…_');
 
     // Classify Bug vs Task — explicit keyword wins; otherwise AI decides from thread content
@@ -2587,6 +2590,18 @@ HARD RULES — follow exactly:
     await client.reactions.add({ channel: event.channel, name: 'x', timestamp: event.ts }).catch(() => {});
   }
 };
+// Every status message the handler opens is closed when it finishes —
+// whichever path it took (replied, returned early, or threw). Previously
+// only some paths cleaned up, so a reply could leave "I'm on it" behind.
+const coreMentionHandler = async (args) => {
+  const _cleanups = [];
+  try {
+    return await coreMentionHandlerInner({ ...args, _cleanups });
+  } finally {
+    for (const c of _cleanups) { try { await c(); } catch (_) {} }
+  }
+};
+
 // Watchdog: a mention must ALWAYS produce a reply. If the handler hasn't
 // finished within the budget, post a failure notice and clear the status —
 // no more silent 'stuck with an hourglass' requests.
