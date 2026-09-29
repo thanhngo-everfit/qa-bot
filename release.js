@@ -547,21 +547,52 @@ function renderVersionCheck(flags) {
 }
 
 const FIRST_SEEN = new Map();   // "<versionId>:<kind>" → ISO day first reported
+// Memory resets on every restart (deploys), so "already posted today" and
+// "first reported on" are read back from the bot's own posts in the review
+// channel — the record that survives restarts.
+async function botPostsInReview(client, days) {
+  try {
+    const { user_id: botUid } = await client.auth.test();
+    const oldest = String((Date.now() - days * 86400 * 1000) / 1000);
+    const res = await client.conversations.history({ channel: RELEASE_REVIEW_CHANNEL, oldest, limit: 200 });
+    return (res.messages || []).filter(m => m.user === botUid || m.bot_id);
+  } catch { return []; }
+}
+const vnDayOf = (ts) => isoDay(new Date(parseFloat(ts) * 1000 + 7 * 3600 * 1000));
+
+let _firstSeenRestored = false;
+async function restoreFirstSeen(client) {
+  if (_firstSeenRestored) return;
+  _firstSeenRestored = true;
+  const posts = (await botPostsInReview(client, 21)).filter(m => /\*Fix version check\*/.test(m.text || ''))
+    .sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts));        // oldest first
+  for (const m of posts) {
+    for (const x of (m.text || '').matchAll(/\/versions\/(\d+)\//g)) {
+      if (!FIRST_SEEN.has(x[1])) FIRST_SEEN.set(x[1], vnDayOf(m.ts));
+    }
+  }
+}
+
 const checkSignature = (f) => JSON.stringify([f.draft, f.overdue, f.noDate].map(l => l.map(e => `${e.id}:${e.date}`).sort()));
 let _lastCheck = { sig: null, day: null };
 
 const DAILY_ALL_CLEAR = (process.env.VERSION_CHECK_ALL_CLEAR || 'true') !== 'false';
 
 async function alertVersionIssues(client, { force = false, channel = RELEASE_REVIEW_CHANNEL, threadTs = null } = {}) {
-  const flags = await versionCheck(client);
   const today = isoDay(vnNow());
+  await restoreFirstSeen(client);
+  if (!force && _lastCheck.day !== today) {
+    const already = (await botPostsInReview(client, 1)).some(m => /\*Fix version check\*/.test(m.text || '') && vnDayOf(m.ts) === today);
+    if (already) { _lastCheck = { sig: null, day: today }; return; }      // posted before a restart
+  }
+  const flags = await versionCheck(client);
   await lib.warmUserNames(client, (flags.shipped || []).map(e => e.by)).catch(() => {});
   // Age each finding; forget ones that got fixed
   const live = new Set();
   for (const [kind, list] of Object.entries(flags)) {
     if (!Array.isArray(list)) continue;                       // e.g. the stale count
     for (const e of list) {
-      const k = `${e.id}:${kind}`;
+      const k = String(e.id);
       live.add(k);
       if (!FIRST_SEEN.has(k)) FIRST_SEEN.set(k, today);
       e.openDays = businessDaysSince(FIRST_SEEN.get(k));
@@ -608,13 +639,19 @@ function businessDaysSince(isoDate) {
 }
 
 // ── Scheduled work ───────────────────────────────────────────────────
+let _reviewHeads = null;
 async function draftUpcoming(client, logger = console) {
+  _reviewHeads = null;
   const groups = await upcomingGroups();
   const ready = [];
   for (const g of groups) {
     if (ANNOUNCED.has(g.key) || SKIPPED.has(g.key)) continue;
     if ([...DRAFTS.values()].some(s => s.groupKey === g.key)) continue;
     if (await alreadyAnnouncedInChannel(client, g)) { ANNOUNCED.set(g.key, { ts: null, versionIds: g.versions.map(v => v.id), releaseDate: g.releaseDate, byPC: true }); continue; }
+    // Already sent for review before a restart? (the review thread's head
+    // message lists the versions) — don't open a second review thread
+    if (!_reviewHeads) _reviewHeads = (await botPostsInReview(client, 4)).filter(m => /release.*due soon/i.test(m.text || '')).map(m => (m.text || '').toLowerCase());
+    if (g.versions.every(v => _reviewHeads.some(t => t.includes(v.name.toLowerCase())))) { SKIPPED.add(g.key); continue; }
     const d = await buildDraft(client, g);
     if (!d.total) continue;                               // empty in UP (e.g. another team's version) → nothing to release
     ready.push(d);
