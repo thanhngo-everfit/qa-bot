@@ -113,6 +113,10 @@ const SQUAD_ROSTER = {
     domains: [
       'nutrition', 'meal', 'macro', 'food', 'diet', 'recipe',
       'myfitnesspal', 'cronometer', 'ingredient', 'calorie', 'meal plan',
+      // logging meals / foods — the client's food journal
+      'log meal', 'log meals', 'log food', 'log foods', 'logged meal', 'logged meals',
+      'logged food', 'logged foods', 'meal log', 'meal logging', 'food log', 'food logging',
+      'food journal', 'food diary', 'serving', 'portion', 'barcode',
     ],
   },
   'AI Features': {
@@ -846,7 +850,10 @@ SQUAD ROUTING HINTS:
     forum, check-ins, habits, goals, client profile, referral, broadcast
   - "Core Product - Enablement": coach onboarding/getting started, client
     import/migration, setup flows
-  - "Core Product - Nutrition": meals, macros, recipes, MyFitnessPal, Cronometer
+  - "Core Product - Nutrition": meals, macros, recipes, MyFitnessPal, Cronometer,
+    and LOGGING meals / foods (food journal, meal log, servings, barcode scan) —
+    in the coach or the client app. Only AI-generated nutrition (AI Recipe
+    Builder, logging food WITH AI) is AI Features.
   - "AI Features": AI Workout Builder, AI Recipe Builder, AI Alternative Recipe,
     Olly / Olly Voice / Ask Olly, Smart Response, Knowledge Base, BI Dashboard,
     Push-up Challenge, Compare Check-in, anything AI-generated
