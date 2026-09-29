@@ -2773,8 +2773,11 @@ HARD RULES — follow exactly:
 const coreMentionHandler = async (args) => {
   const _cleanups = [];
   const startedAt = Date.now() / 1000 - 1;
+  const ev = args.event || {};
+  const client = (ev.user && !ev._noTag && !ev.bot_id)
+    ? lib.withRequesterTag(args.client, { userId: ev.user, channel: ev.channel }) : args.client;
   try {
-    return await coreMentionHandlerInner({ ...args, _cleanups });
+    return await coreMentionHandlerInner({ ...args, client, _cleanups });
   } finally {
     for (const c of _cleanups) { try { await c(); } catch (_) {} }
     await sweepLeftoverStatuses(args.client, args.event, startedAt);
@@ -2942,7 +2945,7 @@ slackApp.action('qa_bulk_create_go', async ({ ack, body, client, logger }) => {
       // Same pipeline as typing "create ticket" in that thread: the card is
       // built from the thread and the confirmation is posted under it.
       await coreMentionHandler({
-        event: { _synthetic: true, channel, thread_ts: ts, ts, user: clicker, text: 'create ticket' },
+        event: { _synthetic: true, _noTag: true, channel, thread_ts: ts, ts, user: clicker, text: 'create ticket' },
         client, logger,
       });
       done++;
@@ -2953,7 +2956,7 @@ slackApp.action('qa_bulk_create_go', async ({ ack, body, client, logger }) => {
     if ((done + failed) % 5 === 0 || done + failed === total) await show(`Creating tickets… ${done + failed}/${total}`);
     await new Promise(r => setTimeout(r, 4000));      // pace AI + Jira calls
   }
-  await show(`Done — processed *${total}* thread(s): ${done} ticket(s) created${failed ? `, ${failed} failed (check those threads)` : ''}. Each card is confirmed in its own thread.`);
+  await show(`<@${clicker}> Done — processed *${total}* thread(s): ${done} ticket(s) created${failed ? `, ${failed} failed (check those threads)` : ''}. Each card is confirmed in its own thread.`);
 });
 
 // ── "Select an epic" prompt for cards created without one ─────────────

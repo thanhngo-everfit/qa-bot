@@ -11,7 +11,7 @@ const path = require('path');
 const {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiCall,
-  agentStatus, getActiveSprintId, createJiraIssueResilient, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, isBulkMoveRequest, isNoTicketReportRequest, isBulkCreateRequest, parseBulkMove,
+  agentStatus, getActiveSprintId, createJiraIssueResilient, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, isBulkMoveRequest, isNoTicketReportRequest, isBulkCreateRequest, parseBulkMove, withRequesterTag,
   warmUserNames, replaceMentionsCached, PRIORITY_RUBRIC,
   resolveInlineMentions, qaTaskWork,
 } = require('./lib');
@@ -1991,6 +1991,8 @@ JSON only, no other text.`,
 }
 
 const crMentionHandler = async ({ event, client, logger }) => {
+  // Every reply to this request tags the person who asked
+  if (event?.user && !event.bot_id && !event._noTag) client = withRequesterTag(client, { userId: event.user, channel: event.channel });
   if (!MONITORED_CHANNELS[event.channel]) return;
 
   // Ticket creation is handled by the core pipeline (index.js) in ALL

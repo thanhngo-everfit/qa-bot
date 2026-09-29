@@ -1324,6 +1324,48 @@ function productionAuditSummary(summary, prefix = '[Production Audit]') {
   return `${prefix}${s.startsWith('[') ? '' : ' '}${s}`.substring(0, 250);
 }
 
+// ── Tag the person who asked ─────────────────────────────────────────
+// Everything the bot posts in reply to someone's request — a card waiting
+// for their click, or the finished result — tags that person, so they're
+// notified without re-opening the thread. Skipped: status lines ("_I'm …_"),
+// messages that already mention them, and posts to other channels.
+function withRequesterTag(client, { userId, channel }) {
+  if (!client || !userId) return client;
+  const tag = `<@${userId}>`;
+  const mentions = (s) => s.includes(tag) || s.includes(`<@${userId}|`);
+  const addTag = (args) => {
+    if (!args || args.channel !== channel) return args;
+    const t = String(args.text || '');
+    if (/^_I(?:['’]m| am)\b/i.test(t.trim())) return args;
+    if (mentions(t) || mentions(JSON.stringify(args.blocks || []))) return args;
+    const out = { ...args, text: `${tag} ${t}` };
+    if (Array.isArray(args.blocks) && args.blocks.length) {
+      const blocks = args.blocks.map(b => ({ ...b }));
+      if (blocks[0].type === 'section' && blocks[0].text?.type === 'mrkdwn') {
+        blocks[0] = { ...blocks[0], text: { ...blocks[0].text, text: `${tag} ${blocks[0].text.text}` } };
+      } else {
+        blocks.unshift({ type: 'section', text: { type: 'mrkdwn', text: tag } });
+      }
+      out.blocks = blocks;
+    }
+    return out;
+  };
+  const chat = new Proxy(client.chat, {
+    get(target, prop) {
+      if (prop === 'postMessage') return (args) => target.postMessage(addTag(args));
+      const v = target[prop];
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+  return new Proxy(client, {
+    get(target, prop) {
+      if (prop === 'chat') return chat;
+      const v = target[prop];
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+}
+
 // ── slackify: normalize AI output for Slack ──────────────────────────
 // Models (especially gpt-4o-mini) leak markdown: **bold**, ### headers,
 // [text](url). Slack needs *bold* and <url|text>. Also auto-link every
@@ -1368,7 +1410,7 @@ module.exports = {
   shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion, listOpenEpics, setIssueParent,
   getLastActiveSprint, getVersionName, getIssueTitle, bulkSetParentForChannel, BULK_MOVE_RE, isBulkMoveRequest, resolveEpicCandidate,
   isNoTicketReportRequest, findThreadsWithoutTickets, isBulkCreateRequest, BULK_CREATE_RE, postLabel,
-  parseBulkMove, getIssueBrief, logWork, fmtDuration,
+  parseBulkMove, getIssueBrief, logWork, fmtDuration, withRequesterTag,
   CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, challengerEpicFor, challengerSummary,
   LOW_PRIORITY_SPRINT_ID, LOW_PRIORITY_STATUS, LOW_PRIORITIES, LOW_PRIORITY_RULES, lowPriorityRule, getSprintInfo, transitionToStatus,
   PROJECT_BOARDS, getActiveSprintForProject,

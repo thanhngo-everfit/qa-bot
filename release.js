@@ -902,7 +902,7 @@ function register(slackApp) {
     st.d = fresh;
     await refreshDraft(client, id);
     await client.chat.postMessage({ channel: st.channel, thread_ts: st.ts,
-      text: `Moved ${moved.length} card(s) to ${cand.versionName}${moved.length ? `: ${moved.join(', ')}` : ''}${failed.length ? `\nCouldn't move: ${failed.join(', ')}` : ''}` }).catch(() => {});
+      text: `Moved ${moved.length} card(s) to ${cand.versionName}${moved.length ? `: ${moved.join(', ')}` : ''}${failed.length ? `\nCouldn't move: ${failed.join(', ')}` : ''} — by <@${body.user.id}>` }).catch(() => {});
   });
 
   slackApp.action(/^rel_mark_released_/, async ({ ack, body, client, logger }) => {
