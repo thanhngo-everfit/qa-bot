@@ -1717,6 +1717,19 @@ const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }
     return;
   }
 
+  // Reassigning an EXISTING ticket ("reassign to @x", "assign UP-123 to @x")
+  // always goes through the confirm card — never straight to Jira.
+  {
+    const rt = (event.text || '').replace(/<@[A-Z0-9]+(?:\|[^>]*)?>/g, ' ');
+    const isReassign = /\bre-?assign\b|\bgiao\s+lại\b|\bđổi\s+(?:người|assignee)\b/i.test(rt)
+      || (/\bassign\b/i.test(rt) && clientReport.keysIn(rt).length > 0 && /<@[A-Z0-9]+/.test(event.text || '') && !/\b(?:create|log|tạo)\b/i.test(rt));
+    if (isReassign && !clientReport.MONITORED_CHANNELS[event.channel]) {
+      const auth = await client.auth.test();
+      await clientReport.handleReassign({ client, event, threadTs: event.thread_ts || event.ts, botUserId: auth.user_id, botBotId: auth.bot_id });
+      return;
+    }
+  }
+
   // Bulk status move: "move them all to QA Success", "close UP-1, UP-2 as
   // Done", with an optional condition ("if they have N/A fix version") and
   // optional work log ("log work = 1 min each"). Shows a checklist; nothing

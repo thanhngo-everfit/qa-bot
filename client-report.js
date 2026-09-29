@@ -2240,68 +2240,8 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
     // CHANGE ASSIGNEE
     // ═══════════════════════════════════════════
     if (doReassign) {
-      const mentionedUsers = (event.text.match(/<@([A-Z0-9]+)>/g) || [])
-        .map(m => m.replace(/<@|>/g, '')).filter(id => id !== botUserId && !ASSIGNEE_BLOCKLIST.has(id));
-
-
-      // A key in the request wins, in any formatting (_UP-79617_, links)
-      const specificKey = keysIn(event.text)[0] || null;
-      const threadMsgsCA = (await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 100 }).catch(() => ({ messages: [] }))).messages || [];
-      let threadKeys = [];
-      for (const msg of [...threadMsgsCA].reverse()) {
-        if (msg.bot_id !== botBotId) continue;
-        for (const k of ticketKeysInMessage(msg.text || '')) if (!threadKeys.includes(k)) threadKeys.push(k);
-      }
-      // Tracked cards of this thread count too (e.g. adopted from a reply)
-      for (const [k, t] of followUpStore) if (t.channelId === event.channel && t.threadTs === threadTs && !t.done && !threadKeys.includes(k)) threadKeys.push(k);
-      threadKeys = await dropEpics(threadKeys);
-
-      if (!threadKeys.length && !specificKey) {
-        await agentSt.done();
-        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: "There's no Jira ticket in this thread to reassign yet.",
-          blocks: [section("There's no Jira ticket in this thread to reassign yet."), { type: 'actions', elements: [createCardButton(event.channel, threadTs)] }] });
-        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
-        return;
-      }
-
-      // Nobody named → pick them (and the ticket, if there are several)
-      if (!mentionedUsers.length) {
-        await agentSt.done();
-        const keys = specificKey ? [specificKey] : threadKeys;
-        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: 'Who should take it?',
-          blocks: [section(keys.length > 1 ? `Pick the ticket and who should take it:` : `Who should take <${JIRA_HOST}/browse/${keys[0]}|${keys[0]}>?`), assigneePicker(keys, event.channel, threadTs)] });
-        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
-        return;
-      }
-
-      // Several real tickets and none named → one button per ticket
-      if (threadKeys.length > 1 && !specificKey) {
-        await agentSt.done();
-        const toId = mentionedUsers[0];
-        const toName = (await client.users.info({ user: toId }).catch(() => null))?.user?.real_name || 'them';
-        const buttons = [];
-        for (const k of threadKeys.slice(0, 5)) {
-          const d = await getJiraIssueDetails(k).catch(() => null);
-          buttons.push({ type: 'button', action_id: `cr_reassign_pick_${k}`,
-            text: { type: 'plain_text', text: `${k}${d?.assigneeDisplay ? ` (now ${d.assigneeDisplay})` : ''}`.substring(0, 75) },
-            value: JSON.stringify({ k, to: toId, by: event.user, c: event.channel, t: threadTs }) });
-        }
-        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs,
-          text: `Which ticket should go to ${toName}?`,
-          blocks: [
-            { type: 'section', text: { type: 'mrkdwn', text: `This thread has ${threadKeys.length} tickets — which one should go to *${toName}*?` } },
-            { type: 'actions', elements: buttons },
-          ] });
-        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
-        return;
-      }
-
-      const targetKey = specificKey || threadKeys[0];
-      const result = await reassignTicket(client, { key: targetKey, toId: mentionedUsers[0], byId: event.user });
       await agentSt.done();
-      await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, unfurl_links: false, text: result.text,
-        ...(result.pickFor ? { blocks: [section(result.text), assigneePicker([result.pickFor], event.channel, threadTs, 'Pick another person')] } : {}) });
-      if (result.ok) await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
+      await handleReassign({ client, event, threadTs, botUserId, botBotId });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       return;
     }
@@ -2939,6 +2879,94 @@ function assigneePicker(keys, channel, threadTs, placeholder = 'Pick who should 
 }
 const section = (text) => ({ type: 'section', text: { type: 'mrkdwn', text } });
 
+// ── Reassign: resolve the ticket, then ALWAYS confirm before changing ──
+// Every path (typed command, ticket buttons, member picker) ends in one
+// card naming the exact issue — title, status, current and new assignee —
+// and nothing changes until the requester clicks Confirm.
+async function handleReassign({ client, event, threadTs, botUserId, botBotId }) {
+  const mentionedUsers = (event.text.match(/<@([A-Z0-9]+)(?:\|[^>]*)?>/g) || [])
+    .map(m => m.replace(/<@|>|\|.*$/g, '')).filter(id => id !== botUserId && !ASSIGNEE_BLOCKLIST.has(id));
+  const specificKey = keysIn(event.text)[0] || null;
+  const msgs = (await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 100 }).catch(() => ({ messages: [] }))).messages || [];
+  let threadKeys = [];
+  for (const msg of [...msgs].reverse()) {
+    if (!(msg.bot_id && (!botBotId || msg.bot_id === botBotId))) continue;
+    for (const k of ticketKeysInMessage(msg.text || '')) if (!threadKeys.includes(k)) threadKeys.push(k);
+  }
+  for (const [k, t] of followUpStore) if (t.channelId === event.channel && t.threadTs === threadTs && !t.done && !threadKeys.includes(k)) threadKeys.push(k);
+  threadKeys = await dropEpics(threadKeys);
+
+  if (!threadKeys.length && !specificKey) {
+    await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: "There's no Jira ticket in this thread to reassign yet.",
+      blocks: [section("There's no Jira ticket in this thread to reassign yet."), { type: 'actions', elements: [createCardButton(event.channel, threadTs)] }] });
+    return;
+  }
+  const keys = specificKey ? [specificKey] : threadKeys;
+  if (!mentionedUsers.length) {                             // pick who (and which, if several)
+    await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: 'Who should take it?',
+      blocks: [section(keys.length > 1 ? 'Pick the ticket and who should take it:' : `Who should take <${JIRA_HOST}/browse/${keys[0]}|${keys[0]}>?`), assigneePicker(keys, event.channel, threadTs)] });
+    return;
+  }
+  if (keys.length > 1) {                                    // pick which ticket
+    const toName = await plainName(client, mentionedUsers[0]);
+    const buttons = [];
+    for (const k of keys.slice(0, 5)) {
+      const d = await getJiraIssueDetails(k).catch(() => null);
+      buttons.push({ type: 'button', action_id: `cr_reassign_pick_${k}`,
+        text: { type: 'plain_text', text: `${k}${d?.assigneeDisplay ? ` (now ${d.assigneeDisplay})` : ''}`.substring(0, 75) },
+        value: JSON.stringify({ k, to: mentionedUsers[0], by: event.user, c: event.channel, t: threadTs }) });
+    }
+    await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: `Which ticket should go to ${toName}?`,
+      blocks: [section(`This thread has ${keys.length} tickets — which one should go to *${toName}*?`), { type: 'actions', elements: buttons }] });
+    return;
+  }
+  const card = await reassignConfirmBlocks(client, { k: keys[0], to: mentionedUsers[0], by: event.user, c: event.channel, t: threadTs });
+  await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, unfurl_links: false, ...card });
+}
+
+async function plainName(client, userId) {
+  try { return (await client.users.info({ user: userId })).user?.real_name || 'them'; } catch { return 'them'; }
+}
+
+// The confirmation card: exactly which issue, from whom, to whom
+async function reassignConfirmBlocks(client, p) {
+  const d = await getJiraIssueDetails(p.k).catch(() => null);
+  const toName = await plainName(client, p.to);
+  if (!d) return { text: `I couldn't find ${p.k} in Jira.`, blocks: [section(`I couldn't find ${p.k} in Jira — nothing changed.`)] };
+  if (d.assigneeEmail && (await resolveEmailToSlackId(client, d.assigneeEmail, d.assigneeDisplay).catch(() => null)) === p.to) {
+    const t = `<${JIRA_HOST}/browse/${p.k}|${p.k}> is already assigned to ${toName} — nothing to change.`;
+    return { text: t, blocks: [section(t)] };
+  }
+  const title = (d.summary || '').replace(/^(\s*\[[^\]]*\])+\s*/, '').substring(0, 110);
+  const warn = /qa success|done|released|closed|will not fix/i.test(d.status || '') ? `\n_Heads-up: it's already *${d.statusName || d.status}*._` : '';
+  const text = `Reassign <${JIRA_HOST}/browse/${p.k}|${p.k}> *${esc(title)}* (${d.statusName || d.status})\nfrom *${esc(d.assigneeDisplay || 'unassigned')}* → *${esc(toName)}*?${warn}`;
+  const value = JSON.stringify({ k: p.k, to: p.to, by: p.by, c: p.c, t: p.t });
+  return { text: `Reassign ${p.k} to ${toName}?`, blocks: [section(text), { type: 'actions', elements: [
+    { type: 'button', style: 'primary', action_id: 'cr_reassign_confirm', value, text: { type: 'plain_text', text: 'Confirm' } },
+    { type: 'button', action_id: 'cr_reassign_cancel', value, text: { type: 'plain_text', text: 'Cancel' } },
+  ] }] };
+}
+const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+slackApp.action('cr_reassign_confirm', async ({ ack, body, client }) => {
+  await ack();
+  let p = {};
+  try { p = JSON.parse(body.actions?.[0]?.value || '{}'); } catch (_) {}
+  const admins = new Set((process.env.BULK_ADMINS || 'U0142GU335F,U0445EQS1ED').split(',').map(s => s.trim()));
+  if (p.by && body.user?.id !== p.by && !admins.has(body.user?.id)) {
+    await client.chat.postEphemeral({ channel: body.channel.id, user: body.user.id, text: `Only <@${p.by}> (who asked) can confirm this reassign.` }).catch(() => {});
+    return;
+  }
+  const result = await reassignTicket(client, { key: p.k, toId: p.to, byId: body.user?.id });
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: result.text,
+    blocks: result.pickFor ? [section(result.text), assigneePicker([result.pickFor], p.c, p.t, 'Pick another person')] : [section(result.text)] }).catch(() => {});
+});
+slackApp.action('cr_reassign_cancel', async ({ ack, body, client }) => {
+  await ack();
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: 'Cancelled',
+    blocks: [section(`Reassign cancelled by <@${body.user?.id}> — nothing changed.`)] }).catch(() => {});
+});
+
 // Reassign in Jira, move follow-up to the new person, and say who did what.
 async function reassignTicket(client, { key, toId, byId }) {
   const before = await getJiraIssueDetails(key).catch(() => null);
@@ -2960,10 +2988,9 @@ slackApp.action(/^cr_reassign_pick_/, async ({ ack, body, client }) => {
   let p = {};
   try { p = JSON.parse(body.actions?.[0]?.value || '{}'); } catch (_) {}
   if (!p.k || !p.to) return;
-  const result = await reassignTicket(client, { key: p.k, toId: p.to, byId: body.user?.id || p.by });
-  // Replace the buttons with the outcome so nobody clicks twice
-  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: result.text,
-    blocks: result.pickFor ? [section(result.text), assigneePicker([result.pickFor], p.c, p.t, 'Pick another person')] : [section(result.text)] }).catch(() => {});
+  // Choosing the ticket shows the confirm card in place
+  const card = await reassignConfirmBlocks(client, { k: p.k, to: p.to, by: p.by || body.user?.id, c: p.c, t: p.t });
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, ...card }).catch(() => {});
 });
 
 // Picker: choosing a person reassigns (the ticket comes from the block, or
@@ -2979,9 +3006,9 @@ slackApp.action('cr_reassign_user', async ({ ack, body, client }) => {
   const key = pickedKey || meta.k;
   const toId = action.selected_user;
   if (!key || !toId) return;
-  const result = await reassignTicket(client, { key, toId, byId: body.user?.id });
-  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: result.text,
-    blocks: result.pickFor ? [section(result.text), assigneePicker([result.pickFor], meta.c, meta.t, 'Pick another person')] : [section(result.text)] }).catch(() => {});
+  // Picking a person shows the confirm card in place
+  const card = await reassignConfirmBlocks(client, { k: key, to: toId, by: body.user?.id, c: meta.c, t: meta.t });
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, ...card }).catch(() => {});
 });
 
 // Follow-up: track one of the thread's tickets for the named person
@@ -3655,5 +3682,5 @@ const SQUAD_PROJECTS = {
 };
 
 module.exports = { register, MONITORED_CHANNELS, CHANNEL_PROFILES, channelProfile, registerFollowUp, isTracked, setTrackedAssignee, stopTrackingThread,
-  ticketKeysInMessage, keysIn,
+  ticketKeysInMessage, keysIn, handleReassign,
   PLATFORM_PARENTS, CLIENT_REPORT_FIX_VERSION_ID, SQUAD_PROJECTS, squadForThread, priorityForThread };
