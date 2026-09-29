@@ -1279,7 +1279,7 @@ function buildTicketReply(createdJiras) {
 async function getJiraIssueDetails(issueKey) {
   try {
     const res = await axios.get(
-      `${JIRA_HOST}/rest/api/3/issue/${issueKey}?fields=status,assignee,fixVersions,updated,summary`,
+      `${JIRA_HOST}/rest/api/3/issue/${issueKey}?fields=status,assignee,fixVersions,updated,summary,created`,
       { headers: { Authorization: jiraAuth(), Accept: 'application/json' } }
     );
     const fields = res.data?.fields || {};
@@ -1290,6 +1290,7 @@ async function getJiraIssueDetails(issueKey) {
       assigneeDisplay: fields.assignee?.displayName || null,
       summary:         fields.summary || '',
       updatedMs:       fields.updated ? Date.parse(fields.updated) : null,
+      createdMs:       fields.created ? Date.parse(fields.created) : null,
       fixVersions:     (fields.fixVersions || []).map(v => ({
         name: v.name, released: !!v.released, releaseDate: v.releaseDate || null,
       })),
@@ -1502,30 +1503,39 @@ async function rebuildFollowUpsFromHistory(client) {
         if (msg.bot_id || !msg.reply_count) continue;           // parents with replies only
         try {
           const replies = await client.conversations.replies({ channel: channelId, ts: msg.ts, limit: 100 });
-          let jiraKey = null, squad = null;
+          // Every card in the thread: the FIRST key always (as before), plus
+          // later ones if the bot posted them or they're new — so a card split
+          // out mid-thread (e.g. an improvement after a failed QA) is kept.
+          const found = new Map();                                 // key → { byBot }
+          let squad = null;
           const combined = [];
           for (const r of replies.messages || []) {
             const t = textOf(r);
             combined.push(t);
-            if (!jiraKey) { const mm = t.match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/); if (mm) jiraKey = mm[0]; }
+            for (const k of (t.match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/g) || [])) {
+              const prev = found.get(k);
+              found.set(k, { byBot: (prev?.byBot) || !!r.bot_id, first: prev ? prev.first : found.size === 0 });
+            }
             if (!squad && r.bot_id) {
               const sm = t.match(/(?:Squad|Related squad):\s*\*?([^*\n]+?)\*?\s*$/m);
               if (sm) squad = sm[1].replace(/&amp;/g, '&').trim();
             }
           }
-          if (!jiraKey || followUpStore.has(jiraKey)) continue;
-
-          const details = await getJiraIssueDetails(jiraKey);
-          if (!details) continue;                                // deleted ticket
-          if (DONE_STATUSES.includes((details.status || '').toLowerCase())) continue;
-
           if (!squad) squad = detectSquadFromKeywords(combined.join(' '));
-          registerFollowUp({
-            channelId, threadTs: msg.ts, jiraKey, jiraUrl: `${JIRA_HOST}/browse/${jiraKey}`, squad,
-            seedStatus: details.status || null,
-            alreadyAnnounced: true,
-          });
-          restored++;
+          for (const [jiraKey, meta] of found) {
+            if (followUpStore.has(jiraKey)) continue;
+            const details = await getJiraIssueDetails(jiraKey);
+            if (!details) continue;                              // deleted ticket
+            if (DONE_STATUSES.includes((details.status || '').toLowerCase())) continue;
+            const isNew = details.createdMs && Date.now() - details.createdMs <= 14 * 86400 * 1000;
+            if (!meta.first && !meta.byBot && !isNew) continue;   // an old ticket pasted for reference
+            registerFollowUp({
+              channelId, threadTs: msg.ts, jiraKey, jiraUrl: `${JIRA_HOST}/browse/${jiraKey}`, squad,
+              seedStatus: details.status || null,
+              alreadyAnnounced: true,
+            });
+            restored++;
+          }
         } catch (_) {}
       }
     } catch (err) {
@@ -2885,6 +2895,60 @@ function withWatchdog(name, handler, budgetMs, note = null) {
     finally { finished = true; clearTimeout(timer); }
   };
 }
+
+// ── A new card posted in a report thread gets followed up too ────────
+// e.g. QA splits an improvement out of a failed ticket ("card khác để
+// improve nha mn <UP-79639>"): the bot starts following the new card with
+// the same rules and says so in the thread. Only NEW cards (created in the
+// last FOLLOWUP_ADOPT_DAYS) that aren't done — an old ticket pasted for
+// reference doesn't start collecting reminders.
+const FOLLOWUP_ADOPT_DAYS = parseFloat(process.env.FOLLOWUP_ADOPT_DAYS || '3');
+const KEY_RE = /\b(?:UP|PAY|AIT|CHAL)-\d+\b/g;
+const ADOPT_DONE = ['qa success', 'done', 'released', 'closed', 'will not fix', 'qa completed', 'ba success'];
+
+async function adoptNewCardsInReply(client, event, logger = console) {
+  const text = [event.text || '', ...(event.attachments || []).map(a => `${a.title_link || ''} ${a.from_url || ''} ${a.text || ''}`)].join(' ');
+  const keys = [...new Set((text.match(KEY_RE) || []).map(k => k.toUpperCase()))];
+  const adopted = [];
+  for (const key of keys) {
+    if (followUpStore.has(key) && !followUpStore.get(key).done) continue;
+    const d = await getJiraIssueDetails(key);
+    if (!d) continue;
+    if (ADOPT_DONE.includes((d.status || '').toLowerCase())) continue;
+    if (!d.createdMs || Date.now() - d.createdMs > FOLLOWUP_ADOPT_DAYS * 86400 * 1000) continue;
+    // Same squad as the thread's other tracked card, else from the thread
+    const sibling = [...followUpStore.values()].find(t => t.channelId === event.channel && t.threadTs === event.thread_ts && !t.done && t.squad);
+    const squad = sibling?.squad || await squadForThread(client, event.channel, event.thread_ts).catch(() => null);
+    const assigneeSlackId = d.assigneeEmail || d.assigneeDisplay
+      ? await resolveEmailToSlackId(client, d.assigneeEmail, d.assigneeDisplay).catch(() => null) : null;
+    registerFollowUp({
+      channelId: event.channel, threadTs: event.thread_ts, jiraKey: key, jiraUrl: `${JIRA_HOST}/browse/${key}`,
+      squad, assigneeSlackHint: assigneeSlackId, seedStatus: d.status || null, alreadyAnnounced: false,
+    });
+    adopted.push({ key, d });
+  }
+  if (!adopted.length) return;
+  // Mention the thread's other open cards so the relationship is clear
+  const others = [...followUpStore.entries()]
+    .filter(([k, t]) => t.channelId === event.channel && t.threadTs === event.thread_ts && !t.done && !adopted.some(a => a.key === k))
+    .map(([k, t]) => `${k}${/qa fail|reopen|reject/.test(t.lastStatus || '') ? ' (failed QA)' : ''}`);
+  const lines = adopted.map(({ key, d }) => `<${JIRA_HOST}/browse/${key}|${key}> (${d.statusName || d.status} · ${d.assigneeDisplay || 'unassigned'})`);
+  await client.chat.postMessage({
+    channel: event.channel, thread_ts: event.thread_ts, unfurl_links: false,
+    text: `Following up on ${lines.join(', ')} too${others.length ? `, alongside ${others.join(', ')}` : ''}. ` +
+      `I'll check in after 2 working days without progress, tag SM at QA Ready, and let the reporter know when it's verified.`,
+  }).catch(() => {});
+  logger.info?.(`[FollowUp] Adopted ${adopted.map(a => a.key).join(', ')} posted in thread ${event.thread_ts}`);
+}
+
+// Replies in monitored threads: look for new cards to follow
+slackApp.event('message', async ({ event, client, logger }) => {
+  if (!MONITORED_CHANNELS[event.channel]) return;
+  if (!event.thread_ts || event.thread_ts === event.ts) return;          // replies only
+  if (event.bot_id || (event.subtype && event.subtype !== 'file_share')) return;
+  try { await adoptNewCardsInReply(client, event, logger); }
+  catch (err) { logger.warn?.('[FollowUp] adopt failed:', err.message); }
+});
 
 let _botUidCache = null;
 const autoAnalysisHandler = withWatchdog('auto-analysis', async ({ event, client, logger }) => {
