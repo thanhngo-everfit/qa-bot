@@ -256,6 +256,8 @@ async function classifyIssueType(triggerText, threadContext) {
 
   // ── Fast-path: explicit Task keywords (trigger text) ──
   if (/\btask\b|tạo task|create task|log task/.test(lower)) return 'Task';
+  // Data corrections are Tasks, not Bugs ("assign Huy to fix data <link>")
+  if (/\bfix(?:ing)?\s+(?:the\s+|client\s+|coach\s+)?data\b|\bdata\s*fix\b|\brestore\s+(?:the\s+)?data\b|fix\s+dữ\s*liệu|sửa\s+(?:data|dữ\s*liệu)/.test(lower)) return 'Task';
 
   // ── Fast-path: clear Task signals in thread content ──
   // Covers Vietnamese action phrases, design/implement requests, BA/PC-style asks
@@ -1811,7 +1813,18 @@ const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }
   const triggerText = event.text.replace(/<@[A-Z0-9]+>/g, '').trim().toLowerCase();
   const isForceLog  = triggerText.startsWith('force log') || triggerText.startsWith('force');
 
-  try { await client.reactions.add({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }); } catch (_) {}
+  // Claim this request: Slack refuses the same reaction twice from the bot,
+  // so a second copy of the work (a Slack retry, or an overlapping deploy)
+  // sees 'already_reacted' and stops — one request, one set of cards.
+  if (!event._synthetic) {
+    try { await client.reactions.add({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }); }
+    catch (err) {
+      if ((err.data?.error || '') === 'already_reacted') {
+        logger.warn(`[QAAgent] Request ${event.ts} is already being handled — skipping the duplicate`);
+        return;
+      }
+    }
+  }
 
   // Declared OUTSIDE the try so catch blocks can always clean the status up
   // (a catch referencing a try-scoped const threw 'agentSt is not defined'
@@ -1824,6 +1837,33 @@ const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }
       context = await getThread(client, event.channel, event.thread_ts);
     } else {
       context = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
+    }
+
+    // The requester linked a specific message in this thread ("assign Huy to
+    // fix data <link>"): that message is what the card is for. The rest of
+    // the thread is background, and issues already ticketed here must not be
+    // re-created (a 25-reply thread about an old, fixed bug drowned out a new
+    // one-client data-fix request).
+    let linkedFocus = null;
+    if (event.thread_ts) {
+      const linkTs = [...(event.text || '').matchAll(/archives\/([A-Z0-9]+)\/p(\d{10})(\d{6})/g)]
+        .filter(m => m[1] === event.channel).map(m => `${m[2]}.${m[3]}`);
+      if (linkTs.length) {
+        try {
+          const rr = await client.conversations.replies({ channel: event.channel, ts: event.thread_ts, limit: 200 });
+          const linked = (rr.messages || []).filter(m => linkTs.includes(m.ts) && m.ts !== event.thread_ts);
+          if (linked.length) {
+            const prior = await scanThreadTicketKeys(client, event.channel, event.thread_ts).catch(() => []);
+            await lib.warmUserNames(client, linked.map(m => m.user).filter(Boolean)).catch(() => {});
+            const parts = [];
+            for (const m of linked) parts.push(`[${lib.replaceMentionsCached(`<@${m.user}>`).replace(/^@/, '')}]: ${await lib.resolveInlineMentions(client, m.text || '')}`);
+            linkedFocus = { text: parts.join('\n'), prior: (prior || []).map(k => (typeof k === 'string' ? k : k.key)).filter(Boolean) };
+            context = `PRIMARY REQUEST — the requester linked this message. Create the card(s) for WHAT IT ASKS, nothing else:\n${linkedFocus.text}\n\n` +
+              `THREAD BACKGROUND (reference only${linkedFocus.prior.length ? ` — already ticketed here: ${linkedFocus.prior.join(', ')}; do NOT re-log those issues` : ''}):\n${context}`;
+            logger.info(`[QABot] Linked message focus: ${linked.map(m => m.ts).join(', ')}${linkedFocus.prior.length ? ` · prior tickets ${linkedFocus.prior.join(', ')}` : ''}`);
+          }
+        } catch (err) { logger.warn('[QABot] linked message lookup failed:', err.data?.error || err.message); }
+      }
     }
 
     if (!context || context.trim().length < 10) {
@@ -2095,7 +2135,9 @@ HARD RULES — follow exactly:
 
     // ── Feature 1: Parse — returns array of tickets ──
     // App Icon requests get a specialized parser with a fixed description template
-    const userDirective = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
+    const userDirective = event.text.replace(/<@[A-Z0-9]+>/g, '').trim() + (linkedFocus
+      ? `\nCreate cards ONLY for the PRIMARY REQUEST (the linked message) — include the coach/client identifiers it names. Do not create a card for the thread's earlier issue${linkedFocus.prior.length ? ` (${linkedFocus.prior.join(', ')})` : ''}.`
+      : '');
     const tickets = isTask && isAppIconRequest(context)
       ? await parseAppIconRequest(context)
       : isTask
@@ -2805,7 +2847,7 @@ slackApp.action('qa_bulk_create_go', async ({ ack, body, client, logger }) => {
       // Same pipeline as typing "create ticket" in that thread: the card is
       // built from the thread and the confirmation is posted under it.
       await coreMentionHandler({
-        event: { channel, thread_ts: ts, ts, user: clicker, text: 'create ticket' },
+        event: { _synthetic: true, channel, thread_ts: ts, ts, user: clicker, text: 'create ticket' },
         client, logger,
       });
       done++;
@@ -3014,7 +3056,7 @@ slackApp.view('qa_assign_submit', async ({ ack, body, view, client, logger }) =>
   // Same pipeline as typing "create ticket and assign to @X" in the thread
   try {
     await coreMentionHandler({
-      event: { channel: meta.c, thread_ts: meta.t, ts: anchorTs, user: clicker, text: `create ticket and assign to ${assignees.map(id => `<@${id}>`).join(' ')}` },
+      event: { _synthetic: true, channel: meta.c, thread_ts: meta.t, ts: anchorTs, user: clicker, text: `create ticket and assign to ${assignees.map(id => `<@${id}>`).join(' ')}` },
       client, logger,
     });
   } catch (err) {
