@@ -1800,7 +1800,7 @@ const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }
 
   const bootSt = agentStatus(client, event.channel, event.thread_ts || event.ts);
   _cleanups.push(() => bootSt.done());
-  await bootSt.start("I'm on it");
+  await bootSt.start("I'm reading your request");
 
   const authRes   = await client.auth.test();
   const botUserId = authRes.user_id;
@@ -1999,7 +1999,7 @@ HARD RULES — follow exactly:
         // create/assign/transition/comment, follow-ups, retract) until done.
         const agentLoopSt = agentStatus(client, event.channel, threadTs);
         _cleanups.push(() => agentLoopSt.done());
-        await agentLoopSt.start('🤖 _QA Agent is on it…_');
+        await agentLoopSt.start("I'm thinking it through");
         let result = null;
         try {
           result = await runAgent({
@@ -2034,10 +2034,10 @@ HARD RULES — follow exactly:
     await bootSt.done();
     agentSt = agentStatus(client, event.channel, threadTs);
     _cleanups.push(() => agentSt.done());
-    await agentSt.start('⏳ _Dispatching to QA Agent — reading the thread…_');
+    await agentSt.start(`I'm reading the thread${(context || '').split('\n').filter(Boolean).length > 1 ? ` (${(context || '').split('\n').filter(Boolean).length} messages)` : ''}`);
 
     // Classify Bug vs Task — explicit keyword wins; otherwise AI decides from thread content
-    await agentSt.update('🧠 _QA Agent is identifying Bug vs Task…_');
+    await agentSt.update("I'm working out whether it's a bug or a task");
     let issueType = await classifyIssueType(triggerText, context);
     // Explicit issue-type mention overrides Bug/Task classification:
     // "create a Product Task for..." → issue type "Product Task" (the list
@@ -2358,7 +2358,7 @@ HARD RULES — follow exactly:
         ticket.summary = lib.productionAuditSummary(ticket.summary, chProfile.prefix);
       }
       logger.info(`[QABot] Creating ${issueType}: ${ticket.summary} epic=${epicKey || 'none'} parent=${parentKey || 'none'}`);
-      await agentSt.update('📝 _QA Agent is creating the Jira ticket(s)…_');
+      await agentSt.update(`I'm creating the ${targetProject} card${expandedTickets.length > 1 ? ` ${createdJiras.length + 1} of ${expandedTickets.length}` : ''}${assigneeSlackIds?.[0] ? ` for ${lib.replaceMentionsCached(`<@${assigneeSlackIds[0]}>`).replace(/^@/, '')}` : ''}`);
       const jira = await createJiraIssue(ticket, jiraIds, epicKey, ticketFixVersionId, parentKey, reporterJiraId, issueType, targetProject, createdJiras.map(c => c.jira.key));
       if (epicKey && !jira.applied?.epic) jira.notes = [...(jira.notes || []), `Jira wouldn't attach it to ${epicKey} — pick an epic below`];
       if (epicRejected) jira.notes = [...(jira.notes || []), epicRejected.type
@@ -2411,6 +2411,7 @@ HARD RULES — follow exactly:
           jira.notes = [...(jira.notes || []), `sprint ${chProfile.sprint} is ${info ? 'closed' : 'unavailable'} — used the active sprint`];
         }
       }
+      if (cardSprintId) await agentSt.update(`I'm adding ${jira.key} to ${cardSprintName || 'the sprint'}`);
       const sprintAdded = cardSprintId
         ? await withBudget('sprint add', 20000, () => addIssueToSprint(jira.key, cardSprintId), false)
         : false;
@@ -2429,6 +2430,7 @@ HARD RULES — follow exactly:
       }
 
       // Upload attachments
+      if (attachments.some(a => a.buffer)) await agentSt.update(`I'm attaching ${attachments.filter(a => a.buffer).length} file${attachments.filter(a => a.buffer).length > 1 ? 's' : ''} to ${jira.key}`);
       let uploaded = 0;
       for (const att of attachments) {
         try {

@@ -277,8 +277,9 @@ async function shutdownLiveStatuses(reason = 'restart') {
   if (!entries.length) return;
   console.warn(`[Shutdown] ${reason}: cleaning ${entries.length} in-flight status message(s)`);
   await Promise.race([
-    Promise.all(entries.map(async ([ts, { client, channel, threadTs }]) => {
-      try { await client.chat.delete({ channel, ts }); } catch (_) {}
+    Promise.all(entries.map(async ([ts, { client, channel, threadTs, native }]) => {
+      if (native) await _setNativeStatus(client, channel, threadTs, '');
+      else { try { await client.chat.delete({ channel, ts }); } catch (_) {} }
       try {
         await client.chat.postMessage({
           channel, thread_ts: threadTs, unfurl_links: false,
@@ -290,14 +291,54 @@ async function shutdownLiveStatuses(reason = 'restart') {
   ]);
 }
 
+// Status style: Slack's native AI status (the shimmering line under the
+// app's name, like Slack's AI apps) when the app has assistant:write, else a
+// posted italic message. STATUS_STYLE = auto (default) | native | message.
+const STATUS_STYLE = (process.env.STATUS_STYLE || 'auto').toLowerCase();
+let _nativeBrokenUntil = 0, _nativeBrokenWhy = null;
+const NATIVE_STATUS_UNSUPPORTED = /missing_scope|not_allowed|invalid_auth|unknown_method|method_deprecated|not_authed|feature_not_enabled|channel_type_not_supported|no_permission|access_denied|not_in_channel|invalid_arguments/i;
+
+// "I'm reading the thread" → "is reading the thread…" (Slack shows it under the app name)
+function _nativeStatusText(text) {
+  const t = _cleanStatus(text).replace(/^I['’]m\s+/i, '').replace(/^I am\s+/i, '');
+  return `is ${t.charAt(0).toLowerCase()}${t.slice(1)}…`.substring(0, 50);
+}
+
+async function _setNativeStatus(client, channel, threadTs, status) {
+  const params = { channel_id: channel, thread_ts: threadTs, status };
+  // Show the CURRENT step only — no generic rotating phrases
+  if (status) params.loading_messages = [status];
+  try { await client.apiCall('assistant.threads.setStatus', params); return true; }
+  catch (err) {
+    const code = err.data?.error || err.message;
+    if (params.loading_messages && /invalid_arg|loading_messages/i.test(code)) {
+      try { delete params.loading_messages; await client.apiCall('assistant.threads.setStatus', params); return true; } catch (_) {}
+    }
+    if (NATIVE_STATUS_UNSUPPORTED.test(code)) {
+      _nativeBrokenUntil = Date.now() + 60 * 60 * 1000;          // stop trying for an hour
+      if (_nativeBrokenWhy !== code) console.warn(`[Status] Native AI status unavailable (${code}) — using posted status messages. Enable 'Agents & AI Apps' + assistant:write to get it.`);
+      _nativeBrokenWhy = code;
+    } else {
+      console.warn(`[Status] native status failed: ${code}`);
+    }
+    return false;
+  }
+}
+
 function agentStatus(client, channel, threadTs) {
-  // One italic line describing the CURRENT step, truthfully — it changes
-  // whenever the work moves to a new step (per tool call in the agent
-  // loop, per phase in the pipelines). No fake animation.
-  let ts = null, killer = null;
+  // One line describing the CURRENT step, truthfully — it changes whenever
+  // the work moves to a new step. No fake animation.
+  let ts = null, killer = null, native = false;
+  const liveKey = () => native ? `native:${channel}:${threadTs}` : ts;
   const del = async () => {
     if (killer) clearTimeout(killer);
     killer = null;
+    if (native) {
+      native = false;
+      LIVE_STATUSES.delete(`native:${channel}:${threadTs}`);
+      await _setNativeStatus(client, channel, threadTs, '');     // clears the shimmer
+      return;
+    }
     if (!ts) return;
     const t = ts; ts = null;
     LIVE_STATUSES.delete(t);
@@ -313,8 +354,16 @@ function agentStatus(client, channel, threadTs) {
       }
     }
   };
+  const wantNative = () => STATUS_STYLE !== 'message' && Date.now() >= _nativeBrokenUntil && !!threadTs;
   return {
     async start(text) {
+      if (wantNative() && await _setNativeStatus(client, channel, threadTs, _nativeStatusText(text))) {
+        native = true;
+        LIVE_STATUSES.set(liveKey(), { client, channel, threadTs, native: true });
+        killer = setTimeout(del, 4 * 60 * 1000);
+        return;
+      }
+      if (STATUS_STYLE === 'native') return;                       // native only: no message fallback
       try {
         const r = await client.chat.postMessage({ channel, thread_ts: threadTs, unfurl_links: false, text: `_${_cleanStatus(text)}_` });
         ts = r.ts;
@@ -323,12 +372,16 @@ function agentStatus(client, channel, threadTs) {
       } catch (_) {}
     },
     async update(text) {
+      // Slack clears a native status whenever the app posts in the thread,
+      // so every step re-asserts it.
+      if (native) { await _setNativeStatus(client, channel, threadTs, _nativeStatusText(text)); return; }
       if (!ts) return;
       try { await client.chat.update({ channel, ts, text: `_${_cleanStatus(text)}_` }); }
       catch (err) { console.warn(`[Status] update ${ts} failed: ${err.data?.error || err.message}`); }
     },
     async done() { await del(); },
     get ts() { return ts; },
+    get native() { return native; },
   };
 }
 

@@ -2061,14 +2061,14 @@ const crMentionHandler = async ({ event, client, logger }) => {
 
     if (aiAction === 'task') {
       const taskSt = agentStatus(client, event.channel, event.thread_ts || event.ts);
-      await taskSt.start('⏳ _QA Agent is working on it…_');
+      await taskSt.start("I'm working on it");
       const crRequest = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
       let threadCtx = event.thread_ts ? await getThread(client, event.channel, event.thread_ts).catch(() => '') : '';
       let crMaxChars = 12000;
       const { detectChannelScope, parseWindowDays, gatherChannelContext } = require('./lib');
       if (detectChannelScope(crRequest)) {
         const days = parseWindowDays(crRequest);
-        await taskSt.update(`\ud83d\udcda _QA Agent is reading this channel's threads from the last ${days} days\u2026_`);
+        await taskSt.update(`I'm reading this channel's threads from the last ${days} days`);
         const gathered = await gatherChannelContext(client, event.channel, { days });
         if (gathered.note) {
           await taskSt.done();
@@ -2148,9 +2148,12 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
     // ANALYZE — re-run analysis on demand
     // ═══════════════════════════════════════════
     if (doAnalyze) {
-      await agentSt.start('⏳ _Dispatching to QA Agent — analyzing this thread…_');
+      await agentSt.start("I'm reading the thread");
       logger.info('[Bot] Analyze triggered manually');
       const images = await threadImages(client, event.channel, threadTs);
+      await agentSt.update(images.length
+        ? `I'm reading the thread and ${images.length} screenshot${images.length > 1 ? 's' : ''}`
+        : "I'm analyzing the thread");
       const { analysis, degraded } = await analyzeWithBudget(context, slackThreadUrl, 100000, images);
       if (!analysis) {
         await agentSt.done();
@@ -2183,7 +2186,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
     // WEEKLY REPORT — manual trigger
     // ═══════════════════════════════════════════
     if (doWeekly) {
-      await agentSt.start('⏳ _Dispatching to QA Agent — compiling the weekly report…_');
+      await agentSt.start("I'm compiling the weekly report");
       logger.info('[Bot] Manual weekly report triggered');
       try { await client.reactions.add({ channel: event.channel, name: 'bar_chart', timestamp: event.ts }); } catch (_) {}
       await sendWeeklyReport(client);
@@ -2278,7 +2281,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
     // FOLLOW-UP (manual trigger)
     // ═══════════════════════════════════════════
     if (doFollowup) {
-      await agentSt.start('⏳ _QA Agent is checking ticket status…_');
+      await agentSt.start("I'm checking the ticket status in Jira");
 
       // ── Mention-aware follow-up ───────────────────────────────────
       // "follow up with @Thanh Tran until his task is finished" must
@@ -2501,7 +2504,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
     // TROUBLESHOOT
     // ═══════════════════════════════════════════
     if (doTrouble) {
-      await agentSt.start('⏳ _QA Agent is preparing troubleshooting steps…_');
+      await agentSt.start("I'm preparing troubleshooting steps");
       const reply = await aiCall(
         `You are QA Agent for Everfit. Provide practical troubleshooting steps for the CS team to try BEFORE escalating to dev. CS are non-technical — steps must be clear and specific.
 
@@ -2551,8 +2554,8 @@ Max 8 steps total. Plain English only.`,
 
     // Run analysis to get ticket details
     logger.info('[Bot] Create card — analyzing thread...');
-    await agentSt.start('⏳ _Dispatching to QA Agent — reading the thread…_');
-    await agentSt.update('🧠 _QA Agent is analyzing and drafting the ticket(s)…_');
+    await agentSt.start("I'm reading the thread");
+    await agentSt.update("I'm drafting the ticket(s)");
     const tDraft = Date.now();
     let analysis;
     try {
@@ -2574,7 +2577,7 @@ Max 8 steps total. Plain English only.`,
       analysis = await analyzeThread(context, slackThreadUrl, event.text.replace(/<@[A-Z0-9]+>/g, '').trim());
       logger.info(`[Bot] Full analysis fallback done in ${((Date.now() - tDraft) / 1000).toFixed(1)}s total`);
     }
-    await agentSt.update('📝 _QA Agent is creating the Jira card(s)…_');
+    await agentSt.update("I'm creating the Jira card(s)");
     logger.info(`[Bot] Severity=${analysis.severity} · tickets=${analysis.tickets.length}`);
 
     // Honor explicit issue type ("create a product task…") and explicit
@@ -2919,13 +2922,15 @@ const autoAnalysisHandler = withWatchdog('auto-analysis', async ({ event, client
     await client.reactions.add({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
 
     const status = agentStatus(client, event.channel, event.ts);
-    await status.start('⏳ _Dispatching to QA Agent…_');
+    await status.start("I'm reading the report");
 
     const slackThreadUrl = buildSlackThreadUrl(event.channel, event.ts);
     const context = text;
 
-    await status.update('🧠 _QA Agent is analyzing the report…_');
     const images = await reportImages(event.files);
+    await status.update(images.length
+      ? `I'm reading the report and ${images.length} screenshot${images.length > 1 ? 's' : ''}`
+      : "I'm analyzing the report");
     if (images.length) logger.info(`[Bot] Auto-analyze with ${images.length} screenshot(s)`);
     const { analysis, degraded } = await analyzeWithBudget(context, slackThreadUrl, 100000, images);
     if (!analysis) {
