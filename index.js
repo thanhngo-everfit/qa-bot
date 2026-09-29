@@ -1770,12 +1770,14 @@ const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }
       for (const b of briefs) {
         if (!b) continue;
         if (b.isEpic) { skipped.push(`${b.key} — an epic, not a ticket`); continue; }
-        if (b.status.toLowerCase() === moveReq.status.toLowerCase()) { skipped.push(`${b.key} — already ${b.status}`); continue; }
+        const sameStatus = !moveReq.status || b.status.toLowerCase() === moveReq.status.toLowerCase();
+        if (sameStatus && !(moveReq.clearFix && b.fixVersions.length)) { skipped.push(`${b.key} — ${moveReq.status ? `already ${b.status}` : 'no Fix Version to remove'}`); continue; }
         if (moveReq.requireNA && !b.fixVersions.some(v => /^n\s*\/?\s*a$/i.test(v))) { skipped.push(`${b.key} — Fix Version is ${b.fixVersions.join(', ') || 'empty'}, not N/A`); continue; }
         eligible.push(b);
       }
       await st.done();
-      const plan = `move to *${moveReq.status}*${moveReq.logSeconds ? ` and log *${lib.fmtDuration(moveReq.logSeconds)}* on each` : ''}`;
+      const plan = [moveReq.status ? `move to *${moveReq.status}*` : null, moveReq.clearFix ? 'remove the *Fix Version*' : null,
+        moveReq.logSeconds ? `log *${lib.fmtDuration(moveReq.logSeconds)}* on each` : null].filter(Boolean).join(', ').replace(/, ([^,]*)$/, ' and $1');
       const said = (event.text.match(/\b(\d+)\s+(?:tickets?|cards?|issues?)\b/i) || [])[1];
       const countNote = said && Number(said) !== eligible.length + skipped.length
         ? `\n_You said ${said}; I found ${eligible.length + skipped.length} in ${source}._` : '';
@@ -3117,17 +3119,31 @@ slackApp.action('bt_confirm', async ({ ack, body, client, logger }) => {
   await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: 'Working…',
     blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `Moving ${picked.length} card(s) to *${job.status}*… (confirmed by <@${body.user.id}>)` } }] }).catch(() => {});
   const lines = [];
+  let ok = 0;
   for (const key of picked) {
-    const moved = await lib.transitionToStatus(key, job.status).catch(err => ({ ok: false, reason: err.response?.status || err.message }));
-    let logged = '';
-    if (moved.ok && job.logSeconds) {
-      const w = await lib.logWork(key, job.logSeconds).catch(err => ({ ok: false, reason: err.response?.status || err.message }));
-      logged = w.ok ? ` · logged ${lib.fmtDuration(job.logSeconds)}` : ` · couldn't log work (${w.reason})`;
+    const before = await lib.getIssueBrief(key);
+    const parts = [];
+    let failed = null;
+    if (job.status && before && before.status.toLowerCase() !== job.status.toLowerCase()) {
+      const moved = await lib.transitionToStatus(key, job.status).catch(err => ({ ok: false, reason: err.response?.status || err.message }));
+      if (moved.ok) { parts.push(`${before.status} → ${moved.status}`); clientReport.resumeTracking?.(key, moved.status); }
+      else failed = `couldn't move to ${job.status} (${moved.reason})`;
     }
-    lines.push(moved.ok ? `• <${JIRA_HOST}/browse/${key}|${key}> → ${moved.status}${logged}` : `• ${key} — couldn't move (${moved.reason})`);
+    if (!failed && job.clearFix && before?.fixVersions?.length) {
+      try {
+        await axios.put(`${JIRA_HOST}/rest/api/3/issue/${key}`, { fields: { fixVersions: [] } }, { headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json' } });
+        parts.push(`Fix Version removed (was ${before.fixVersions.join(', ')})`);
+      } catch (err) { failed = `couldn't remove the Fix Version (${err.response?.status || err.message})`; }
+    }
+    if (!failed && job.logSeconds) {
+      const w = await lib.logWork(key, job.logSeconds).catch(err => ({ ok: false, reason: err.response?.status || err.message }));
+      parts.push(w.ok ? `logged ${lib.fmtDuration(job.logSeconds)}` : `couldn't log work (${w.reason})`);
+    }
+    if (!failed) ok++;
+    lines.push(`• <${JIRA_HOST}/browse/${key}|${key}> ${[...parts, failed].filter(Boolean).join(' · ') || 'nothing to change'}`);
   }
-  const ok = lines.filter(l => l.includes('→')).length;
-  const summary = `Moved ${ok} of ${picked.length} card(s) to *${job.status}* — confirmed by <@${body.user.id}>:\n${lines.join('\n')}`;
+  const what = [job.status ? `to *${job.status}*` : null, job.clearFix ? 'Fix Version removed' : null].filter(Boolean).join(', ');
+  const summary = `Updated ${ok} of ${picked.length} card(s) ${what} — confirmed by <@${body.user.id}>:\n${lines.join('\n')}`;
   await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: summary,
     blocks: [{ type: 'section', text: { type: 'mrkdwn', text: summary.substring(0, 2900) } }] }).catch(() => {});
   logger.info(`[QAAgent] Bulk move → ${job.status}: ${ok}/${picked.length}`);

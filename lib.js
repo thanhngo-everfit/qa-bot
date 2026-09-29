@@ -960,9 +960,14 @@ const MOVE_STATUSES = ['qa success', 'qa completed', 'qa ready', 'qa failed', 'd
   'in review', 'need review', 'will not fix', 'to do', 'ba success'];
 function parseBulkMove(text) {
   const t = (text || '').replace(/<@[A-Z0-9]+(?:\|[^>]*)?>/g, ' ');
-  const m = t.match(new RegExp(`\\b(?:move|transition|close|set|mark|put|chuyển|đóng|đưa)\\b[\\s\\S]*?\\b(?:to|as|into|sang|về|qua)\\s+(?:status\\s+)?["'“]?(${MOVE_STATUSES.join('|')})\\b`, 'i'));
-  if (!m) return null;
-  const status = m[1].toLowerCase().split(' ').map(w => w === 'qa' || w === 'ba' ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1)).join(' ');
+  // "update status of UP-1 to In Progress", "change … to …", "reopen … to …"
+  // Unicode-aware word edges: \\b treats Vietnamese letters (đ, á, ổ) as non-letters
+  const B = '(?<![\\p{L}\\p{N}])', E = '(?![\\p{L}\\p{N}])';
+  const m = t.match(new RegExp(`${B}(?:move|transition|close|set|mark|put|update|change|revert|reopen|chuyển|đóng|đưa|đổi)${E}[\\s\\S]*?${B}(?:to|as|into|sang|về|qua|thành)\\s+(?:status\\s+)?["'“]?(${MOVE_STATUSES.join('|')})${E}`, 'iu'));
+  // Fix Version: "remove / clear fix version" (alone or with a status change)
+  const clearFix = new RegExp(`${B}(?:remove|clear|unset|delete|drop|xoá|xóa|xoa|bỏ|gỡ)${E}[\\s\\S]{0,25}?${B}fix\\s*-?\\s*versions?${E}`, 'iu').test(t);
+  if (!m && !clearFix) return null;
+  const status = m ? m[1].toLowerCase().split(' ').map(w => w === 'qa' || w === 'ba' ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1)).join(' ') : null;
   const requireNA = /\bn\s*\/\s*a\b/i.test(t) && /fix\s*-?\s*version/i.test(t);
   const lw = t.match(/\blog\s*(?:work|time)?\s*(?:=|:|of)?\s*(\d+(?:[.,]\d+)?)\s*(m|min|mins|minutes?|p|phút|h|hr|hrs|hours?|giờ)\b/i);
   let logSeconds = null;
@@ -970,7 +975,7 @@ function parseBulkMove(text) {
     const n = parseFloat(lw[1].replace(',', '.'));
     logSeconds = Math.round(/^(h|hr|hrs|hour|hours|giờ)$/i.test(lw[2]) ? n * 3600 : n * 60);
   }
-  return { status, requireNA, logSeconds };
+  return { status, requireNA, logSeconds, clearFix };
 }
 const fmtDuration = (s) => s < 3600 ? `${Math.round(s / 60)}m` : `${Math.floor(s / 3600)}h${s % 3600 ? ` ${Math.round((s % 3600) / 60)}m` : ''}`;
 

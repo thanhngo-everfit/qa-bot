@@ -3162,6 +3162,22 @@ slackApp.action('cr_retry_analysis', async ({ ack, body, client, logger }) => {
   await crMentionHandler({ event: { _synthetic: true, channel: p.c, thread_ts: p.t, ts: p.t, user: body.user?.id, text: 'analyze' }, client, logger });
 });
 
+// A ticket moved back into development (e.g. reopened after 'passed QA')
+// is followed up again: the tracked item is reactivated with a fresh clock.
+function resumeTracking(key, status) {
+  const t = followUpStore.get(key);
+  if (!t) return false;
+  const s = String(status || '').toLowerCase();
+  if (!['to do', 'in progress', 'in review', 'qa failed', 'need review'].includes(s)) return false;
+  t.done = false;
+  t.lastStatus = s;
+  t.lastPingAt = Date.now();
+  t.nudgeCount = 0;
+  t.notifiedQaReady = false;
+  t.qaRound = (t.qaRound || 0) + 1;
+  return true;
+}
+
 // ── The real tickets in a thread ──────────────────────────────────────// ── The real tickets in a thread ──────────────────────────────────────
 // Keys in any formatting (_UP-1_, *UP-1*, links). A key linked under a
 // different label is a reference, not a ticket — the bot's own
@@ -3809,5 +3825,5 @@ const SQUAD_PROJECTS = {
 };
 
 module.exports = { register, MONITORED_CHANNELS, CHANNEL_PROFILES, channelProfile, registerFollowUp, isTracked, setTrackedAssignee, stopTrackingThread,
-  ticketKeysInMessage, keysIn, handleReassign, handleQaAssign, parseQaAssign,
+  ticketKeysInMessage, keysIn, handleReassign, handleQaAssign, parseQaAssign, resumeTracking,
   PLATFORM_PARENTS, CLIENT_REPORT_FIX_VERSION_ID, SQUAD_PROJECTS, squadForThread, priorityForThread };
