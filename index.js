@@ -3126,6 +3126,27 @@ slackApp.action('bt_confirm', async ({ ack, body, client, logger }) => {
   logger.info(`[QAAgent] Bulk move → ${job.status}: ${ok}/${picked.length}`);
 });
 
+// ── Direct messages ──────────────────────────────────────────────────
+// A DM to the bot is handled like an @mention: no need to tag it. (Needs
+// the Messages tab enabled, the message.im event and im:history.)
+let _dmBotUid = null;
+slackApp.event('message', async ({ event, client, logger }) => {
+  if (event.channel_type !== 'im') return;
+  if (event.bot_id || (event.subtype && event.subtype !== 'file_share')) return;
+  if (!(event.text || '').trim()) return;
+  try {
+    if (!_dmBotUid) _dmBotUid = (await client.auth.test()).user_id;
+    if (event.user === _dmBotUid) return;
+    const text = (event.text || '').includes(`<@${_dmBotUid}>`) ? event.text : `<@${_dmBotUid}> ${event.text}`;
+    // the person is already notified in their own DM — no extra tag
+    await coreMentionHandler({ event: { ...event, text, _noTag: true }, client, logger });
+  } catch (err) {
+    logger.warn('[QAAgent] DM handling failed:', err.message);
+    await client.chat.postMessage({ channel: event.channel, thread_ts: event.thread_ts || event.ts,
+      text: `I couldn't handle that: \`${(err.message || '').substring(0, 200)}\`` }).catch(() => {});
+  }
+});
+
 // ── One-click follow-ups instead of "tag me again with …" ─────────────
 // A request that failed, timed out or needs a card offers a button; the
 // click runs the same pipeline as typing the command.
