@@ -301,7 +301,17 @@ function agentStatus(client, channel, threadTs) {
     if (!ts) return;
     const t = ts; ts = null;
     LIVE_STATUSES.delete(t);
-    try { await client.chat.delete({ channel, ts: t }); } catch (_) {}
+    // Retry once and LOG failures — a silently failed delete left
+    // "I'm on it" in threads after the work was done.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try { await client.chat.delete({ channel, ts: t }); return; }
+      catch (err) {
+        const code = err.data?.error || err.message;
+        if (code === 'message_not_found') return;              // already gone
+        console.warn(`[Status] delete ${t} failed (attempt ${attempt}): ${code}`);
+        if (attempt === 1) await new Promise(r => setTimeout(r, 1500));
+      }
+    }
   };
   return {
     async start(text) {
@@ -314,7 +324,8 @@ function agentStatus(client, channel, threadTs) {
     },
     async update(text) {
       if (!ts) return;
-      try { await client.chat.update({ channel, ts, text: `_${_cleanStatus(text)}_` }); } catch (_) {}
+      try { await client.chat.update({ channel, ts, text: `_${_cleanStatus(text)}_` }); }
+      catch (err) { console.warn(`[Status] update ${ts} failed: ${err.data?.error || err.message}`); }
     },
     async done() { await del(); },
     get ts() { return ts; },

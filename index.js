@@ -2641,12 +2641,34 @@ HARD RULES — follow exactly:
 // only some paths cleaned up, so a reply could leave "I'm on it" behind.
 const coreMentionHandler = async (args) => {
   const _cleanups = [];
+  const startedAt = Date.now() / 1000 - 1;
   try {
     return await coreMentionHandlerInner({ ...args, _cleanups });
   } finally {
     for (const c of _cleanups) { try { await c(); } catch (_) {} }
+    await sweepLeftoverStatuses(args.client, args.event, startedAt);
   }
 };
+
+// Final safety net: remove any "_I'm …_" status the bot posted in this
+// thread during this request that is still there — whatever the status
+// objects believe (e.g. a Slack delete that failed). Statuses of other
+// requests still in progress are tracked in LIVE_STATUSES and left alone.
+async function sweepLeftoverStatuses(client, event, startedAt) {
+  const threadTs = event?.thread_ts || event?.ts;
+  if (!client || !event?.channel || !threadTs) return;
+  try {
+    const { user_id: botUid } = await client.auth.test();
+    const rr = await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 100 });
+    const leftovers = (rr.messages || []).filter(m =>
+      m.user === botUid && parseFloat(m.ts) >= startedAt && m.ts !== threadTs
+      && /^_I['’]m [^\n]+_$/.test((m.text || '').trim()) && !lib.LIVE_STATUSES.has(m.ts));
+    for (const m of leftovers) {
+      try { await client.chat.delete({ channel: event.channel, ts: m.ts }); console.warn(`[Status] swept leftover status ${m.ts} in ${event.channel}`); }
+      catch (err) { console.warn(`[Status] sweep couldn't delete ${m.ts}: ${err.data?.error || err.message}`); }
+    }
+  } catch (_) { /* best effort */ }
+}
 
 // Watchdog: a mention must ALWAYS produce a reply. If the handler hasn't
 // finished within the budget, post a failure notice and clear the status —
