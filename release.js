@@ -926,6 +926,18 @@ function register(slackApp) {
     await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message?.ts, text: reply }).catch(() => {});
   });
 
+  slackApp.action('rel_redraft', async ({ ack, body, client, logger }) => {
+    await ack();
+    let p = {};
+    try { p = JSON.parse(body.actions?.[0]?.value || '{}'); } catch (_) {}
+    await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: `Drafting again — requested by <@${body.user?.id}>`,
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `Drafting again — requested by <@${body.user?.id}>` } }] }).catch(() => {});
+    const groups = [];
+    for (const n of (p.n || [])) for (const g of await upcomingGroups({ onlyVersion: n })) if (!groups.some(x => x.key === g.key)) groups.push(g);
+    for (const g of groups) await sendDraft(client, await buildDraft(client, g), { channel: p.c || body.channel.id, threadTs: p.t });
+    if (!groups.length) await client.chat.postMessage({ channel: p.c || body.channel.id, thread_ts: p.t, text: "I couldn't find those versions unreleased anymore — they may have been released or renamed." }).catch(() => {});
+  });
+
   slackApp.action('rel_skip', async ({ ack, body, client }) => {
     await ack();
     const id = body.actions?.[0]?.value;
@@ -951,8 +963,13 @@ function register(slackApp) {
       return;
     }
     if (!st) {
+      // Expired (restart): redraft it with one click, from the versions in the draft
+      const names = [...new Set([...(JSON.stringify(body.message?.blocks || []).matchAll(/versions\/\d+\/tab\/release-report-all-issues\|([^>]+)>/g))].map(m => m[1]))];
       await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.thread_ts || body.message.ts,
-        text: 'That draft expired (I restarted), so I didn\'t post it. Ask me to "draft release for <version>" again — or press Skip to remove it.' }).catch(() => {});
+        text: "That draft expired (I restarted), so I didn't post it.",
+        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: "That draft expired (I restarted), so I didn't post it." } },
+          { type: 'actions', elements: [{ type: 'button', style: 'primary', action_id: 'rel_redraft', text: { type: 'plain_text', text: 'Draft again' },
+            value: JSON.stringify({ n: names.slice(0, 4), c: body.channel.id, t: body.message.thread_ts || body.message.ts }).substring(0, 2000) }] }] }).catch(() => {});
       return;
     }
     if (!RELEASE_APPROVERS.includes(body.user?.id)) {

@@ -2588,7 +2588,8 @@ HARD RULES — follow exactly:
 
     await client.chat.postMessage({
       channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-      text: responseText || "Something went wrong on my side — I wasn't able to create the ticket this time. Try tagging me again in a moment.",
+      text: responseText || "Something went wrong on my side — I wasn't able to create the ticket this time.",
+      ...(!responseText ? { blocks: [{ type: 'section', text: { type: 'mrkdwn', text: "Something went wrong on my side — I wasn't able to create the ticket this time." } }, tryAgainBlock(event)] } : {}),
       ...(replyBlocks ? { blocks: replyBlocks } : {}),
     });
 
@@ -2728,7 +2729,8 @@ slackApp.event('app_mention', async (args) => {
     try {
       await client.chat.postMessage({
         channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false,
-        text: `I couldn't finish this within ${Math.round(REQUEST_BUDGET_MS / 1000)}s and stopped so I don't leave you hanging. Nothing was created. Please try again — if it keeps happening, my Railway logs show which step stalled.`,
+        text: `I couldn't finish this within ${Math.round(REQUEST_BUDGET_MS / 1000)}s and stopped, so nothing was created.`,
+        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `I couldn't finish this within ${Math.round(REQUEST_BUDGET_MS / 1000)}s and stopped, so nothing was created.` } }, tryAgainBlock(event)],
       });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       await client.reactions.add({ channel: event.channel, name: 'warning', timestamp: event.ts }).catch(() => {});
@@ -2743,7 +2745,8 @@ slackApp.event('app_mention', async (args) => {
     try {
       await client.chat.postMessage({
         channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false,
-        text: `I hit an unexpected error and stopped: \`${(err?.message || 'unknown').substring(0, 200)}\`\nNothing may have been created — please retry.`,
+        text: `I hit an unexpected error and stopped: \`${(err?.message || 'unknown').substring(0, 200)}\``,
+        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `I hit an unexpected error and stopped: \`${(err?.message || 'unknown').substring(0, 200)}\`\nNothing may have been created.` } }, tryAgainBlock(event)],
       });
     } catch (_) {}
   } finally {
@@ -2836,7 +2839,13 @@ slackApp.action('qa_bulk_create_go', async ({ ack, body, client, logger }) => {
   const channel = body.channel.id, msgTs = body.message.ts, clicker = body.user.id;
   const admins = new Set((process.env.BULK_ADMINS || 'U0142GU335F').split(',').map(s => s.trim()));
   const show = (text) => client.chat.update({ channel, ts: msgTs, text, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }] }).catch(() => {});
-  if (!job) { await show('This confirmation expired (the bot restarted). Run the command again — it only picks up posts that still have no ticket.'); return; }
+  if (!job) {
+    await client.chat.update({ channel, ts: msgTs, text: 'This confirmation expired (the bot restarted).',
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'This confirmation expired (the bot restarted). Checking again only picks up posts that still have no ticket.' } },
+        { type: 'actions', elements: [{ type: 'button', style: 'primary', action_id: 'qa_retry', text: { type: 'plain_text', text: 'Check again' },
+          value: JSON.stringify({ c: channel, t: body.message.thread_ts || msgTs, x: 'create tickets under each thread without a ticket' }) }] }] }).catch(() => {});
+    return;
+  }
   if (!admins.has(clicker)) { BULK_CREATE_JOBS.set(id, job); return; }
 
   const total = job.tsList.length;
@@ -2978,6 +2987,27 @@ slackApp.event('message', async ({ event, client, logger }) => {
     }
   }
 });
+
+// ── One-click follow-ups instead of "tag me again with …" ─────────────
+// A request that failed, timed out or needs a card offers a button; the
+// click runs the same pipeline as typing the command.
+function tryAgainBlock(event, label = 'Try again') {
+  const value = JSON.stringify({ c: event.channel, t: event.thread_ts || event.ts, x: String(event.text || '').substring(0, 1800) });
+  return { type: 'actions', elements: [{ type: 'button', style: 'primary', action_id: 'qa_retry', value, text: { type: 'plain_text', text: label } }] };
+}
+
+async function runFromButton({ body, client, logger }, text, label) {
+  let p = {};
+  try { p = JSON.parse(body.actions?.[0]?.value || '{}'); } catch (_) {}
+  if (!p.c || !p.t) return;
+  const who = body.user?.id;
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: `${label} — requested by <@${who}>`,
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `${label} — requested by <@${who}>` } }] }).catch(() => {});
+  await coreMentionHandler({ event: { _synthetic: true, channel: p.c, thread_ts: p.t, ts: body.message.ts, user: who, text: text || p.x || '' }, client, logger });
+}
+
+slackApp.action('qa_retry', async (args) => { await args.ack(); await runFromButton(args, null, 'Trying again'); });
+slackApp.action('qa_create_card', async (args) => { await args.ack(); await runFromButton(args, 'create ticket', 'Creating the card'); });
 
 // ── Assign button on the analysis → member picker → create + assign ──
 slackApp.action('qa_assign_open', async ({ ack, body, client, logger }) => {

@@ -1135,11 +1135,10 @@ async function analyzeWithBudget(context, slackThreadUrl, budgetMs = 100000, ima
 }
 
 function degradedAnalysisText(reason) {
-  return `I couldn't complete the analysis this time (${reason.substring(0, 120)}).\n\n` +
-         `You can still assign it below, or tag me with _"analyze"_ to retry.`;
+  return `I couldn't complete the analysis this time (${reason.substring(0, 120)}). You can retry, or assign it below.`;
 }
 
-function analysisBlocks(text, channelId, threadTs) {
+function analysisBlocks(text, channelId, threadTs, { retry = false } = {}) {
   const blocks = [];
   let chunk = '';
   for (const para of (text || '').split('\n\n')) {
@@ -1154,7 +1153,8 @@ function analysisBlocks(text, channelId, threadTs) {
   if (chunk) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: chunk } });
   blocks.push({
     type: 'actions',
-    elements: [{
+    elements: [...(retry ? [{ type: 'button', action_id: 'cr_retry_analysis', value: JSON.stringify({ c: channelId, t: threadTs }),
+      text: { type: 'plain_text', text: 'Retry analysis' } }] : []), {
       type: 'button', style: 'primary', action_id: 'qa_assign_open',
       text: { type: 'plain_text', text: 'Assign', emoji: true },
       value: JSON.stringify({ c: channelId, t: threadTs }),
@@ -2170,7 +2170,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
       if (!analysis) {
         await agentSt.done();
         const t = degradedAnalysisText(degraded);
-        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, unfurl_links: false, text: t, blocks: analysisBlocks(t, event.channel, threadTs) });
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, unfurl_links: false, text: t, blocks: analysisBlocks(t, event.channel, threadTs, { retry: true }) });
         await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
         return;
       }
@@ -2214,7 +2214,14 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
       const tracked = await findOrRegisterTracked(client, event.channel, threadTs, botBotId, botUserId);
       if (!tracked) {
         await agentSt.done();
-      await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: "I'm not tracking anything in this thread yet — say _\"create card\"_ or _\"follow up\"_ on a ticket and I'll start." });
+      {
+        const keys = (await scanThreadForTickets(client, event.channel, threadTs).catch(() => [])).map(k => (typeof k === 'string' ? k : k.key)).filter(Boolean);
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: "I'm not tracking anything in this thread yet.",
+          blocks: [section("I'm not tracking anything in this thread yet."), { type: 'actions', elements: [
+            createCardButton(event.channel, threadTs),
+            ...keys.slice(0, 4).map(k => btn(`Follow up ${k}`, `cr_track_pick_${k}`, JSON.stringify({ k, c: event.channel, t: threadTs }))),
+          ] }] });
+      }
       } else {
         tracked.done = true;
         await agentSt.done();
@@ -2235,12 +2242,6 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
       const mentionedUsers = (event.text.match(/<@([A-Z0-9]+)>/g) || [])
         .map(m => m.replace(/<@|>/g, '')).filter(id => id !== botUserId && !ASSIGNEE_BLOCKLIST.has(id));
 
-      if (!mentionedUsers.length) {
-        await agentSt.done();
-      await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: `Who should take it? Mention them — e.g. _"reassign to @person"_ — and I'll update the ticket.` });
-        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
-        return;
-      }
 
       // A key in the request wins, in any formatting (_UP-79617_, links)
       const specificKey = keysIn(event.text)[0] || null;
@@ -2256,7 +2257,18 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
 
       if (!threadKeys.length && !specificKey) {
         await agentSt.done();
-        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: "I couldn't find a Jira ticket in this thread to reassign. Create one first with _\"create card\"_, or name it: _\"reassign UP-12345 to @person\"_." });
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: "There's no Jira ticket in this thread to reassign yet.",
+          blocks: [section("There's no Jira ticket in this thread to reassign yet."), { type: 'actions', elements: [createCardButton(event.channel, threadTs)] }] });
+        await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
+        return;
+      }
+
+      // Nobody named → pick them (and the ticket, if there are several)
+      if (!mentionedUsers.length) {
+        await agentSt.done();
+        const keys = specificKey ? [specificKey] : threadKeys;
+        await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: 'Who should take it?',
+          blocks: [section(keys.length > 1 ? `Pick the ticket and who should take it:` : `Who should take <${JIRA_HOST}/browse/${keys[0]}|${keys[0]}>?`), assigneePicker(keys, event.channel, threadTs)] });
         await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
         return;
       }
@@ -2286,7 +2298,8 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
       const targetKey = specificKey || threadKeys[0];
       const result = await reassignTicket(client, { key: targetKey, toId: mentionedUsers[0], byId: event.user });
       await agentSt.done();
-      await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, unfurl_links: false, text: result.text });
+      await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, unfurl_links: false, text: result.text,
+        ...(result.pickFor ? { blocks: [section(result.text), assigneePicker([result.pickFor], event.channel, threadTs, 'Pick another person')] } : {}) });
       if (result.ok) await client.reactions.add({ channel: event.channel, name: 'white_check_mark', timestamp: event.ts }).catch(() => {});
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       return;
@@ -2339,11 +2352,14 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
 
         await agentSt.done();
         if (!chosen.length) {
+          const q = threadKeys.length
+            ? `None of this thread's tickets is assigned to <@${targetId}>. Which one should I track for them?`
+            : `There's no Jira ticket in this thread yet.`;
           await client.chat.postMessage({
-            channel: event.channel, thread_ts: threadTs, unfurl_links: false,
-            text: threadKeys.length
-              ? `I couldn't find a ticket in this thread assigned to <@${targetId}> (I checked ${threadKeys.slice(0, 6).map(k => `<${JIRA_HOST}/browse/${k}|${k}>`).join(', ')}). Tell me the ticket key and I'll track it.`
-              : `There's no Jira ticket in this thread yet — say _"create card"_ and I'll log one, then I can track it.`,
+            channel: event.channel, thread_ts: threadTs, unfurl_links: false, text: q,
+            blocks: [section(q), { type: 'actions', elements: threadKeys.length
+              ? threadKeys.slice(0, 5).map(k => btn(`Track ${k}`, `cr_track_pick_${k}`, JSON.stringify({ k, c: event.channel, t: threadTs, who: targetId })))
+              : [createCardButton(event.channel, threadTs)] }],
           });
         } else {
           const lines = [];
@@ -2890,9 +2906,10 @@ function withWatchdog(name, handler, budgetMs, note = null) {
       if (finished) return;
       logger.warn(`[Bot] WATCHDOG ${name} exceeded ${budgetMs / 1000}s`);
       try {
+        const msg = note || `I couldn't finish analyzing this in time.`;
         await client.chat.postMessage({
-          channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false,
-          text: note || `I couldn't finish analyzing this in time — tag me with _"analyze"_ to retry, or just describe what you need.`,
+          channel: event.channel, thread_ts: event.thread_ts || event.ts, unfurl_links: false, text: msg,
+          blocks: [section(msg), { type: 'actions', elements: [retryAnalysisButton(event.channel, event.thread_ts || event.ts)] }],
         });
       } catch (_) {}
     }, budgetMs);
@@ -2901,11 +2918,31 @@ function withWatchdog(name, handler, budgetMs, note = null) {
   };
 }
 
+// ── Buttons instead of "tell me like: …" ──────────────────────────────
+// Whenever the bot needs a choice, it offers a click — never a command to
+// retype. Create-card and retry buttons are handled by the core (index.js),
+// which owns creation; the rest are handled here.
+const btn = (text, action_id, value, style) => ({ type: 'button', action_id, value: String(value).substring(0, 2000),
+  text: { type: 'plain_text', text: String(text).substring(0, 75) }, ...(style ? { style } : {}) });
+const createCardButton = (channel, threadTs) => btn('Create card', 'qa_create_card', JSON.stringify({ c: channel, t: threadTs }), 'primary');
+const retryAnalysisButton = (channel, threadTs) => btn('Retry analysis', 'cr_retry_analysis', JSON.stringify({ c: channel, t: threadTs }), 'primary');
+function assigneePicker(keys, channel, threadTs, placeholder = 'Pick who should take it') {
+  const elements = [];
+  if (keys.length > 1) {
+    elements.push({ type: 'static_select', action_id: 'cr_reassign_ticket', placeholder: { type: 'plain_text', text: 'Which ticket' },
+      initial_option: { text: { type: 'plain_text', text: keys[0] }, value: keys[0] },
+      options: keys.slice(0, 25).map(k => ({ text: { type: 'plain_text', text: k }, value: k })) });
+  }
+  elements.push({ type: 'users_select', action_id: 'cr_reassign_user', placeholder: { type: 'plain_text', text: placeholder } });
+  return { type: 'actions', block_id: `cr_reassign:${JSON.stringify({ k: keys.slice(0, 1)[0] || null, c: channel, t: threadTs })}`.substring(0, 255), elements };
+}
+const section = (text) => ({ type: 'section', text: { type: 'mrkdwn', text } });
+
 // Reassign in Jira, move follow-up to the new person, and say who did what.
 async function reassignTicket(client, { key, toId, byId }) {
   const before = await getJiraIssueDetails(key).catch(() => null);
   const newJiraId = await resolveJiraAccountId(client, toId);
-  if (!newJiraId) return { ok: false, text: `I couldn't match <@${toId}> to a Jira account, so ${key} is unchanged — set it in Jira, or give me someone else.` };
+  if (!newJiraId) return { ok: false, text: `I couldn't match <@${toId}> to a Jira account, so ${key} is unchanged. Pick someone else:`, pickFor: key };
   await axios.put(`${JIRA_HOST}/rest/api/3/issue/${key}/assignee`, { accountId: newJiraId }, {
     headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' },
   });
@@ -2925,7 +2962,50 @@ slackApp.action(/^cr_reassign_pick_/, async ({ ack, body, client }) => {
   const result = await reassignTicket(client, { key: p.k, toId: p.to, byId: body.user?.id || p.by });
   // Replace the buttons with the outcome so nobody clicks twice
   await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: result.text,
-    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: result.text } }] }).catch(() => {});
+    blocks: result.pickFor ? [section(result.text), assigneePicker([result.pickFor], p.c, p.t, 'Pick another person')] : [section(result.text)] }).catch(() => {});
+});
+
+// Picker: choosing a person reassigns (the ticket comes from the block, or
+// from the ticket menu in the same message)
+slackApp.action('cr_reassign_ticket', async ({ ack }) => { await ack(); });   // selection only; read on user pick
+slackApp.action('cr_reassign_user', async ({ ack, body, client }) => {
+  await ack();
+  const action = body.actions?.[0] || {};
+  let meta = {};
+  try { meta = JSON.parse((action.block_id || '').replace(/^cr_reassign:/, '')); } catch (_) {}
+  const stateVals = Object.values(body.state?.values || {}).flatMap(b => Object.values(b));
+  const pickedKey = stateVals.find(v => v.type === 'static_select' && v.selected_option)?.selected_option?.value;
+  const key = pickedKey || meta.k;
+  const toId = action.selected_user;
+  if (!key || !toId) return;
+  const result = await reassignTicket(client, { key, toId, byId: body.user?.id });
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: result.text,
+    blocks: result.pickFor ? [section(result.text), assigneePicker([result.pickFor], meta.c, meta.t, 'Pick another person')] : [section(result.text)] }).catch(() => {});
+});
+
+// Follow-up: track one of the thread's tickets for the named person
+slackApp.action(/^cr_track_pick_/, async ({ ack, body, client }) => {
+  await ack();
+  let p = {};
+  try { p = JSON.parse(body.actions?.[0]?.value || '{}'); } catch (_) {}
+  if (!p.k) return;
+  const d = await getJiraIssueDetails(p.k).catch(() => null);
+  registerFollowUp({ channelId: p.c, threadTs: p.t, jiraKey: p.k, jiraUrl: `${JIRA_HOST}/browse/${p.k}`, squad: null,
+    assigneeSlackHint: p.who || null, seedStatus: d?.status || null, alreadyAnnounced: true });
+  if (p.who) setTrackedAssignee(p.k, p.who);
+  const t = `Tracking <${JIRA_HOST}/browse/${p.k}|${p.k}> (${d?.statusName || 'status unknown'})${p.who ? ` for <@${p.who}>` : ''} — started by <@${body.user?.id}>. I'll check in after 2 working days without progress.`;
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: t, blocks: [section(t)] }).catch(() => {});
+});
+
+// Retry the analysis of this thread
+slackApp.action('cr_retry_analysis', async ({ ack, body, client, logger }) => {
+  await ack();
+  let p = {};
+  try { p = JSON.parse(body.actions?.[0]?.value || '{}'); } catch (_) {}
+  if (!p.c || !p.t) return;
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: `Retrying the analysis — requested by <@${body.user?.id}>`,
+    blocks: [section(`Retrying the analysis — requested by <@${body.user?.id}>`)] }).catch(() => {});
+  await crMentionHandler({ event: { _synthetic: true, channel: p.c, thread_ts: p.t, ts: p.t, user: body.user?.id, text: 'analyze' }, client, logger });
 });
 
 // ── The real tickets in a thread ──────────────────────────────────────// ── The real tickets in a thread ──────────────────────────────────────
@@ -3062,7 +3142,7 @@ const autoAnalysisHandler = withWatchdog('auto-analysis', async ({ event, client
     if (!analysis) {
       await status.done();
       const t = degradedAnalysisText(degraded);
-      await client.chat.postMessage({ channel: event.channel, thread_ts: event.ts, unfurl_links: false, text: t, blocks: analysisBlocks(t, event.channel, event.ts) });
+      await client.chat.postMessage({ channel: event.channel, thread_ts: event.ts, unfurl_links: false, text: t, blocks: analysisBlocks(t, event.channel, event.ts, { retry: true }) });
       await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
       return;
     }
