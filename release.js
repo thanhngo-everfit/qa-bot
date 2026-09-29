@@ -460,10 +460,46 @@ async function hasCards(versionId) {
   } catch { return { n: 0, more: false }; }
 }
 
+// Marked released in Jira, but some cards aren't finished (status category
+// isn't Done — QA Success and Done are; QA Ready / In Progress aren't).
+// One query across released versions; only versions released in the last
+// RELEASED_LOOKBACK_DAYS are reported.
+async function releasedButUnfinished() {
+  const LOOKBACK = parseInt(process.env.RELEASED_LOOKBACK_DAYS || '45', 10);
+  const since = isoDay(new Date(vnNow().getTime() - LOOKBACK * 86400 * 1000));
+  const byVersion = new Map();              // versionId → { id, name, date, open: [issues] }
+  try {
+    let nextPageToken = null;
+    for (let page = 0; page < 10; page++) {
+      const res = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
+        params: { jql: `project = ${RELEASE_PROJECT} AND fixVersion in releasedVersions(${RELEASE_PROJECT}) AND statusCategory != Done ORDER BY key ASC`,
+                  maxResults: 100, fields: 'summary,status,assignee,fixVersions', ...(nextPageToken ? { nextPageToken } : {}) },
+        headers: headers(),
+      });
+      for (const i of res.data?.issues || []) {
+        for (const v of i.fields?.fixVersions || []) {
+          if (!v.released || v.archived || !v.releaseDate || v.releaseDate < since) continue;
+          if (!byVersion.has(String(v.id))) byVersion.set(String(v.id), { id: String(v.id), name: v.name, date: v.releaseDate, open: [] });
+          byVersion.get(String(v.id)).open.push({ key: i.key, status: i.fields?.status?.name || '?', who: i.fields?.assignee?.displayName || 'unassigned' });
+        }
+      }
+      nextPageToken = res.data?.nextPageToken || null;
+      if (!nextPageToken || res.data?.isLast) break;
+    }
+  } catch (err) {
+    console.warn('[Release] released-but-unfinished lookup failed:', err.response?.status || err.message);
+  }
+  const out = [...byVersion.values()];
+  for (let i = 0; i < out.length; i += 8) {
+    await Promise.all(out.slice(i, i + 8).map(async (e) => { const c = await hasCards(e.id); e.cards = c.more ? `${c.n}+` : String(c.n); }));
+  }
+  return out.sort((a, b) => (b.date || '').localeCompare(a.date || ''));   // newest release first
+}
+
 async function versionCheck(client = null) {
   const today = isoDay(vnNow());
   const versions = await listVersions();
-  const flags = { shipped: [], draft: [], overdue: [], noDate: [] };
+  const flags = { shipped: [], releasedOpen: await releasedButUnfinished(), draft: [], overdue: [], noDate: [] };
   // Released to production (per #release_production_request) but still
   // unreleased in Jira — the strongest signal, reported first
   const shippedByName = new Map();
@@ -536,8 +572,17 @@ function renderVersionCheck(flags) {
   const shipped = flags.shipped?.length
     ? `*Released to production, not marked released in Jira* — from <#${PROD_RELEASE_CHANNEL}>\n${flags.shipped.slice(0, 10).map(shippedLine).join('\n')}${flags.shipped.length > 10 ? `\n_…and ${flags.shipped.length - 10} more_` : ''}`
     : null;
+  const openLine = (e) => {
+    const age = e.openDays > 0 ? ` · _open ${e.openDays} working day${e.openDays > 1 ? 's' : ''}_` : ' · _new_';
+    const cards = e.open.slice(0, 5).map(c => `<${JIRA_HOST}/browse/${c.key}|${c.key}> ${esc(c.status)} (${esc(c.who)})`).join(', ');
+    return `• <${versionUrl(e.id)}|${esc(e.name)}> · released ${prettyDate(e.date)} · ${e.open.length} of ${e.cards} card${e.cards === '1' ? '' : 's'} not done: ${cards}${e.open.length > 5 ? `, +${e.open.length - 5} more` : ''}${age}`;
+  };
+  const releasedOpen = flags.releasedOpen?.length
+    ? `*Marked released, but not all cards are done* — finish them, or move them to the next version\n${flags.releasedOpen.slice(0, 10).map(openLine).join('\n')}${flags.releasedOpen.length > 10 ? `\n_…and ${flags.releasedOpen.length - 10} more_` : ''}`
+    : null;
   const parts = [
     shipped,
+    releasedOpen,
     section('Draft version names', "not a real \"<Platform> <number>\" version yet — the PC still needs to decide it", flags.draft),
     section('Release date passed', 'still not marked released in Jira — release it, or move the date', flags.overdue),
     section('No release date', 'cards are assigned but the version has no date', flags.noDate),
@@ -600,7 +645,7 @@ async function alertVersionIssues(client, { force = false, channel = RELEASE_REV
   }
   for (const k of [...FIRST_SEEN.keys()]) if (!live.has(k)) FIRST_SEEN.delete(k);
 
-  const total = flags.shipped.length + flags.draft.length + flags.overdue.length + flags.noDate.length;
+  const total = flags.shipped.length + flags.releasedOpen.length + flags.draft.length + flags.overdue.length + flags.noDate.length;
   if (!force && _lastCheck.day === today) return;            // once per working day
   _lastCheck = { sig: checkSignature(flags), day: today };
 
@@ -611,7 +656,7 @@ async function alertVersionIssues(client, { force = false, channel = RELEASE_REV
     }
     return;
   }
-  const text = `${threadTs ? '' : `${notifyTags()} `}*Fix version check* (${prettyDate(today)}) — ${total} version${total > 1 ? 's need' : ' needs'} a PC's attention before release:\n\n${renderVersionCheck(flags)}`;
+  const text = `${threadTs ? '' : `${notifyTags()} `}*Fix version check* (${prettyDate(today)}) — ${total} version${total > 1 ? 's need' : ' needs'} a PC's attention:\n\n${renderVersionCheck(flags)}`;
   const buttons = (flags.shipped || []).slice(0, 10).map(e => ({
     type: 'button', action_id: `rel_mark_released_${e.id}`, value: `${e.id}|${e.shippedDay}|${e.name}`.substring(0, 2000),
     text: { type: 'plain_text', text: `Mark ${e.name} released`.substring(0, 75) },
