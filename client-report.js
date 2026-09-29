@@ -1817,9 +1817,9 @@ function startFollowUpScheduler(client) {
             const qaText = qaNow
               ? `${link} is *QA Ready* — QA: *${qaNow}*.` + fyi(reporter)
               : `${link} is *QA Ready*. ${smMention}, pick the QA to verify it:` + fyi(reporter);
+            // Picking here sets the QA straight away (the message names the ticket)
             await client.chat.postMessage({ channel: item.channelId, thread_ts: item.threadTs, unfurl_links: false, text: qaText,
-              ...(qaNow ? {} : { blocks: [section(qaText), { type: 'actions', block_id: `cr_qa:${JSON.stringify({ k: jiraKey, c: item.channelId, t: item.threadTs })}`.substring(0, 255),
-                elements: [{ type: 'users_select', action_id: 'cr_qa_user', placeholder: { type: 'plain_text', text: 'Pick the QA' } }] }] }) });
+              blocks: [section(qaText), qaPickerBlock(jiraKey, item.channelId, item.threadTs, qaNow ? 'Change QA' : 'Pick the QA')] });
             item.announced[`qa_ready_${round}`] = true;
             item.lastPingAt = Date.now();
             item.notifiedQaReady = true;
@@ -2995,15 +2995,40 @@ slackApp.action(/^cr_qa_pick_/, async ({ ack, body, client }) => {
   if (!p.k || !p.qa) return;
   await client.chat.update({ channel: body.channel.id, ts: body.message.ts, ...(await qaConfirmBlocks(client, { ...p, by: p.by || body.user?.id })) }).catch(() => {});
 });
-// QA picker (e.g. on the QA Ready message): choosing someone shows the confirm card
+// QA picker on the QA Ready message: picking sets the QA straight away.
+// The message keeps a 'Change QA' picker, so a wrong pick is one click.
+function qaPickerBlock(key, channel, threadTs, placeholder = 'Pick the QA') {
+  return { type: 'actions', block_id: `cr_qa:${JSON.stringify({ k: key, c: channel, t: threadTs })}`.substring(0, 255),
+    elements: [{ type: 'users_select', action_id: 'cr_qa_user', placeholder: { type: 'plain_text', text: placeholder } }] };
+}
+
+async function setTicketQa(client, key, qaSlackId) {
+  const accountId = await resolveJiraAccountId(client, qaSlackId);
+  if (!accountId) return { ok: false, reason: `I couldn't match <@${qaSlackId}> to a Jira account` };
+  try {
+    await axios.put(`${JIRA_HOST}/rest/api/3/issue/${key}`, { fields: { [QA_FIELD_ID]: { accountId } } },
+      { headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' } });
+    const tracked = followUpStore.get(key);
+    if (tracked) tracked.qaSlackId = qaSlackId;
+    return { ok: true };
+  } catch (err) { return { ok: false, reason: `Jira refused it (${err.response?.status || err.message})` }; }
+}
+
 slackApp.action('cr_qa_user', async ({ ack, body, client }) => {
   await ack();
   const action = body.actions?.[0] || {};
   let meta = {};
   try { meta = JSON.parse((action.block_id || '').replace(/^cr_qa:/, '')); } catch (_) {}
   if (!meta.k || !action.selected_user) return;
-  const card = await qaConfirmBlocks(client, { k: meta.k, qa: action.selected_user, by: body.user?.id, c: meta.c, t: meta.t });
-  await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.thread_ts || body.message.ts, unfurl_links: false, ...card }).catch(() => {});
+  const r = await setTicketQa(client, meta.k, action.selected_user);
+  // Keep the ticket line, replace the picker with the outcome + 'Change QA'
+  const head = (body.message?.blocks || []).find(b => b.type === 'section')?.text?.text || `<${JIRA_HOST}/browse/${meta.k}|${meta.k}>`;
+  const headClean = head.replace(/,?\s*pick the QA to verify it:?/i, '.').replace(/\s*—\s*QA: \*[^*]+\*\./, '.');
+  const outcome = r.ok
+    ? `QA: <@${action.selected_user}> — picked by <@${body.user?.id}>, please verify it.`
+    : `${r.reason}, so the QA on ${meta.k} is unchanged — pick someone else.`;
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: `${meta.k}: ${r.ok ? 'QA set' : 'QA not set'}`,
+    blocks: [section(headClean), section(outcome), qaPickerBlock(meta.k, meta.c, meta.t, r.ok ? 'Change QA' : 'Pick the QA')] }).catch(() => {});
 });
 slackApp.action('cr_qa_confirm', async ({ ack, body, client }) => {
   await ack();
@@ -3014,16 +3039,9 @@ slackApp.action('cr_qa_confirm', async ({ ack, body, client }) => {
     await client.chat.postEphemeral({ channel: body.channel.id, user: body.user.id, text: `Only <@${p.by}> (who asked) can confirm this.` }).catch(() => {});
     return;
   }
-  const accountId = await resolveJiraAccountId(client, p.qa);
-  let t;
-  if (!accountId) t = `I couldn't match <@${p.qa}> to a Jira account, so the QA on ${p.k} is unchanged.`;
-  else {
-    try {
-      await axios.put(`${JIRA_HOST}/rest/api/3/issue/${p.k}`, { fields: { [QA_FIELD_ID]: { accountId } } },
-        { headers: { Authorization: jiraAuth(), 'Content-Type': 'application/json', Accept: 'application/json' } });
-      t = `QA on <${JIRA_HOST}/browse/${p.k}|${p.k}> set to <@${p.qa}> by <@${body.user?.id}>.`;
-    } catch (err) { t = `I couldn't set the QA on ${p.k} (${err.response?.status || err.message}).`; }
-  }
+  const r = await setTicketQa(client, p.k, p.qa);
+  const t = r.ok ? `QA on <${JIRA_HOST}/browse/${p.k}|${p.k}> set to <@${p.qa}> by <@${body.user?.id}>.`
+                 : `${r.reason}, so the QA on ${p.k} is unchanged.`;
   await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: t, blocks: [section(t)] }).catch(() => {});
 });
 slackApp.action('cr_qa_cancel', async ({ ack, body, client }) => {
