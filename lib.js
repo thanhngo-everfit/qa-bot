@@ -955,6 +955,14 @@ async function findThreadsWithoutTickets(client, channelId, { days = 120, botUse
   return { scanned: posts.length, linkedFromJira: linked.size, missing };
 }
 
+// ── The requester's own words ────────────────────────────────────────
+// Quoted lines (Slack sends them as '&gt; …') are context the requester is
+// pointing at, not instructions — a quoted '@Duyen' must not become an
+// assignee, and a quoted ticket link must not become the target.
+function ownText(text) {
+  return String(text || '').split('\n').filter(l => !/^\s*(?:&gt;|>)/.test(l)).join('\n').trim();
+}
+
 // ── Bulk status move ("move them all to QA Success, log work 1 min") ──
 const MOVE_STATUSES = ['qa success', 'qa completed', 'qa ready', 'qa failed', 'done', 'closed', 'in progress',
   'in review', 'need review', 'will not fix', 'to do', 'ba success'];
@@ -1415,7 +1423,7 @@ module.exports = {
   shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion, listOpenEpics, setIssueParent,
   getLastActiveSprint, getVersionName, getIssueTitle, bulkSetParentForChannel, BULK_MOVE_RE, isBulkMoveRequest, resolveEpicCandidate,
   isNoTicketReportRequest, findThreadsWithoutTickets, isBulkCreateRequest, BULK_CREATE_RE, postLabel,
-  parseBulkMove, getIssueBrief, logWork, fmtDuration, withRequesterTag,
+  parseBulkMove, getIssueBrief, logWork, fmtDuration, withRequesterTag, ownText,
   CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, challengerEpicFor, challengerSummary,
   LOW_PRIORITY_SPRINT_ID, LOW_PRIORITY_STATUS, LOW_PRIORITIES, LOW_PRIORITY_RULES, lowPriorityRule, getSprintInfo, transitionToStatus,
   PROJECT_BOARDS, getActiveSprintForProject,

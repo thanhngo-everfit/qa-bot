@@ -11,7 +11,7 @@ const path = require('path');
 const {
   JIRA_HOST, JIRA_PROJECT, jiraAuth,
   SMART_MODEL, aiCall,
-  agentStatus, getActiveSprintId, createJiraIssueResilient, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, isBulkMoveRequest, isNoTicketReportRequest, isBulkCreateRequest, parseBulkMove, withRequesterTag,
+  agentStatus, getActiveSprintId, createJiraIssueResilient, FASTPATH, retractOwnMessages, isCreationRequest, isDiscoveryRequest, isBulkMoveRequest, isNoTicketReportRequest, isBulkCreateRequest, parseBulkMove, withRequesterTag, ownText,
   warmUserNames, replaceMentionsCached, PRIORITY_RUBRIC,
   resolveInlineMentions, qaTaskWork,
 } = require('./lib');
@@ -2894,9 +2894,10 @@ const section = (text) => ({ type: 'section', text: { type: 'mrkdwn', text } });
 // card naming the exact issue — title, status, current and new assignee —
 // and nothing changes until the requester clicks Confirm.
 async function handleReassign({ client, event, threadTs, botUserId, botBotId }) {
-  const mentionedUsers = (event.text.match(/<@([A-Z0-9]+)(?:\|[^>]*)?>/g) || [])
+  const own = ownText(event.text);                          // quoted lines are context, not instructions
+  const mentionedUsers = (own.match(/<@([A-Z0-9]+)(?:\|[^>]*)?>/g) || [])
     .map(m => m.replace(/<@|>|\|.*$/g, '')).filter(id => id !== botUserId && !ASSIGNEE_BLOCKLIST.has(id));
-  const specificKey = keysIn(event.text)[0] || null;
+  const specificKey = keysIn(own)[0] || null;
   const msgs = (await client.conversations.replies({ channel: event.channel, ts: threadTs, limit: 100 }).catch(() => ({ messages: [] }))).messages || [];
   let threadKeys = [];
   for (const msg of [...msgs].reverse()) {
@@ -2957,8 +2958,8 @@ async function threadTicketsFor(client, channel, threadTs, botBotId) {
 }
 
 async function handleQaAssign({ client, event, threadTs, botBotId }) {
-  const qaId = parseQaAssign(event.text);
-  const specificKey = keysIn(event.text)[0] || null;
+  const qaId = parseQaAssign(ownText(event.text));
+  const specificKey = keysIn(ownText(event.text))[0] || null;
   const keys = specificKey ? [specificKey] : await threadTicketsFor(client, event.channel, threadTs, botBotId);
   if (!keys.length) {
     await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: "Which ticket? There's no Jira ticket in this thread yet.",

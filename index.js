@@ -1748,7 +1748,7 @@ const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }
     await st.start("I'm checking those tickets in Jira");
     try {
       // Tickets: named in the message, else the nearest message above that has some
-      let keys = clientReport.keysIn(event.text);
+      let keys = clientReport.keysIn(lib.ownText(event.text));
       let source = 'your message';
       if (!keys.length && event.thread_ts) {
         const rr = await client.conversations.replies({ channel: event.channel, ts: event.thread_ts, limit: 200 });
@@ -2265,15 +2265,20 @@ HARD RULES — follow exactly:
     // Mentions after "cc" or "fyi" are informational only — NOT assignees.
     // e.g. "assign to @A cc @B"  → assignee A only
     //      "assign to @A, @B"    → assignees A and B (one card each)
-    const ccMatch = event.text.match(/\b(?:cc|fyi)\b/i);
-    const assignPortion = ccMatch
-      ? event.text.slice(0, ccMatch.index)
-      : event.text;
-    const triggerMentions = (assignPortion.match(/<@([A-Z0-9]+)>/g) || [])
-      .map(m => m.replace(/<@|>/g, ''))
-      .filter(id => id !== botUserId);
+    // Quoted lines are context, not instructions (a quoted '@Duyen' made a
+    // second card assigned to the requester herself)
+    const own = lib.ownText(event.text);
+    const ccMatch = own.match(/\b(?:cc|fyi)\b/i);
+    const assignPortion = ccMatch ? own.slice(0, ccMatch.index) : own;
+    const idsIn = (s) => [...new Set((s.match(/<@([A-Z0-9]+)(?:\|[^>]*)?>/g) || []).map(m => m.replace(/<@|>|\|.*$/g, '')).filter(id => id !== botUserId))];
+    // People named in the "assign … to" clause win; otherwise any mention
+    const clause = (assignPortion.match(/\b(?:re-?assign|assign|giao|gán)\b[\s\S]*$/i) || [])[0];
+    let triggerMentions = clause && idsIn(clause).length ? idsIn(clause) : idsIn(assignPortion);
+    // The requester only when they explicitly assign themselves
+    const selfAssign = /\b(assign|giao)\b[^.<\n]{0,30}\b(to\s+)?(me|myself|em|mình|tôi)\b/i.test(own);
+    if (!selfAssign && triggerMentions.length > 1) triggerMentions = triggerMentions.filter(id => id !== event.user);
     // "assign to me" / "giao cho em|mình|tôi" (no @mention) → the requester
-    if (triggerMentions.length === 0 && /\b(assign|giao)\b[^.<\n]{0,30}\b(to\s+)?(me|myself|em|mình|tôi)\b/i.test(event.text)) {
+    if (triggerMentions.length === 0 && selfAssign) {
       triggerMentions.push(event.user);
       logger.info('[QAAgent] Self-assign detected → assigning to requester');
     }
