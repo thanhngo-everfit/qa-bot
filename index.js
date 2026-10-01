@@ -32,6 +32,7 @@ const {
 
 const clientReport = require('./client-report');
 const release = require('./release');
+const requests = require('./requests');
 console.log(`[Boot] QA Agent build ${(process.env.RAILWAY_GIT_COMMIT_SHA || 'local').substring(0, 7)} · node ${process.version} · mem limit ${Math.round(require('os').totalmem() / 1048576)}MB`);
 
 // Survive unexpected errors: Node exits on unhandled rejections by default,
@@ -1833,6 +1834,9 @@ const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }
     return;
   }
 
+  // Production release requests: 'status' in a request thread, or 'release requests' anywhere
+  if (requests.isRequestStatusCommand(event)) { await requests.handleStatus({ event, client }); return; }
+
   // Logs: "@QA Agent logs" / "logs analyze" / "show logs for UP-79340"
   const logsMatch = (event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim().match(/^(?:(?:show|check|get)\s+(?:the\s+)?(?:bot\s+)?logs?|logs)\b(?:\s+(?:for|about|with|of)?\s*(.+))?$/i);
   if (logsMatch) {
@@ -3504,4 +3508,5 @@ slackApp.action('qa_core_dup_cancel', async ({ ack, body, client }) => {
   clientReport.register(slackApp, openai);
   release.register(slackApp);
   release.startScheduler(slackApp.client);
+  requests.start(slackApp.client);
 })();
