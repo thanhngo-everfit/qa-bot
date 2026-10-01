@@ -2230,14 +2230,28 @@ HARD RULES — follow exactly:
 
     // ── Feature 1: Parse — returns array of tickets ──
     // App Icon requests get a specialized parser with a fixed description template
+    let draftedWithoutAi = false;
     const userDirective = event.text.replace(/<@[A-Z0-9]+>/g, '').trim() + (linkedFocus
       ? `\nCreate cards ONLY for the PRIMARY REQUEST (the linked message) — include the coach/client identifiers it names. Do not create a card for the thread's earlier issue${linkedFocus.prior.length ? ` (${linkedFocus.prior.join(', ')})` : ''}.`
       : '');
-    const tickets = isTask && isAppIconRequest(context)
-      ? await parseAppIconRequest(context)
-      : isTask
-        ? await parseTaskReport(context, userDirective)
-        : await parseBugReport(context, userDirective);
+    let tickets;
+    try {
+      tickets = isTask && isAppIconRequest(context)
+        ? await parseAppIconRequest(context)
+        : isTask
+          ? await parseTaskReport(context, userDirective)
+          : await parseBugReport(context, userDirective);
+    } catch (err) {
+      // The AI service is down (e.g. the gateway's '503 No available
+      // accounts'): the card can still be made from the bot's own analysis
+      // in this thread instead of failing the request.
+      if (!lib.isAiUnavailable(err)) throw err;
+      const fromAnalysis = await ticketFromThreadAnalysis(client, event.channel, event.thread_ts || event.ts, isTask);
+      if (!fromAnalysis) throw err;
+      logger.warn(`[QABot] AI unavailable (${(err.message || '').substring(0, 80)}) — drafting the card from the thread's analysis`);
+      tickets = [fromAnalysis];
+      draftedWithoutAi = true;
+    }
     const beforeDedup = tickets.length;
     const dedupedTickets = dedupeTickets(tickets);
     if (dedupedTickets.length < beforeDedup) {
@@ -2604,6 +2618,7 @@ HARD RULES — follow exactly:
 
     // ── Build Slack response ──────────────────
     const headline = isTask ? `📋 Done — I've created a ${issueType || 'Task'}` : "🐛 Done — I've logged this bug";
+    const aiNote = draftedWithoutAi ? '\n_The AI service was unavailable, so I built this card from the analysis above — worth a quick read in Jira._' : '';
     // Release attachment buffers as soon as uploads are done
     for (const att of attachments) att.buffer = null;
 
@@ -2652,7 +2667,7 @@ HARD RULES — follow exactly:
           const problems = (jira.notes || []).filter(n => n !== 'no epic set');
           if (problems.length) out.push(`_${problems.join(' · ')}_`);
           return out.join('\n');
-        })()
+        })() + aiNote
       );
     });
     } catch (fmtErr) {
@@ -2773,9 +2788,13 @@ HARD RULES — follow exactly:
     logger.error('[QABot]', err.response?.data ?? err.message);
     await agentSt?.done();
     await bootSt?.done();
-      await client.chat.postMessage({
-      channel: event.channel, thread_ts: event.thread_ts || event.ts,
-      text: `I hit an error while working on this and couldn't finish: \`${errDetail}\`\nGive it another try in a moment — if it keeps failing, my logs have the details.`,
+    const aiDown = lib.isAiUnavailable(err);
+    const errText = aiDown
+      ? `The AI service I use is unavailable right now (\`${errDetail.substring(0, 140)}\`), so I couldn't draft the card — nothing was created. It's an outage on that service, not this request.`
+      : `I hit an error while working on this and couldn't finish: \`${errDetail}\``;
+    await client.chat.postMessage({
+      channel: event.channel, thread_ts: event.thread_ts || event.ts, text: errText,
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: errText } }, tryAgainBlock(event)],
     });
     await client.reactions.remove({ channel: event.channel, name: 'hourglass_flowing_sand', timestamp: event.ts }).catch(() => {});
     await client.reactions.add({ channel: event.channel, name: 'x', timestamp: event.ts }).catch(() => {});
@@ -3090,6 +3109,36 @@ slackApp.event('message', async ({ event, client, logger }) => {
     }
   }
 });
+
+// Build a card from the bot's own analysis reply in the thread (Summary,
+// Platform, Priority, Likely cause, Worth checking, Missing, and the title
+// quoted in Next action) — used when the AI service can't be reached.
+async function ticketFromThreadAnalysis(client, channel, threadTs, isTask) {
+  try {
+    const { user_id: botUid } = await client.auth.test();
+    const rr = await client.conversations.replies({ channel, ts: threadTs, limit: 100 });
+    const a = (rr.messages || []).filter(m => (m.user === botUid || m.bot_id) && /\*Summary:\*/.test(m.text || '')).pop();
+    if (!a) return null;
+    const t = (a.text || '').replace(/&amp;/g, '&');
+    const field = (name) => (t.match(new RegExp(`\\*${name}:\\*\\s*([^\\n]+)`)) || [])[1]?.trim() || '';
+    const section = (name) => { const m = t.match(new RegExp(`\\*${name}\\*[^\\n]*\\n((?:•[^\\n]*\\n?)+)`)); return m ? m[1].trim() : ''; };
+    const title = (t.match(/(?:fix|to)\s+"([^"]{5,140})"/) || [])[1] || field('Summary').split(/(?<=\.)\s/)[0].substring(0, 120);
+    const platform = field('Platform') || 'API';
+    const pr = field('Priority');
+    const priority = /critical/i.test(pr) ? 'Highest' : /high/i.test(pr) ? 'High' : /low/i.test(pr) ? 'Low' : 'Medium';
+    const parent = (rr.messages || [])[0];
+    const reporterLine = parent?.user ? `Reported by <@${parent.user}> in Slack.` : '';
+    const description = [
+      `## Summary\n\n${field('Summary')}`,
+      field('Likely cause') ? `## Likely cause\n\n${field('Likely cause')}` : '',
+      section('Worth checking first') ? `## Worth checking first\n\n${section('Worth checking first').replace(/^•\s?/gm, '* ')}` : '',
+      section('Missing from the report') ? `## Open questions\n\n${section('Missing from the report').replace(/^•\s?/gm, '* ')}` : '',
+      `## Reference\n\n* **Slack thread:** https://everfitt.slack.com/archives/${channel}/p${String(threadTs).replace('.', '')}\n* ${reporterLine}`,
+    ].filter(Boolean).join('\n\n');
+    return { type: isTask ? 'Task' : 'Bug', summary: `[${platform}] ${title.replace(/^\[[^\]]*\]\s*/, '')}`, description,
+             priority, platform, acceptance_criteria: [] };
+  } catch { return null; }
+}
 
 // ── Bulk status move: checklist → Confirm ────────────────────────────
 const BULK_MOVE_JOBS = new Map();

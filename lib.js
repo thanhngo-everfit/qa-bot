@@ -955,6 +955,14 @@ async function findThreadsWithoutTickets(client, channelId, { days = 120, botUse
   return { scanned: posts.length, linkedFromJira: linked.size, missing };
 }
 
+// The AI service is down (not a problem with the request): gateway 5xx,
+// "No available accounts", degraded mode, overloaded, connection failures.
+function isAiUnavailable(err) {
+  const status = err?.status || err?.response?.status;
+  const msg = String(err?.message || err?.error?.message || '');
+  return [502, 503, 504, 529].includes(status) || /no available accounts|degraded mode|upstream|overloaded|service unavailable|ECONNREFUSED|ENOTFOUND|socket hang up|timed out|timeout/i.test(msg);
+}
+
 // ── The requester's own words ────────────────────────────────────────
 // Quoted lines (Slack sends them as '&gt; …') are context the requester is
 // pointing at, not instructions — a quoted '@Duyen' must not become an
@@ -1423,7 +1431,7 @@ module.exports = {
   shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion, listOpenEpics, setIssueParent,
   getLastActiveSprint, getVersionName, getIssueTitle, bulkSetParentForChannel, BULK_MOVE_RE, isBulkMoveRequest, resolveEpicCandidate,
   isNoTicketReportRequest, findThreadsWithoutTickets, isBulkCreateRequest, BULK_CREATE_RE, postLabel,
-  parseBulkMove, getIssueBrief, logWork, fmtDuration, withRequesterTag, ownText,
+  parseBulkMove, getIssueBrief, logWork, fmtDuration, withRequesterTag, ownText, isAiUnavailable,
   CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, challengerEpicFor, challengerSummary,
   LOW_PRIORITY_SPRINT_ID, LOW_PRIORITY_STATUS, LOW_PRIORITIES, LOW_PRIORITY_RULES, lowPriorityRule, getSprintInfo, transitionToStatus,
   PROJECT_BOARDS, getActiveSprintForProject,
