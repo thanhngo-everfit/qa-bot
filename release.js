@@ -742,15 +742,32 @@ async function remindPending(client) {
   }).catch(err => console.warn('[Release] reminder failed:', err.data?.error || err.message));
 }
 
+// Follow-ups run until things are done — not until the release date. They
+// stop when every version of the announcement is marked released in Jira.
+const _relCache = new Map();
+async function allReleased(versionIds) {
+  const ids = (versionIds || []).map(String);
+  if (!ids.length) return false;
+  const hit = _relCache.get(ids.join(','));
+  if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.v;
+  let v = false;
+  try {
+    const rs = await Promise.all(ids.map(id => axios.get(`${JIRA_HOST}/rest/api/3/version/${id}`, { headers: headers() }).then(r => !!r.data?.released)));
+    v = rs.every(Boolean);
+  } catch (_) {}
+  _relCache.set(ids.join(','), { at: Date.now(), v });
+  return v;
+}
+
 const TBD_ASKED = new Map();   // announcement ts → last 'YYYY-MM-DD hh' asked
-async function remindTbd(client, { releaseDayOnly = false } = {}) {
+async function remindTbd(client) {
   const today = isoDay(vnNow()), slot = `${today} ${vnNow().getUTCHours() >= 14 ? 'pm' : 'am'}`;
   for (const [, a] of ANNOUNCED) {
-    if (!a.ts || a.byPC || !a.releaseDate || a.releaseDate < today) continue;
-    if (releaseDayOnly && a.releaseDate !== today) continue;
+    if (!a.ts || a.byPC) continue;
     if (TBD_ASKED.get(a.ts) === slot) continue;
+    if (await allReleased(a.versionIds)) continue;            // shipped — nothing left to chase
     TBD_ASKED.set(a.ts, slot);
-    await askForTbd(client, RELEASE_CHANNEL, a.ts);
+    await askForTbd(client, RELEASE_CHANNEL, a.ts);          // posts only if something is still TBD
   }
 }
 
@@ -758,18 +775,21 @@ async function postReadiness(client, logger = console) {
   const today = isoDay(vnNow());
   for (const [key, a] of ANNOUNCED) {
     if (!a.ts || a.byPC) continue;                          // only threads the bot posted
-    if (!a.releaseDate || a.releaseDate < today) continue;
+    if (a.allClear) continue;                               // already confirmed done
     if (READINESS_POSTED.get(key) === today) continue;
+    if (await allReleased(a.versionIds)) continue;          // shipped — stop following
     READINESS_POSTED.set(key, today);
     const [family] = key.split('|');
     const d = await buildDraft(client, { key, family, releaseDate: a.releaseDate, versions: a.versionIds.map(id => ({ id, name: a.versionNames?.[id] || id })) });
     const isReleaseDay = a.releaseDate === today;
-    if (!d.notReady.length && !isReleaseDay) continue;       // quiet when fully ready, until release day
+    const overdue = a.releaseDate && a.releaseDate < today;
+    if (!d.notReady.length && !isReleaseDay && !overdue) continue;       // quiet when fully ready, until release day
+    if (!d.notReady.length) a.allClear = true;               // done → one all-clear, then stop
     await client.chat.postMessage({
       channel: RELEASE_CHANNEL, thread_ts: a.ts, unfurl_links: false,
       text: d.notReady.length
-        ? `${isReleaseDay ? '*Release day* — ' : ''}${renderReadiness(d)}`
-        : `*Release day* — ${renderReadiness(d).replace(/^\*Readiness:\* /, '')}`,
+        ? `${isReleaseDay ? '*Release day* — ' : overdue ? `*Past the release date (${prettyDate(a.releaseDate)})* — still not ready. ` : ''}${renderReadiness(d)}`
+        : `${isReleaseDay ? '*Release day* — ' : '*All done* — '}${renderReadiness(d).replace(/^\*Readiness:\* /, '')}`,
     }).catch(err => logger.warn?.('[Release] readiness post failed:', err.message));
   }
 }
@@ -806,7 +826,7 @@ function startScheduler(client) {
       if (dow === 0 || dow === 6) return;
       if (hm >= 9 * 60 + 30 && _lastDraftDay !== day) { _lastDraftDay = day; await draftUpcoming(client); await alertVersionIssues(client); }
       if (hm >= 10 * 60 && _lastReadyDay !== day)     { _lastReadyDay = day; await postReadiness(client); await remindTbd(client); }
-      if (hm >= 14 * 60 && _lastTbdPmDay !== day)     { _lastTbdPmDay = day; await remindTbd(client, { releaseDayOnly: true }); }
+      if (hm >= 14 * 60 && _lastTbdPmDay !== day)     { _lastTbdPmDay = day; await remindTbd(client); }
       if (hm >= 15 * 60 && _lastRemindDay !== day)    { _lastRemindDay = day; await remindPending(client); }
     } catch (err) {
       console.warn('[Release] scheduler error:', err.message);
@@ -1370,6 +1390,8 @@ function register(slackApp) {
 }
 
 module.exports = {
+  __test_recover: (client) => recoverAnnounced(client),
+  __test_tick: async (client) => { await postReadiness(client); await remindTbd(client); },
   register, startScheduler, isReleaseCommand, handleCommand, recheckThread, isPagesCommand, handlePagesCommand, handleAnnouncementEdit, askForTbd, announcementTbd, setAnnouncementField,
   // exported for tests
   versionFamily, upcomingWorkdays, itemLabel, renderAnnouncement, renderReadiness, buildDraft, upcomingGroups,
