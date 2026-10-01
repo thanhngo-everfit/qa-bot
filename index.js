@@ -1815,6 +1815,9 @@ const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }
     return;
   }
 
+  // "release followup" → follow up open releases now (readiness + TBD prompts)
+  if (release.isReleaseFollowupCommand(event.text)) { await release.handleReleaseFollowup({ event, client }); return; }
+
   // "update description to: …" / "optional update" in a release announcement thread
   if (event.thread_ts && await release.handleAnnouncementEdit({ event, client })) return;
 

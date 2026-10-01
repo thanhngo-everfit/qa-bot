@@ -987,6 +987,69 @@ async function handleAnnouncementEdit({ event, client }) {
   return true;
 }
 
+// ── On demand: '@QA Agent release followup' ──────────────────────────
+// In an announcement thread → follow up that release now; elsewhere → every
+// open release (bot-announced, not yet released in Jira), each in its own
+// thread, plus a summary where it was asked.
+const FOLLOWUP_CMD_RE = /\brelease\s*follow\s*-?\s*ups?\b|\bfollow\s*-?\s*up\s+(?:on\s+)?(?:the\s+|all\s+)?releases?\b|\bnhắc\s+release\b/i;
+function isReleaseFollowupCommand(text) { return FOLLOWUP_CMD_RE.test((text || '').replace(/<@[A-Z0-9]+(?:\|[^>]*)?>/g, '')); }
+
+async function followUpAnnouncement(client, ts) {
+  const parent = ((await client.conversations.replies({ channel: RELEASE_CHANNEL, ts, limit: 1 }).catch(() => ({ messages: [] }))).messages || [])[0];
+  const versions = await announcementVersions(client, RELEASE_CHANNEL, ts);
+  if (!parent || !versions) return null;
+  const all = await listAllVersions();
+  const byId = new Map(all.map(v => [String(v.id), v]));
+  const vs = versions.map(v => byId.get(String(v.id)) || { id: v.id, name: v.name });
+  if (vs.every(v => v.released)) return { name: vs.map(v => v.name).join(' / '), released: true };
+  const family = versionFamily(vs[0].name);
+  const releaseDate = vs.map(v => v.releaseDate).filter(Boolean).sort()[0] || null;
+  const d = await buildDraft(client, { key: `${family}|followup`, family, releaseDate, versions: vs.map(v => ({ id: v.id, name: v.name })) });
+  const today = isoDay(vnNow());
+  const lead = releaseDate === today ? '*Release day* — ' : releaseDate && releaseDate < today ? `*Past the release date (${prettyDate(releaseDate)})* — ` : '';
+  await client.chat.postMessage({ channel: RELEASE_CHANNEL, thread_ts: ts, unfurl_links: false,
+    text: d.notReady.length ? `${lead}${renderReadiness(d)}` : `${lead}${renderReadiness(d).replace(/^\*Readiness:\* /, '')}` });
+  const tbd = announcementTbd(parent.text);
+  if (tbd.length) await askForTbd(client, RELEASE_CHANNEL, ts);
+  return { name: vs.map(v => v.name).join(' / '), notReady: d.notReady.length, total: d.total, tbd, ts };
+}
+
+async function listAllVersions() {
+  return axios.get(`${JIRA_HOST}/rest/api/3/project/${RELEASE_PROJECT}/versions`, { headers: headers() }).then(r => r.data || []).catch(() => []);
+}
+
+async function handleReleaseFollowup({ event, client }) {
+  const tTs = event.thread_ts || event.ts;
+  const st = lib.agentStatus(client, event.channel, tTs);
+  await st.start("I'm following up on the release");
+  try {
+    // In an announcement thread → just this one
+    if (event.channel === RELEASE_CHANNEL && event.thread_ts && await announcementVersions(client, RELEASE_CHANNEL, event.thread_ts)) {
+      const r = await followUpAnnouncement(client, event.thread_ts);
+      await st.done();
+      if (r?.released) await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, text: `${r.name} is already marked released in Jira — nothing left to follow up.` });
+      return;
+    }
+    // Everywhere else → every open bot announcement
+    if (!ANNOUNCED.size) await recoverAnnounced(client);
+    const lines = [];
+    for (const [, a] of ANNOUNCED) {
+      if (!a.ts || a.byPC) continue;
+      const r = await followUpAnnouncement(client, a.ts);
+      if (!r || r.released) continue;
+      const link = `https://everfitt.slack.com/archives/${RELEASE_CHANNEL}/p${String(a.ts).replace('.', '')}`;
+      const bits = [r.notReady ? `${r.notReady}/${r.total} not QA Success` : 'all cards QA Success', r.tbd.length ? `TBD: ${r.tbd.map(k => TBD_FIELDS[k].replace('Set up ', '')).join(', ')}` : null].filter(Boolean);
+      lines.push(`• <${link}|${esc(r.name)}> — ${bits.join(' · ')}`);
+    }
+    await st.done();
+    await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, unfurl_links: false,
+      text: lines.length ? `Followed up on ${lines.length} open release${lines.length > 1 ? 's' : ''} in <#${RELEASE_CHANNEL}>:\n${lines.join('\n')}` : 'No open releases to follow up — everything announced is released.' });
+  } catch (err) {
+    await st.done();
+    await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, text: `I couldn't finish the follow-up: \`${String(err.message).substring(0, 180)}\`` });
+  }
+}
+
 // ── Confluence release pages (overview + checklist), on request ──────
 // Mirrors the QA team's manual routine (everfit-release-pages): under
 // 'Core Product - 2026 Release Report', an overview page with the live Jira
@@ -1392,7 +1455,7 @@ function register(slackApp) {
 module.exports = {
   __test_recover: (client) => recoverAnnounced(client),
   __test_tick: async (client) => { await postReadiness(client); await remindTbd(client); },
-  register, startScheduler, isReleaseCommand, handleCommand, recheckThread, isPagesCommand, handlePagesCommand, handleAnnouncementEdit, askForTbd, announcementTbd, setAnnouncementField,
+  register, startScheduler, isReleaseCommand, handleCommand, recheckThread, isPagesCommand, handlePagesCommand, isReleaseFollowupCommand, handleReleaseFollowup, handleAnnouncementEdit, askForTbd, announcementTbd, setAnnouncementField,
   // exported for tests
   versionFamily, upcomingWorkdays, itemLabel, renderAnnouncement, renderReadiness, buildDraft, upcomingGroups,
   versionTagRegex, findCandidates, moveToVersion, PLACEHOLDER_VERSION_IDS, draftUpcoming, remindPending,
