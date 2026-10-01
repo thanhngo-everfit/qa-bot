@@ -27,6 +27,7 @@ const REMIND_AFTER_MIN = parseInt(process.env.REQ_REMIND_AFTER_MIN || '30', 10);
 const REMIND_EVERY_MIN = parseInt(process.env.REQ_REMIND_EVERY_MIN || '60', 10);
 const MAX_REMINDERS    = parseInt(process.env.REQ_MAX_REMINDERS || '3', 10);
 const LOOKBACK_DAYS    = parseInt(process.env.REQ_LOOKBACK_DAYS || '7', 10);
+const STALE_AFTER_MIN  = parseInt(process.env.REQ_STALE_AFTER_MIN || String(2 * 24 * 60), 10);   // 2 days
 const MARK = '⏳ This release is waiting';          // marker on the bot's reminders
 const vn = () => new Date(Date.now() + 7 * 3600 * 1000);
 const hhmm = (ts) => new Date(parseFloat(ts) * 1000 + 7 * 3600 * 1000).toISOString().substring(11, 16);
@@ -34,11 +35,40 @@ const mins = (ts) => Math.round((Date.now() / 1000 - parseFloat(ts)) / 60);
 const dur = (m) => m < 60 ? `${m} min` : `${Math.floor(m / 60)}h${m % 60 ? ` ${m % 60}m` : ''}`;
 const link = (ts) => `https://everfitt.slack.com/archives/${CHANNEL}/p${String(ts).replace('.', '')}`;
 
+// The workflow keeps parts of a step (e.g. '<@X> clicked *Continue*') in its
+// blocks, not in .text — read everything.
+function fullText(m) {
+  const out = [m.text || ''];
+  const walk = (n) => {
+    if (!n || typeof n !== 'object') return;
+    if (Array.isArray(n)) return n.forEach(walk);
+    if (typeof n.text === 'string') out.push(n.text);
+    else if (n.text && typeof n.text.text === 'string') out.push(n.text.text);
+    if (n.type === 'user' && n.user_id) out.push(`<@${n.user_id}>`);
+    if (n.type === 'usergroup' && n.usergroup_id) out.push(`<!subteam^${n.usergroup_id}>`);
+    for (const k of ['elements', 'fields', 'blocks']) if (n[k]) walk(n[k]);
+  };
+  walk(m.blocks); walk(m.attachments);
+  return out.join('\n');
+}
+// Buttons still on the message = the step is waiting for that click
+function pendingButtons(m) {
+  const labels = [];
+  const walk = (n) => {
+    if (!n || typeof n !== 'object') return;
+    if (Array.isArray(n)) return n.forEach(walk);
+    if (n.type === 'button' && n.text?.text) labels.push(n.text.text.trim());
+    for (const k of ['elements', 'blocks', 'actions']) if (n[k]) walk(n[k]);
+  };
+  walk(m.blocks); walk(m.attachments);
+  return labels;
+}
+
 // ── Reading a request thread ─────────────────────────────────────────
-const ACTION_RE = /(?:press|click)\s*\*?`?\s*(continue|done|passed)\b|\*`?(approve)`?\*|\b(approve)\b[^.\n]*\brelease\b|\*`?(PASSED)`?\*/i;
+const ACTION_RE = /(?:press|click)[^`*\n]{0,25}[*`]+\s*(continue|done|passed|confirm|completed?|approve)\b|\*`?(approve)`?\*|\b(approve)\b[^.\n]*\brelease\b|\*`?(PASSED)`?\*|`(continue|done|confirm|completed?)`/i;
 function actionOf(text) {
   const m = (text || '').match(ACTION_RE);
-  const a = (m && (m[1] || m[2] || m[3] || m[4]) || '').toLowerCase();
+  const a = (m && (m[1] || m[2] || m[3] || m[4] || m[5]) || '').toLowerCase();
   return a === 'passed' ? 'PASSED' : a ? a[0].toUpperCase() + a.slice(1) : null;
 }
 function stepLabel(text) {
@@ -56,7 +86,7 @@ function stepLabel(text) {
   if (/smoke test/.test(t)) return 'smoke test on production';
   return 'the next step';
 }
-const doneLine = (text) => /<@[A-Z0-9]+(?:\|[^>]*)?>\s*clicked\s*\*?`?(?:continue|approve|passed|done)/i.test(text || '');
+const doneLine = (text) => /<@[A-Z0-9]+(?:\|[^>]*)?>\s*clicked\s*\*?`?\w+/i.test(text || '');
 // Who the step waits on: people/groups named before any 'fyi'
 function waitingOn(text) {
   const head = (text || '').split(/\bfyi\b/i)[0].replace(/<@[A-Z0-9]+(?:\|[^>]*)?>\s*clicked[\s\S]*$/i, '');
@@ -67,22 +97,35 @@ function requestName(parentText) {
   return m ? `${m[1].trim()} ${m[2].replace(/^v/i, '')}`.replace(/\s+/g, ' ') : 'this release';
 }
 
+const CANCEL_RE = /\b(?:release|request|ver(?:sion)?|bản|cái\s+ni|cái\s+này)\b[^.\n]{0,40}\b(?:cancel(?:led|ed)?|h[uủ]y|hủy|won'?t\s+go|not\s+going)\b|\bcancel(?:led|ed)\b|(?:ko|không|k)\s+đi\s+nữa|\bignore\s+(?:gi[ùu]m|giúp|this|it)\b|\bkhông\s+release\s+nữa\b/i;
+
 function readThread(msgs, botUid) {
   const parent = msgs[0];
   const workflow = msgs.filter(m => m.bot_id && m.user !== botUid);          // the release workflow's messages
-  const finished = workflow.some(m => /release already finished/i.test(m.text || ''));
+  const finished = workflow.some(m => /release already finished/i.test(fullText(m)));
   // The pending step: the latest workflow message with an action and no 'clicked' line
   let pending = null;
   for (const m of [...workflow].reverse()) {
-    if (doneLine(m.text)) break;                                             // everything up to here is done
-    if (actionOf(m.text)) { pending = m; break; }
+    const t = fullText(m);
+    if (doneLine(t)) break;                                                  // everything up to here is done
+    const buttons = pendingButtons(m);
+    if (buttons.length || actionOf(t)) { pending = { ...m, text: t, _action: buttons[0] || actionOf(t) }; break; }
   }
   const mine = msgs.filter(m => m.user === botUid || (m.bot_id && /^⏳|^Blocked:|^Release finished/.test(m.text || '')));
-  const remindersForStep = pending ? mine.filter(m => (m.text || '').includes(MARK) && parseFloat(m.ts) > parseFloat(pending.ts)) : [];
+  // Only reminders that point at THIS step count (a stale or misread one doesn't)
+  const pointsAt = (m) => ((m.text || '').match(/archives\/[A-Z0-9]+\/p(\d{10})(\d{6})/) || []).slice(1).join('.');
+  const remindersForStep = pending ? mine.filter(m => (m.text || '').includes(MARK) && pointsAt(m) === pending.ts) : [];
+  // Cancelled: the bot's own 'Stopped following' marker, or someone saying so
+  // after the pending step ('ko đi nữa', 'ignore giùm', 'release cancelled').
+  // Only messages AFTER the step count, so a feature named 'Cancel
+  // Subscription' in the release notes doesn't.
+  const after = pending ? msgs.filter(m => !m.bot_id && parseFloat(m.ts) > parseFloat(pending.ts)) : [];
+  const cancelled = mine.some(m => /^Stopped following this release request/.test(m.text || ''))
+    || after.some(m => CANCEL_RE.test((m.text || '').replace(/<@[A-Z0-9]+(?:\|[^>]*)?>/g, ' ')));
   // A blocker someone noted after the step started
   const blocker = pending && msgs.filter(m => !m.bot_id && parseFloat(m.ts) > parseFloat(pending.ts))
-    .reverse().find(m => /\b(?:waiting|dependency|blocked|depends on|chờ|đợi)\b/i.test(m.text || ''));
-  return { parent, finished, pending, remindersForStep, blocker, mine };
+    .reverse().find(m => /\b(?:waiting|dependency|blocked|depends on|chờ|đợi)\b/i.test(m.text || '') && !CANCEL_RE.test(m.text || ''));
+  return { parent, finished, pending, remindersForStep, blocker, mine, cancelled };
 }
 
 // ── Dependencies ('Waiting API 4.32.0') ──────────────────────────────
@@ -135,6 +178,12 @@ async function scan(client, { force = false, onlyTs = null, logger = console } =
     const msgs = threads.get(p.ts);
     const s = readThread(msgs, botUid);
     const name = requestName(p.text);
+    if (s.cancelled) {
+      // Clean up my reminders once, then leave it alone
+      for (const r of s.mine.filter(m => (m.text || '').includes(MARK))) await client.chat.delete({ channel: CHANNEL, ts: r.ts }).catch(() => {});
+      report.push({ name, state: 'cancelled', ts: p.ts });
+      continue;
+    }
     // Finished → Jira released?
     if (s.finished) {
       const v = await jiraVersionFor(p.text);
@@ -150,15 +199,25 @@ async function scan(client, { force = false, onlyTs = null, logger = console } =
       report.push({ name, state: 'finished', ts: p.ts, jiraReleased: v ? !!v.released : null });
       continue;
     }
+    // A reminder of mine that points at a step which isn't the pending one
+    // (it's done, or I misread it) is removed — no stale nagging in the thread
+    for (const r of s.mine.filter(m => (m.text || '').includes(MARK))) {
+      const pointed = ((r.text || '').match(/archives\/[A-Z0-9]+\/p(\d{10})(\d{6})/) || []).slice(1).join('.');
+      if (pointed && (!s.pending || pointed !== s.pending.ts)) {
+        await client.chat.delete({ channel: CHANNEL, ts: r.ts }).catch(() => {});
+        logger.info?.(`[Requests] Removed a stale reminder in ${name}`);
+      }
+    }
     if (!s.pending) { report.push({ name, state: 'in progress', ts: p.ts }); continue; }
-    const step = stepLabel(s.pending.text), action = actionOf(s.pending.text), since = s.pending.ts, waited = mins(since);
+    const step = stepLabel(s.pending.text), action = s.pending._action || 'the button', since = s.pending.ts, waited = mins(since);
     const who = waitingOn(s.pending.text);
     // Blocked by a dependency someone noted
     if (s.blocker) {
       const dep = depOf(s.blocker.text);
       let depLine = '';
       if (dep) {
-        const depParent = [...threads.entries()].find(([, ms]) => sameRelease(ms[0].text, dep));
+        const depParent = [...threads.entries()].filter(([, ms]) => sameRelease(ms[0].text, dep) && !readThread(ms, botUid).cancelled)
+          .sort((a, b) => parseFloat(b[0]) - parseFloat(a[0]))[0];
         if (!depParent) depLine = `No release request for ${dep.platform} ${dep.version} yet.`;
         else {
           const ds = readThread(depParent[1], botUid);
@@ -177,6 +236,11 @@ async function scan(client, { force = false, onlyTs = null, logger = console } =
           text: `Blocked: *${step}* is on hold — ${dep ? `waiting on ${dep.platform} ${dep.version}` : 'a dependency was noted'} (since ${hhmm(s.blocker.ts)}). ${depLine}` }).catch(() => {});
       }
       report.push({ name, state: `on hold: ${step}`, ts: p.ts, blockedBy: dep ? `${dep.platform} ${dep.version}` : 'noted dependency' });
+      continue;
+    }
+    // Pending for days and never reminded → it's stale, not something to nag about now
+    if (!force && waited > STALE_AFTER_MIN && !s.remindersForStep.length) {
+      report.push({ name, state: `stale: ${step}`, ts: p.ts, waited, who, action });
       continue;
     }
     report.push({ name, state: `waiting on ${step}`, ts: p.ts, waited, who, action });
@@ -200,6 +264,22 @@ function start(client) {
   setTimeout(() => scan(client).catch(() => {}), 60 * 1000);
 }
 
+// '@QA Agent this release was cancelled' / 'cancel' / 'hủy' / 'ignore' in a request thread
+function isCancelCommand(event) {
+  const t = (event.text || '').replace(/<@[A-Z0-9]+(?:\|[^>]*)?>/g, ' ');
+  return event.channel === CHANNEL && !!event.thread_ts && (/\bcancel(?:led|ed)?\b|h[uủ]y|hủy|\bignore\b|\bstop\s+(?:following|tracking)\b/i.test(t));
+}
+async function handleCancel({ event, client }) {
+  const rr = await client.conversations.replies({ channel: CHANNEL, ts: event.thread_ts, limit: 200 }).catch(() => ({ messages: [] }));
+  const msgs = rr.messages || [];
+  if (!/Release Request\*?\s*for platform/i.test(msgs[0]?.text || '')) return false;
+  const { user_id: botUid } = await client.auth.test();
+  for (const r of msgs.filter(m => m.user === botUid && (m.text || '').includes(MARK))) await client.chat.delete({ channel: CHANNEL, ts: r.ts }).catch(() => {});
+  await client.chat.postMessage({ channel: CHANNEL, thread_ts: event.thread_ts,
+    text: `Stopped following this release request (${requestName(msgs[0].text)}) — cancelled by <@${event.user}>. I removed my reminders here.` });
+  return true;
+}
+
 // '@QA Agent release status' (anywhere) / 'status' in a request thread
 const STATUS_RE = /\b(?:release\s+(?:request\s+)?status|status|where|stuck|check)\b/i;
 function isRequestStatusCommand(event) {
@@ -217,4 +297,4 @@ async function handleStatus({ event, client }) {
     text: lines.length ? `Release requests in <#${CHANNEL}> that aren't done:\n${lines.join('\n')}` : 'Every release request from the last week is finished and marked released.' });
 }
 
-module.exports = { start, scan, readThread, stepLabel, actionOf, waitingOn, depOf, isRequestStatusCommand, handleStatus };
+module.exports = { start, scan, readThread, stepLabel, actionOf, waitingOn, depOf, isRequestStatusCommand, handleStatus, isCancelCommand, handleCancel };

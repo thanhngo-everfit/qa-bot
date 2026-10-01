@@ -1835,6 +1835,7 @@ const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }
   }
 
   // Production release requests: 'status' in a request thread, or 'release requests' anywhere
+  if (requests.isCancelCommand(event) && await requests.handleCancel({ event, client })) return;
   if (requests.isRequestStatusCommand(event)) { await requests.handleStatus({ event, client }); return; }
 
   // Logs: "@QA Agent logs" / "logs analyze" / "show logs for UP-79340"
