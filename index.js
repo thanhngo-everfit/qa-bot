@@ -359,8 +359,10 @@ function buildFallbackSummary(context, platform) {
     const featurePart = prefixMatch[2]; // e.g. "[Check-In Form][Notification][Reminder]"
     // Try to find an "Actual" line for the bug detail
     const actualMatch = text.match(/(?:\*?Actual\*?|Step\s*\(\d+\))[:\s]+([^\n•*`]{5,60})/i);
-    const detail = actualMatch ? ' — ' + actualMatch[1].trim() : '';
-    const summary = `[${platform}]${featurePart}${detail}`.slice(0, 120);
+    // No 'Actual:' line → keep the words that follow the tags on that line
+    const rest = (text.slice(prefixMatch.index + prefixMatch[0].length).split('\n')[0] || '').replace(/[:：]\s*$/, '').trim();
+    const detail = actualMatch ? ' — ' + actualMatch[1].trim() : (rest ? ` ${rest.substring(0, 90)}` : '');
+    const summary = `[${platform}]${featurePart}${detail}`.slice(0, 160);
     return summary;
   }
 
@@ -493,7 +495,8 @@ NEVER return null/undefined/empty. Always make a reasonable guess based on the f
   // Treat both null AND empty array as a failed parse — return a fallback ticket
   const ticketsRaw = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
   if (ticketsRaw.length === 0) {
-    const fallbackPlatform = 'iOS Client';
+    // The platform the report names ('[Android Client]…'), not a fixed guess
+    const fallbackPlatform = ((context || '').match(/\[((?:iOS|Android)(?:\s+(?:Client|Coach))?|Web|API|BE|FE)\]/i) || [])[1] || 'API';
     return [{
       summary:             buildFallbackSummary(context, fallbackPlatform),
       priority:            'Medium',
@@ -1315,7 +1318,7 @@ async function inferPlatformFromAssignee(client, slackUserId, fallbackPlatform, 
     if (bucket) console.log(`[QABot] Roster match: ${profile.real_name || profile.display_name} → ${bucket}`);
 
     // 1) Everfit convention: parenthesized role tag in the display name, e.g. "Hong (BE)"
-    const tagMatch = bucket ? null : haystack.match(/\(\s*(be|fe|backend|frontend|ios|android|web|dl|data|ba)\s*\)/i);   // tolerates "( DL )"
+    const tagMatch = bucket ? null : haystack.match(/\(\s*(be|fe|backend|frontend|ios|android|and|adr|web|dl|data|ba)\s*\)/i);   // tolerates "( DL )"; (And) = Android
     if (tagMatch) {
       const tag = tagMatch[1].toLowerCase();
       if      (tag === 'ba')                                            bucket = 'product'; // business analyst
@@ -1323,7 +1326,7 @@ async function inferPlatformFromAssignee(client, slackUserId, fallbackPlatform, 
       else if (tag === 'be' || tag === 'backend')                      bucket = 'api';
       else if (tag === 'fe' || tag === 'frontend' || tag === 'web')    bucket = 'web';
       else if (tag === 'ios')                                          bucket = 'ios';
-      else if (tag === 'android')                                      bucket = 'android';
+      else if (tag === 'android' || tag === 'and' || tag === 'adr')   bucket = 'android';
     }
 
     // 2) Fall back to job title keywords (only if no tag was found)
@@ -2249,8 +2252,13 @@ HARD RULES — follow exactly:
       // accounts'): the card can still be made from the bot's own analysis
       // in this thread instead of failing the request.
       if (!lib.isAiUnavailable(err)) throw err;
-      const fromAnalysis = await ticketFromThreadAnalysis(client, event.channel, event.thread_ts || event.ts, isTask)
-        || await ticketFromReportText(client, event.channel, event.thread_ts || event.ts, isTask);
+      // Cards are drafted by the AI. By default the bot waits for the AI to
+      // come back (see AI_WAIT); AI_DOWN_FALLBACK=analysis|report opts in to
+      // building the card without it.
+      const mode = (process.env.AI_DOWN_FALLBACK || 'off').toLowerCase();
+      const fromAnalysis = mode === 'off' ? null
+        : (await ticketFromThreadAnalysis(client, event.channel, event.thread_ts || event.ts, isTask))
+          || (mode === 'report' ? await ticketFromReportText(client, event.channel, event.thread_ts || event.ts, isTask) : null);
       if (!fromAnalysis) throw err;
       logger.warn(`[QABot] AI unavailable (${(err.message || '').substring(0, 80)}) — drafting the card without AI (${fromAnalysis._from})`);
       tickets = [fromAnalysis];
@@ -2794,6 +2802,12 @@ HARD RULES — follow exactly:
     await agentSt?.done();
     await bootSt?.done();
     const aiDown = lib.isAiUnavailable(err);
+    if (aiDown) {
+      // A retry of a waiting job that hit the outage again: keep waiting quietly
+      if (event._aiJobId && AI_WAIT_JOBS.has(event._aiJobId)) { AI_WAIT_JOBS.get(event._aiJobId).running = false; return; }
+      await queueForAi(client, event, errDetail);
+      return;
+    }
     const errText = aiDown
       ? `The AI service I use is unavailable right now (\`${errDetail.substring(0, 140)}\`), so I couldn't draft the card — nothing was created. It's an outage on that service, not this request.`
       : `I hit an error while working on this and couldn't finish: \`${errDetail}\``;
@@ -3179,6 +3193,92 @@ async function ticketFromReportText(client, channel, threadTs, isTask) {
     return { type: isTask ? 'Task' : 'Bug', summary, description, priority, platform, acceptance_criteria: [], _from: 'report' };
   } catch { return null; }
 }
+
+// ── Waiting for the AI service ───────────────────────────────────────
+// When the AI is down, a create request isn't failed or built without it:
+// it waits, and runs (AI-drafted) as soon as the service answers again.
+const AI_WAIT_JOBS = new Map();          // id → { event, msg: {channel, ts}, since, running }
+const AI_RETRY_EVERY_MS = parseInt(process.env.AI_RETRY_EVERY_MS || '180000', 10);   // 3 min
+const AI_WAIT_MAX_MS    = parseInt(process.env.AI_WAIT_MAX_MS    || '7200000', 10);  // 2 h
+
+async function queueForAi(client, event, errDetail) {
+  const id = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  const text = `The AI service I use is down right now (\`${String(errDetail).substring(0, 110)}\`). ` +
+    `I'll create this card as soon as it's back — checking every ${Math.max(1, Math.round(AI_RETRY_EVERY_MS / 60000))} min, for up to ${Math.max(1, Math.round(AI_WAIT_MAX_MS / 3600000))} hours.`;
+  const res = await client.chat.postMessage({ channel: event.channel, thread_ts: event.thread_ts || event.ts, text,
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }, { type: 'actions', elements: [
+      { type: 'button', style: 'primary', action_id: 'qa_ai_wait_now', value: id, text: { type: 'plain_text', text: 'Try now' } },
+      { type: 'button', action_id: 'qa_ai_wait_cancel', value: id, text: { type: 'plain_text', text: 'Cancel' } },
+    ] }] }).catch(() => null);
+  AI_WAIT_JOBS.set(id, { event: { ...event, _synthetic: true, _aiJobId: id }, msg: res ? { channel: event.channel, ts: res.ts } : null, since: Date.now(), running: false });
+  ensureAiWaiter(client);
+  console.warn(`[AI] Queued request ${event.ts} until the AI service is back (${AI_WAIT_JOBS.size} waiting)`);
+}
+
+const updateWaitMsg = (client, job, text, blocks) => job.msg && client.chat.update({ channel: job.msg.channel, ts: job.msg.ts, text,
+  blocks: blocks || [{ type: 'section', text: { type: 'mrkdwn', text } }] }).catch(() => {});
+
+async function runWaitingJob(client, id, logger = console) {
+  const job = AI_WAIT_JOBS.get(id);
+  if (!job || job.running) return;
+  job.running = true;
+  await updateWaitMsg(client, job, 'The AI service is back — creating the card now…');
+  await coreMentionHandler({ event: job.event, client, logger });
+  // Still waiting (it hit the outage again) → restore the waiting message; else done
+  if (AI_WAIT_JOBS.has(id) && !AI_WAIT_JOBS.get(id).running && Date.now() - job.since < AI_WAIT_MAX_MS) {
+    await updateWaitMsg(client, job, "Still waiting for the AI service — I'll keep checking.", [
+      { type: 'section', text: { type: 'mrkdwn', text: "Still waiting for the AI service — I'll keep checking." } },
+      { type: 'actions', elements: [
+        { type: 'button', style: 'primary', action_id: 'qa_ai_wait_now', value: id, text: { type: 'plain_text', text: 'Try now' } },
+        { type: 'button', action_id: 'qa_ai_wait_cancel', value: id, text: { type: 'plain_text', text: 'Cancel' } }] }]);
+    return;
+  }
+  if (job.msg) await client.chat.delete({ channel: job.msg.channel, ts: job.msg.ts }).catch(() => {});
+  AI_WAIT_JOBS.delete(id);
+}
+
+let _aiWaiter = null;
+function ensureAiWaiter(client) {
+  if (_aiWaiter) return;
+  _aiWaiter = setInterval(async () => {
+    if (!AI_WAIT_JOBS.size) { clearInterval(_aiWaiter); _aiWaiter = null; return; }
+    // Give up on jobs waiting too long
+    for (const [id, job] of AI_WAIT_JOBS) {
+      if (Date.now() - job.since >= AI_WAIT_MAX_MS && !job.running) {
+        AI_WAIT_JOBS.delete(id);
+        const t = `The AI service was still down after ${Math.round(AI_WAIT_MAX_MS / 3600000)} hours, so I stopped waiting — nothing was created.`;
+        await updateWaitMsg(client, job, t, [{ type: 'section', text: { type: 'mrkdwn', text: t } }, tryAgainBlock(job.event)]);
+      }
+    }
+    if (!AI_WAIT_JOBS.size) return;
+    // Is it back? One cheap call.
+    try {
+      await aiComplete({ model: 'gpt-4o-mini', max_tokens: 5, messages: [{ role: 'user', content: 'ping' }], __timeoutMs: 20000 });
+    } catch (err) {
+      if (lib.isAiUnavailable(err)) return;           // still down
+    }
+    console.log(`[AI] Service is back — running ${AI_WAIT_JOBS.size} waiting request(s)`);
+    for (const id of [...AI_WAIT_JOBS.keys()]) await runWaitingJob(client, id);
+  }, AI_RETRY_EVERY_MS);
+  _aiWaiter.unref?.();
+}
+
+slackApp.action('qa_ai_wait_now', async ({ ack, body, client, logger }) => {
+  await ack();
+  const id = body.actions?.[0]?.value;
+  if (!AI_WAIT_JOBS.has(id)) {
+    await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: 'Nothing waiting',
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'This request is no longer waiting (done, cancelled, or I restarted).' } }] }).catch(() => {});
+    return;
+  }
+  await runWaitingJob(client, id, logger);
+});
+slackApp.action('qa_ai_wait_cancel', async ({ ack, body, client }) => {
+  await ack();
+  AI_WAIT_JOBS.delete(body.actions?.[0]?.value);
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: 'Cancelled',
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `Cancelled by <@${body.user?.id}> — I won't create this card.` } }] }).catch(() => {});
+});
 
 // ── Bulk status move: checklist → Confirm ────────────────────────────
 const BULK_MOVE_JOBS = new Map();
