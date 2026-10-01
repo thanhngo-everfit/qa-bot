@@ -969,6 +969,30 @@ async function setAnnouncementField(client, channel, ts, key, value) {
   return { ok: true, remaining: announcementTbd(text) };
 }
 
+// Edits don't notify anyone, so every update is also said in the thread;
+// once nothing is TBD, the complete info is posted once, with the
+// announcement's own team tags, so everyone aligns on the final version.
+const FINAL_POSTED = new Set();
+async function afterAnnouncementUpdate(client, channel, ts, key, value, who) {
+  const label = TBD_FIELDS[key].replace('Set up ', '');
+  const shown = String(value).trim().split(/\n+/).map(s => s.trim()).filter(Boolean).join(' ');
+  const p = ((await client.conversations.replies({ channel, ts, limit: 200 }).catch(() => ({ messages: [] }))).messages || []);
+  const parent = p[0];
+  const remaining = announcementTbd(parent?.text);
+  // A change AFTER the final info went out must reach everyone again
+  const wasFinal = FINAL_POSTED.has(ts) || p.some(m => m.bot_id && /^\*Final release info/.test(m.text || ''));
+  const teamTags = wasFinal ? [...new Set(((parent?.text || '').match(/<!subteam\^[A-Z0-9]+(?:\|[^>]*)?>/g) || []))].join(' ') : '';
+  await client.chat.postMessage({ channel, thread_ts: ts, unfurl_links: false,
+    text: `${wasFinal ? `${teamTags} *Change to the final release info* — ` : 'Release info updated — '}*${label}:* ${shown} (by <@${who}>)` +
+      `${remaining.length ? `\nStill TBD: ${remaining.map(k => TBD_FIELDS[k].replace('Set up ', '')).join(', ')}` : ''}` }).catch(() => {});
+  if (remaining.length || !parent) return;
+  // Complete → the final release info, once (the thread survives restarts; memory doesn't)
+  if (FINAL_POSTED.has(ts) || p.some(m => m.bot_id && /^\*Final release info/.test(m.text || ''))) { FINAL_POSTED.add(ts); return; }
+  FINAL_POSTED.add(ts);
+  const final = parent.text.replace(/^\*Em gửi release cho ([^*]+)\*/, (m, fam) => `*Final release info — ${fam}* (all confirmed)`);
+  await client.chat.postMessage({ channel, thread_ts: ts, unfurl_links: false, text: final }).catch(() => {});
+}
+
 // Typed: 'update description to: …', 'set optional update', 'force update'
 async function handleAnnouncementEdit({ event, client }) {
   if (!event.thread_ts) return false;
@@ -981,9 +1005,8 @@ async function handleAnnouncementEdit({ event, client }) {
   const key = desc ? 'desc' : 'force';
   const value = desc ? desc[1] : (force[1].toLowerCase() === 'force' ? 'Force Update' : 'Optional Update');
   const r = await setAnnouncementField(client, event.channel, event.thread_ts, key, value);
-  await client.chat.postMessage({ channel: event.channel, thread_ts: event.thread_ts, unfurl_links: false,
-    text: r.ok ? `Updated the announcement — *${TBD_FIELDS[key].replace('Set up ', '')}:* ${value.replace(/\n+/g, ' ')}${r.remaining.length ? `\nStill TBD: ${r.remaining.map(k => TBD_FIELDS[k].replace('Set up ', '')).join(', ')}` : ''}`
-                : `I couldn't update it: ${r.reason}.` });
+  if (!r.ok) { await client.chat.postMessage({ channel: event.channel, thread_ts: event.thread_ts, text: `I couldn't update it: ${r.reason}.` }); return true; }
+  await afterAnnouncementUpdate(client, event.channel, event.thread_ts, key, value, event.user);
   return true;
 }
 
@@ -1370,6 +1393,7 @@ function register(slackApp) {
     const r = await setAnnouncementField(client, meta.c, meta.ts, 'force', choice);
     if (!r.ok) { await client.chat.postEphemeral({ channel: body.channel.id, user: body.user.id, text: `I couldn't update it: ${r.reason}.` }).catch(() => {}); return; }
     await refreshTbdPrompt(client, body, meta, body.user.id);
+    await afterAnnouncementUpdate(client, meta.c, meta.ts, 'force', choice, body.user.id);
   });
   slackApp.action('rel_tbd_desc', async ({ ack, body, client }) => {
     await ack();
@@ -1387,6 +1411,7 @@ function register(slackApp) {
     const r = await setAnnouncementField(client, meta.c, meta.ts, 'desc', value);
     if (!r.ok) { await client.chat.postMessage({ channel: meta.c, thread_ts: meta.ts, text: `I couldn't update the description: ${r.reason}.` }).catch(() => {}); return; }
     await refreshTbdPrompt(client, { channel: { id: meta.promptCh }, message: { ts: meta.promptTs } }, meta, body.user.id);
+    await afterAnnouncementUpdate(client, meta.c, meta.ts, 'desc', value, body.user.id);
   });
 
   slackApp.action('rel_skip', async ({ ack, body, client }) => {
