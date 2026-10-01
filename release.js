@@ -742,6 +742,18 @@ async function remindPending(client) {
   }).catch(err => console.warn('[Release] reminder failed:', err.data?.error || err.message));
 }
 
+const TBD_ASKED = new Map();   // announcement ts → last 'YYYY-MM-DD hh' asked
+async function remindTbd(client, { releaseDayOnly = false } = {}) {
+  const today = isoDay(vnNow()), slot = `${today} ${vnNow().getUTCHours() >= 14 ? 'pm' : 'am'}`;
+  for (const [, a] of ANNOUNCED) {
+    if (!a.ts || a.byPC || !a.releaseDate || a.releaseDate < today) continue;
+    if (releaseDayOnly && a.releaseDate !== today) continue;
+    if (TBD_ASKED.get(a.ts) === slot) continue;
+    TBD_ASKED.set(a.ts, slot);
+    await askForTbd(client, RELEASE_CHANNEL, a.ts);
+  }
+}
+
 async function postReadiness(client, logger = console) {
   const today = isoDay(vnNow());
   for (const [key, a] of ANNOUNCED) {
@@ -785,7 +797,7 @@ async function recoverAnnounced(client) {
   }
 }
 
-let _lastDraftDay = null, _lastReadyDay = null, _lastRemindDay = null;
+let _lastDraftDay = null, _lastReadyDay = null, _lastRemindDay = null, _lastTbdPmDay = null;
 function startScheduler(client) {
   setTimeout(() => recoverAnnounced(client), 20000);
   setInterval(async () => {
@@ -793,7 +805,8 @@ function startScheduler(client) {
       const vn = vnNow(), day = isoDay(vn), dow = vn.getUTCDay(), hm = vn.getUTCHours() * 60 + vn.getUTCMinutes();
       if (dow === 0 || dow === 6) return;
       if (hm >= 9 * 60 + 30 && _lastDraftDay !== day) { _lastDraftDay = day; await draftUpcoming(client); await alertVersionIssues(client); }
-      if (hm >= 10 * 60 && _lastReadyDay !== day)     { _lastReadyDay = day; await postReadiness(client); }
+      if (hm >= 10 * 60 && _lastReadyDay !== day)     { _lastReadyDay = day; await postReadiness(client); await remindTbd(client); }
+      if (hm >= 14 * 60 && _lastTbdPmDay !== day)     { _lastTbdPmDay = day; await remindTbd(client, { releaseDayOnly: true }); }
       if (hm >= 15 * 60 && _lastRemindDay !== day)    { _lastRemindDay = day; await remindPending(client); }
     } catch (err) {
       console.warn('[Release] scheduler error:', err.message);
@@ -887,6 +900,70 @@ async function recheckThread({ event, client }) {
     await st.done();
     await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: `I couldn't check the cards in Jira: \`${(err.message || '').substring(0, 160)}\`` });
   }
+  return true;
+}
+
+// ── TBD items on a release announcement ──────────────────────────────
+// An announcement posted with 'Description: TBD' / 'Force/Optional Update:
+// TBD' is chased by the bot — tagging the approvers in its thread with the
+// controls to fill them in — instead of the PC asking by hand. Answers (or
+// typed 'update description to: …') edit the announcement in place.
+const TBD_FIELDS = { desc: 'Description', force: 'Set up Force/Optional Update' };
+function announcementTbd(text) {
+  const t = text || '';
+  return Object.entries(TBD_FIELDS).filter(([, label]) => new RegExp(`•\\s*${label.replace(/[/]/g, '\\/')}:\\s*TBD\\s*$`, 'mi').test(t)).map(([k]) => k);
+}
+function tbdPromptBlocks(channel, ts, missing) {
+  const names = missing.map(k => `*${TBD_FIELDS[k].replace('Set up ', '')}*`).join(', ');
+  const text = `${RELEASE_APPROVERS.map(u => `<@${u}>`).join(' ')} still needed for this release: ${names}`;
+  const meta = JSON.stringify({ c: channel, ts });
+  const elements = [];
+  if (missing.includes('desc')) elements.push({ type: 'button', style: 'primary', action_id: 'rel_tbd_desc', value: meta, text: { type: 'plain_text', text: 'Set description' } });
+  if (missing.includes('force')) elements.push({ type: 'static_select', action_id: 'rel_tbd_force', placeholder: { type: 'plain_text', text: 'Force / Optional update' },
+    options: ['Optional Update', 'Force Update', 'N/A'].map(o => ({ text: { type: 'plain_text', text: o }, value: `${o}|${meta}`.substring(0, 150) })) });
+  return { text, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }, { type: 'actions', elements }] };
+}
+async function askForTbd(client, channel, ts, logger = console) {
+  try {
+    const p = ((await client.conversations.replies({ channel, ts, limit: 1 })).messages || [])[0];
+    const missing = announcementTbd(p?.text);
+    if (!missing.length) return false;
+    await client.chat.postMessage({ channel, thread_ts: ts, unfurl_links: false, ...tbdPromptBlocks(channel, ts, missing) });
+    return true;
+  } catch (err) { logger.warn?.('[Release] TBD prompt failed:', err.message); return false; }
+}
+
+// Edit one field of the bot's announcement in place
+async function setAnnouncementField(client, channel, ts, key, value) {
+  const p = ((await client.conversations.replies({ channel, ts, limit: 1 })).messages || [])[0];
+  if (!p || !/Em gửi release cho/.test(p.text || '')) return { ok: false, reason: "that thread isn't a release announcement" };
+  const { user_id: botUid } = await client.auth.test();
+  if (p.user !== botUid) return { ok: false, reason: 'the announcement was posted by a person, so I can\'t edit it — update it by hand' };
+  const label = TBD_FIELDS[key];
+  const lines = String(value).trim().split(/\n+/).map(s => s.trim()).filter(Boolean);
+  const rendered = lines.length > 1 ? `\n${lines.map(l => `    ◦ ${l}`).join('\n')}` : ` ${lines[0] || 'TBD'}`;
+  const re = new RegExp(`(•\\s*${label.replace(/[/]/g, '\\/')}:)[^\\n]*((?:\\n\\s{4}◦[^\\n]*)*)`, 'i');
+  if (!re.test(p.text)) return { ok: false, reason: `the announcement has no ${label} line` };
+  const text = p.text.replace(re, `$1${rendered}`);
+  await client.chat.update({ channel, ts, text, unfurl_links: false });
+  return { ok: true, remaining: announcementTbd(text) };
+}
+
+// Typed: 'update description to: …', 'set optional update', 'force update'
+async function handleAnnouncementEdit({ event, client }) {
+  if (!event.thread_ts) return false;
+  const raw = (event.text || '').replace(/<@[A-Z0-9]+(?:\|[^>]*)?>/g, '').trim();
+  const desc = raw.match(/\b(?:update|set|change|add)\s+(?:the\s+)?description\s*(?:to|=|:)?\s*:?\s*([\s\S]+)$/i);
+  const force = !desc && /\b(?:set|use|update|choose|mark|chọn)?\b[\s\S]{0,15}\b(force|optional)\s*update\b/i.exec(raw);
+  if (!desc && !force) return false;
+  const p = ((await client.conversations.replies({ channel: event.channel, ts: event.thread_ts, limit: 1 }).catch(() => ({ messages: [] }))).messages || [])[0];
+  if (!p || !/Em gửi release cho/.test(p.text || '')) return false;            // not an announcement thread → not ours
+  const key = desc ? 'desc' : 'force';
+  const value = desc ? desc[1] : (force[1].toLowerCase() === 'force' ? 'Force Update' : 'Optional Update');
+  const r = await setAnnouncementField(client, event.channel, event.thread_ts, key, value);
+  await client.chat.postMessage({ channel: event.channel, thread_ts: event.thread_ts, unfurl_links: false,
+    text: r.ok ? `Updated the announcement — *${TBD_FIELDS[key].replace('Set up ', '')}:* ${value.replace(/\n+/g, ' ')}${r.remaining.length ? `\nStill TBD: ${r.remaining.map(k => TBD_FIELDS[k].replace('Set up ', '')).join(', ')}` : ''}`
+                : `I couldn't update it: ${r.reason}.` });
   return true;
 }
 
@@ -1196,6 +1273,39 @@ function register(slackApp) {
     }
   });
 
+  const refreshTbdPrompt = async (client, body, meta, who) => {
+    const p = ((await client.conversations.replies({ channel: meta.c, ts: meta.ts, limit: 1 })).messages || [])[0];
+    const missing = announcementTbd(p?.text);
+    const done = `All set — the announcement is complete (filled in by <@${who}>).`;
+    await client.chat.update({ channel: body.channel?.id || meta.c, ts: body.message?.ts || meta.promptTs, ...(missing.length ? tbdPromptBlocks(meta.c, meta.ts, missing)
+      : { text: done, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: done } }] }) }).catch(() => {});
+  };
+  slackApp.action('rel_tbd_force', async ({ ack, body, client }) => {
+    await ack();
+    const [choice, metaRaw] = (body.actions?.[0]?.selected_option?.value || '').split(/\|(.+)/);
+    let meta = {}; try { meta = JSON.parse(metaRaw); } catch (_) {}
+    const r = await setAnnouncementField(client, meta.c, meta.ts, 'force', choice);
+    if (!r.ok) { await client.chat.postEphemeral({ channel: body.channel.id, user: body.user.id, text: `I couldn't update it: ${r.reason}.` }).catch(() => {}); return; }
+    await refreshTbdPrompt(client, body, meta, body.user.id);
+  });
+  slackApp.action('rel_tbd_desc', async ({ ack, body, client }) => {
+    await ack();
+    let meta = {}; try { meta = JSON.parse(body.actions?.[0]?.value || '{}'); } catch (_) {}
+    await client.views.open({ trigger_id: body.trigger_id, view: {
+      type: 'modal', callback_id: 'rel_tbd_desc_submit', private_metadata: JSON.stringify({ ...meta, promptTs: body.message?.ts, promptCh: body.channel?.id }),
+      title: { type: 'plain_text', text: 'Release description' }, submit: { type: 'plain_text', text: 'Save' },
+      blocks: [{ type: 'input', block_id: 'd', label: { type: 'plain_text', text: 'Store description (one line per point)' },
+        element: { type: 'plain_text_input', action_id: 'v', multiline: true, placeholder: { type: 'plain_text', text: 'Community Forum updates.\nOther fixes and improvements.' } } }] } }).catch(() => {});
+  });
+  slackApp.view('rel_tbd_desc_submit', async ({ ack, view, body, client }) => {
+    await ack();
+    let meta = {}; try { meta = JSON.parse(view.private_metadata || '{}'); } catch (_) {}
+    const value = view.state?.values?.d?.v?.value || '';
+    const r = await setAnnouncementField(client, meta.c, meta.ts, 'desc', value);
+    if (!r.ok) { await client.chat.postMessage({ channel: meta.c, thread_ts: meta.ts, text: `I couldn't update the description: ${r.reason}.` }).catch(() => {}); return; }
+    await refreshTbdPrompt(client, { channel: { id: meta.promptCh }, message: { ts: meta.promptTs } }, meta, body.user.id);
+  });
+
   slackApp.action('rel_skip', async ({ ack, body, client }) => {
     await ack();
     const id = body.actions?.[0]?.value;
@@ -1252,6 +1362,7 @@ function register(slackApp) {
     DRAFTS.delete(id);
     const link = `https://everfitt.slack.com/archives/${RELEASE_CHANNEL}/p${posted.ts.replace('.', '')}`;
     POSTED.set(id, { by: body.user.id, link });
+    await askForTbd(client, RELEASE_CHANNEL, posted.ts, logger);
     await client.chat.update({ channel: st.channel, ts: st.ts, text: 'Posted',
       blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `Approved by <@${body.user.id}> and posted the ${fresh.group.family} release to <#${RELEASE_CHANNEL}> — <${link}|view>. I'll post readiness in its thread each morning until release day.` } }] }).catch(() => {});
     logger?.info?.(`[Release] Approved and posted ${st.groupKey}`);
@@ -1259,7 +1370,7 @@ function register(slackApp) {
 }
 
 module.exports = {
-  register, startScheduler, isReleaseCommand, handleCommand, recheckThread, isPagesCommand, handlePagesCommand,
+  register, startScheduler, isReleaseCommand, handleCommand, recheckThread, isPagesCommand, handlePagesCommand, handleAnnouncementEdit, askForTbd, announcementTbd, setAnnouncementField,
   // exported for tests
   versionFamily, upcomingWorkdays, itemLabel, renderAnnouncement, renderReadiness, buildDraft, upcomingGroups,
   versionTagRegex, findCandidates, moveToVersion, PLACEHOLDER_VERSION_IDS, draftUpcoming, remindPending,
