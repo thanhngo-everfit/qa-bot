@@ -937,11 +937,22 @@ function tbdPromptBlocks(channel, ts, missing) {
   const names = missing.map(k => `*${TBD_FIELDS[k].replace('Set up ', '')}*`).join(', ');
   const text = `${RELEASE_APPROVERS.map(u => `<@${u}>`).join(' ')} still needed for this release: ${names}`;
   const meta = JSON.stringify({ c: channel, ts });
-  const elements = [];
-  if (missing.includes('desc')) elements.push({ type: 'button', style: 'primary', action_id: 'rel_tbd_desc', value: meta, text: { type: 'plain_text', text: 'Set description' } });
-  if (missing.includes('force')) elements.push({ type: 'static_select', action_id: 'rel_tbd_force', placeholder: { type: 'plain_text', text: 'Force / Optional update' },
-    options: ['Optional Update', 'Force Update', 'N/A'].map(o => ({ text: { type: 'plain_text', text: o }, value: `${o}|${meta}`.substring(0, 150) })) });
-  return { text, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }, { type: 'actions', elements }] };
+  const blocks = [{ type: 'section', text: { type: 'mrkdwn', text } }];
+  if (missing.includes('desc')) {
+    // Write it right here — one line per point
+    blocks.push({ type: 'input', block_id: 'rel_tbd_desc_in', optional: true, label: { type: 'plain_text', text: 'Description' },
+      element: { type: 'plain_text_input', action_id: 'v', multiline: true, placeholder: { type: 'plain_text', text: 'Write description' } } });
+    blocks.push({ type: 'actions', elements: [{ type: 'button', style: 'primary', action_id: 'rel_tbd_save_desc', value: meta, text: { type: 'plain_text', text: 'Save description' } }] });
+  }
+  if (missing.includes('force')) {
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '*Force/Optional update:*' } });
+    blocks.push({ type: 'actions', elements: [
+      { type: 'button', action_id: 'rel_tbd_upd_optional', value: meta, text: { type: 'plain_text', text: 'Optional update' } },
+      { type: 'button', action_id: 'rel_tbd_upd_required', value: meta, text: { type: 'plain_text', text: 'Required update' } },
+      { type: 'button', action_id: 'rel_tbd_upd_none', value: meta, text: { type: 'plain_text', text: 'No update set' } },
+    ] });
+  }
+  return { text, blocks };
 }
 async function askForTbd(client, channel, ts, logger = console) {
   try {
@@ -1397,6 +1408,30 @@ function register(slackApp) {
     await client.chat.update({ channel: body.channel?.id || meta.c, ts: body.message?.ts || meta.promptTs, ...(missing.length ? tbdPromptBlocks(meta.c, meta.ts, missing)
       : { text: done, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: done } }] }) }).catch(() => {});
   };
+  // Force/Optional: three buttons
+  const UPDATE_CHOICES = { rel_tbd_upd_optional: 'Optional Update', rel_tbd_upd_required: 'Force Update', rel_tbd_upd_none: 'No update set' };
+  for (const [actionId, choice] of Object.entries(UPDATE_CHOICES)) {
+    slackApp.action(actionId, async ({ ack, body, client }) => {
+      await ack();
+      let meta = {}; try { meta = JSON.parse(body.actions?.[0]?.value || '{}'); } catch (_) {}
+      const r = await setAnnouncementField(client, meta.c, meta.ts, 'force', choice);
+      if (!r.ok) { await client.chat.postEphemeral({ channel: body.channel.id, user: body.user.id, text: `I couldn't update it: ${r.reason}.` }).catch(() => {}); return; }
+      await refreshTbdPrompt(client, body, meta, body.user.id);
+      await afterAnnouncementUpdate(client, meta.c, meta.ts, 'force', choice, body.user.id);
+    });
+  }
+  // Description: the box in the message + Save
+  slackApp.action('rel_tbd_save_desc', async ({ ack, body, client }) => {
+    await ack();
+    let meta = {}; try { meta = JSON.parse(body.actions?.[0]?.value || '{}'); } catch (_) {}
+    const value = (body.state?.values?.rel_tbd_desc_in?.v?.value || '').trim();
+    if (!value) { await client.chat.postEphemeral({ channel: body.channel.id, user: body.user.id, text: 'Write the description in the box first, then press Save.' }).catch(() => {}); return; }
+    const r = await setAnnouncementField(client, meta.c, meta.ts, 'desc', value);
+    if (!r.ok) { await client.chat.postEphemeral({ channel: body.channel.id, user: body.user.id, text: `I couldn't update it: ${r.reason}.` }).catch(() => {}); return; }
+    await refreshTbdPrompt(client, body, meta, body.user.id);
+    await afterAnnouncementUpdate(client, meta.c, meta.ts, 'desc', value, body.user.id);
+  });
+
   slackApp.action('rel_tbd_force', async ({ ack, body, client }) => {
     await ack();
     const [choice, metaRaw] = (body.actions?.[0]?.selected_option?.value || '').split(/\|(.+)/);
