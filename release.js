@@ -890,6 +890,167 @@ async function recheckThread({ event, client }) {
   return true;
 }
 
+// ── Confluence release pages (overview + checklist), on request ──────
+// Mirrors the QA team's manual routine (everfit-release-pages): under
+// 'Core Product - 2026 Release Report', an overview page with the live Jira
+// table for the fix version, and a checklist page cloned from the platform's
+// master checklist with QA1 / QA2 / Dev mentioned in the header. Mobile:
+// one pair of pages per app version.
+const CONF = {
+  spaceId: process.env.CONF_SPACE_ID || '65552',                 // EV
+  folderId: process.env.CONF_RELEASE_FOLDER_ID || '3685581182',  // Core Product - 2026 Release Report
+  jiraCloudId: '1aa4c658-dad4-4e7e-9458-49735d9d69ca',
+  datasourceId: 'd8b75300-dfda-4519-b6cd-e49abbd50401',
+  templates: { Web: '532512807', API: '685047876', Android: '532611245', iOS: '532545601' },
+};
+const PAGES_RE = /\b(?:create|make|tạo|generate)\b[\s\S]{0,40}?\b(?:release\s+)?(?:checklists?|release\s+pages?|confluence)\b|^\s*checklist\b/i;
+function isPagesCommand(text) { return PAGES_RE.test((text || '').replace(/<@[A-Z0-9]+(?:\|[^>]*)?>/g, '').trim()); }
+
+const templateFor = (versionName) => {
+  const f = versionFamily(versionName);
+  if (/white label|challenger/i.test(versionName)) return null;
+  return CONF.templates[f] ? { family: f, pageId: CONF.templates[f] } : null;
+};
+const longDate = (iso) => new Date(`${iso}T00:00:00Z`).toLocaleString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+const confHeaders = () => ({ Authorization: jiraAuth(), Accept: 'application/json', 'Content-Type': 'application/json' });
+const uuid = () => require('crypto').randomUUID();
+
+// Slack ↔ Jira people
+let _slackUsers = null, _slackUsersAt = 0;
+async function slackIdByName(client, name) {
+  if (!name) return null;
+  if (!_slackUsers || Date.now() - _slackUsersAt > 3600e3) {
+    _slackUsers = [];
+    let cursor;
+    for (let i = 0; i < 10; i++) {
+      const r = await client.users.list({ limit: 200, cursor }).catch(() => null);
+      if (!r) break;
+      _slackUsers.push(...(r.members || []).filter(m => !m.deleted && !m.is_bot));
+      cursor = r.response_metadata?.next_cursor;
+      if (!cursor) break;
+    }
+    _slackUsersAt = Date.now();
+  }
+  const norm = (s) => String(s || '').toLowerCase().replace(/\s*\(.*?\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
+  const n = norm(name);
+  const hit = _slackUsers.find(u => [u.real_name, u.profile?.real_name, u.profile?.display_name].some(x => norm(x) === n));
+  return hit?.id || null;
+}
+async function jiraAccountForSlack(client, slackId) {
+  try {
+    const email = (await client.users.info({ user: slackId })).user?.profile?.email;
+    if (!email) return null;
+    const r = await axios.get(`${JIRA_HOST}/rest/api/3/user/search`, { params: { query: email }, headers: headers() });
+    const u = (r.data || [])[0];
+    return u ? { accountId: u.accountId, displayName: u.displayName } : null;
+  } catch { return null; }
+}
+
+// Who to pre-select: the QA field on the version's cards, and its main assignee
+async function suggestPeople(client, versionId) {
+  const r = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
+    params: { jql: `fixVersion = ${versionId}`, maxResults: 100, fields: 'assignee,customfield_10131' }, headers: headers(),
+  }).catch(() => ({ data: { issues: [] } }));
+  const count = (vals) => Object.entries(vals.reduce((m, v) => (v ? (m[v] = (m[v] || 0) + 1, m) : m), {})).sort((a, b) => b[1] - a[1]).map(x => x[0]);
+  const issues = r.data?.issues || [];
+  const qas = count(issues.map(i => i.fields?.customfield_10131?.displayName));
+  const devs = count(issues.map(i => i.fields?.assignee?.displayName));
+  return {
+    qa1: await slackIdByName(client, qas[0]), qa2: await slackIdByName(client, qas[1]),
+    dev: await slackIdByName(client, devs.find(d => !qas.includes(d)) || devs[0]),
+  };
+}
+
+function pagesCardBlocks(v, people, by) {
+  const picker = (role, init) => ({ type: 'users_select', action_id: `relpg_${role}`, placeholder: { type: 'plain_text', text: role.toUpperCase() === 'DEV' ? 'Dev' : role.toUpperCase() },
+    ...(init ? { initial_user: init } : {}) });
+  const meta = JSON.stringify({ id: v.id, n: v.name, d: v.releaseDate || null, by });
+  return [
+    { type: 'section', text: { type: 'mrkdwn', text: `Create the Confluence pages for *${esc(v.name)}*${v.releaseDate ? ` (${prettyDate(v.releaseDate)})` : ''}? Pick QA1, QA2 and Dev:` } },
+    { type: 'actions', block_id: `relpg_people`, elements: [picker('qa1', people.qa1), picker('qa2', people.qa2), picker('dev', people.dev)] },
+    { type: 'actions', elements: [
+      { type: 'button', style: 'primary', action_id: 'relpg_create', value: meta.substring(0, 2000), text: { type: 'plain_text', text: 'Create pages' } },
+      { type: 'button', action_id: 'relpg_cancel', value: meta.substring(0, 2000), text: { type: 'plain_text', text: 'Cancel' } },
+    ] },
+  ];
+}
+
+async function handlePagesCommand({ event, client }) {
+  const tTs = event.thread_ts || event.ts;
+  const text = (event.text || '').replace(/<@[A-Z0-9]+(?:\|[^>]*)?>/g, '');
+  const all = await axios.get(`${JIRA_HOST}/rest/api/3/project/${RELEASE_PROJECT}/versions`, { headers: headers() }).then(r => r.data || []).catch(() => []);
+  // 1) versions named in the message, 2) the announcement this thread belongs to
+  let versions = all.filter(v => v.name && new RegExp(`(?:^|[^\\w.])${v.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.])`, 'i').test(text));
+  if (!versions.length && event.thread_ts) {
+    const fromThread = await announcementVersions(client, event.channel, event.thread_ts);
+    if (fromThread) versions = fromThread.map(fv => all.find(v => String(v.id) === String(fv.id)) || { id: fv.id, name: fv.name });
+  }
+  if (!versions.length) {
+    // Nothing named → pick from upcoming / recent versions
+    const today = isoDay(vnNow());
+    const opts = all.filter(v => !v.archived && isRealVersionName(v.name) && templateFor(v.name) && (!v.released || (v.releaseDate && v.releaseDate >= isoDay(new Date(vnNow() - 14 * 864e5)))))
+      .sort((a, b) => Math.abs(new Date(a.releaseDate || '2100-01-01') - new Date(today)) - Math.abs(new Date(b.releaseDate || '2100-01-01') - new Date(today))).slice(0, 25);
+    await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, text: 'Which release?',
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'Which release should I create the Confluence pages for?' } },
+        { type: 'actions', elements: [{ type: 'static_select', action_id: 'relpg_pick_version', placeholder: { type: 'plain_text', text: 'Pick a version' },
+          options: opts.map(v => ({ text: { type: 'plain_text', text: `${v.name}${v.releaseDate ? ` · ${prettyDate(v.releaseDate)}` : ''}`.substring(0, 75) }, value: String(v.id) })) }] }] });
+    return;
+  }
+  for (const v of versions) {
+    if (!templateFor(v.name)) {
+      await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, text: `There's no master checklist for ${v.name} (only Web, API, Android and iOS have one), so I didn't create pages for it.` });
+      continue;
+    }
+    const people = await suggestPeople(client, v.id);
+    await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, text: `Create the Confluence pages for ${v.name}?`, blocks: pagesCardBlocks(v, people, event.user) });
+  }
+}
+
+// Create a Confluence page; a taken title gets ' (2)', ' (3)'…
+async function createConfPage({ title, parentId, representation, value }) {
+  for (let n = 1; n <= 6; n++) {
+    const t = n === 1 ? title : `${title} (${n})`;
+    try {
+      const r = await axios.post(`${JIRA_HOST}/wiki/api/v2/pages`, { spaceId: CONF.spaceId, status: 'current', title: t, parentId,
+        body: { representation, value } }, { headers: confHeaders() });
+      return { id: r.data.id, title: t, url: `${JIRA_HOST}/wiki${r.data._links?.webui || `/spaces/EV/pages/${r.data.id}`}` };
+    } catch (err) {
+      const msg = JSON.stringify(err.response?.data || err.message);
+      if (/title|already exists|duplicate|conflict/i.test(msg) && [400, 409].includes(err.response?.status)) continue;
+      throw new Error(`Confluence ${err.response?.status || ''} ${msg.substring(0, 160)}`);
+    }
+  }
+  throw new Error('every title variant was taken');
+}
+
+function overviewAdf(fixVersionName) {
+  const jql = `fixversion = "${fixVersionName}"`;
+  return { version: 1, type: 'doc', content: [
+    { type: 'paragraph', attrs: { localId: uuid() } },
+    { type: 'heading', attrs: { level: 2, localId: uuid() }, content: [{ type: 'text', text: 'Overview' }] },
+    { type: 'heading', attrs: { level: 2, localId: uuid() }, content: [{ type: 'text', text: 'Issues in this Release' }] },
+    { type: 'blockCard', attrs: { layout: 'full-width', localId: uuid(),
+      url: `${JIRA_HOST}/issues/?jql=${encodeURIComponent(jql).replace(/%20/g, '+')}`,
+      datasource: { id: CONF.datasourceId, parameters: { cloudId: CONF.jiraCloudId, jql },
+        views: [{ type: 'table', properties: { columns: ['issuekey', 'summary', 'issuetype', 'created', 'updated', 'assignee', 'priority', 'status', 'customfield_10202', 'customfield_10131', 'key'].map(key => ({ key })) } }] } } },
+    { type: 'paragraph', attrs: { localId: uuid() } },
+  ] };
+}
+
+// The master checklist, with QA1 / QA2 / Dev mentioned in the header row only
+async function checklistBody(templateId, people) {
+  const r = await axios.get(`${JIRA_HOST}/wiki/api/v2/pages/${templateId}`, { params: { 'body-format': 'storage' }, headers: confHeaders() });
+  let html = r.data?.body?.storage?.value || '';
+  const mention = (acc) => acc ? ` <ac:link><ri:user ri:account-id="${acc.accountId}" /></ac:link>` : '';
+  const unplaced = [];
+  for (const [label, acc] of [['QA1', people.qa1], ['QA2', people.qa2], ['Dev', people.dev]]) {
+    const re = new RegExp(`(<th\\b[^>]*>\\s*<p>\\s*<strong>${label}</strong>)`);
+    if (acc && !re.test(html)) unplaced.push(label);
+    html = html.replace(re, `$1${mention(acc)}`);
+  }
+  return { html, unplaced };
+}
+
 // ── Interactions ─────────────────────────────────────────────────────
 function register(slackApp) {
   slackApp.action('rel_force', async ({ ack, body, client }) => {
@@ -985,6 +1146,56 @@ function register(slackApp) {
     if (!groups.length) await client.chat.postMessage({ channel: p.c || body.channel.id, thread_ts: p.t, text: "I couldn't find those versions unreleased anymore — they may have been released or renamed." }).catch(() => {});
   });
 
+  for (const role of ['qa1', 'qa2', 'dev']) slackApp.action(`relpg_${role}`, async ({ ack }) => { await ack(); });
+  slackApp.action('relpg_pick_version', async ({ ack, body, client }) => {
+    await ack();
+    const id = body.actions?.[0]?.selected_option?.value;
+    const all = await axios.get(`${JIRA_HOST}/rest/api/3/project/${RELEASE_PROJECT}/versions`, { headers: headers() }).then(r => r.data || []).catch(() => []);
+    const v = all.find(x => String(x.id) === String(id));
+    if (!v) return;
+    const people = await suggestPeople(client, v.id);
+    await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: `Create the Confluence pages for ${v.name}?`, blocks: pagesCardBlocks(v, people, body.user?.id) }).catch(() => {});
+  });
+  slackApp.action('relpg_cancel', async ({ ack, body, client }) => {
+    await ack();
+    await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: 'Cancelled',
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `Cancelled by <@${body.user?.id}> — no pages created.` } }] }).catch(() => {});
+  });
+  slackApp.action('relpg_create', async ({ ack, body, client, logger }) => {
+    await ack();
+    let v = {};
+    try { v = JSON.parse(body.actions?.[0]?.value || '{}'); } catch (_) {}
+    const sel = body.state?.values?.relpg_people || {};
+    const slack = { qa1: sel.relpg_qa1?.selected_user, qa2: sel.relpg_qa2?.selected_user, dev: sel.relpg_dev?.selected_user };
+    const show = (text) => client.chat.update({ channel: body.channel.id, ts: body.message.ts, text, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }] }).catch(() => {});
+    const missing = Object.entries(slack).filter(([, id]) => !id).map(([r]) => r.toUpperCase().replace('DEV', 'Dev'));
+    if (missing.length) {
+      await client.chat.postEphemeral({ channel: body.channel.id, user: body.user.id, text: `Pick ${missing.join(', ')} first.` }).catch(() => {});
+      return;
+    }
+    await show(`Creating the Confluence pages for *${esc(v.n)}*… (requested by <@${body.user?.id}>)`);
+    try {
+      const tpl = templateFor(v.n);
+      const people = { qa1: await jiraAccountForSlack(client, slack.qa1), qa2: await jiraAccountForSlack(client, slack.qa2), dev: await jiraAccountForSlack(client, slack.dev) };
+      const date = longDate(v.d || isoDay(vnNow()));
+      const overview = await createConfPage({ title: `${v.n} Release - ${date}`, parentId: CONF.folderId,
+        representation: 'atlas_doc_format', value: JSON.stringify(overviewAdf(v.n)) });
+      const body = await checklistBody(tpl.pageId, people);
+      const checklist = await createConfPage({ title: `Checklist ${v.n} Release - ${date}`, parentId: overview.id,
+        representation: 'storage', value: body.html });
+      const suffix = [overview, checklist].some(p => / \(\d+\)$/.test(p.title)) ? '\n_A page with that title already existed, so I added a number — check for a duplicate._' : '';
+      const noMention = Object.entries(people).filter(([, a]) => !a).map(([r]) => r.toUpperCase().replace('DEV', 'Dev'));
+      await show(`Created the release pages for *${esc(v.n)}* — requested by <@${body.user?.id}>:\n` +
+        `• Overview: <${overview.url}|${esc(overview.title)}>\n• Checklist: <${checklist.url}|${esc(checklist.title)}>\n` +
+        `QA1 <@${slack.qa1}> · QA2 <@${slack.qa2}> · Dev <@${slack.dev}>${suffix}` +
+        (noMention.length ? `\n_I couldn't find ${noMention.join(', ')} in Jira, so the checklist header doesn't mention them — add them by hand._` : '') +
+        (body.unplaced.length ? `\n_The master checklist's header layout changed, so I couldn't place ${body.unplaced.join(', ')} — add the mention${body.unplaced.length > 1 ? 's' : ''} by hand._` : ''));
+      logger?.info?.(`[Release] Confluence pages created for ${v.n}: ${overview.id}, ${checklist.id}`);
+    } catch (err) {
+      await show(`I couldn't create the pages for *${esc(v.n)}*: \`${String(err.message).substring(0, 220)}\``);
+    }
+  });
+
   slackApp.action('rel_skip', async ({ ack, body, client }) => {
     await ack();
     const id = body.actions?.[0]?.value;
@@ -1048,7 +1259,7 @@ function register(slackApp) {
 }
 
 module.exports = {
-  register, startScheduler, isReleaseCommand, handleCommand, recheckThread,
+  register, startScheduler, isReleaseCommand, handleCommand, recheckThread, isPagesCommand, handlePagesCommand,
   // exported for tests
   versionFamily, upcomingWorkdays, itemLabel, renderAnnouncement, renderReadiness, buildDraft, upcomingGroups,
   versionTagRegex, findCandidates, moveToVersion, PLACEHOLDER_VERSION_IDS, draftUpcoming, remindPending,

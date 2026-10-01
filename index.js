@@ -1815,6 +1815,9 @@ const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }
     return;
   }
 
+  // "create release checklist" → Confluence overview + checklist pages
+  if (release.isPagesCommand(event.text)) { await release.handlePagesCommand({ event, client }); return; }
+
   // "check again" in a release announcement thread → readiness from Jira now
   if (event.thread_ts && await release.recheckThread({ event, client })) return;
 
