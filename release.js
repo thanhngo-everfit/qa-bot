@@ -986,11 +986,21 @@ async function afterAnnouncementUpdate(client, channel, ts, key, value, who) {
     text: `${wasFinal ? `${teamTags} *Change to the final release info* — ` : 'Release info updated — '}*${label}:* ${shown} (by <@${who}>)` +
       `${remaining.length ? `\nStill TBD: ${remaining.map(k => TBD_FIELDS[k].replace('Set up ', '')).join(', ')}` : ''}` }).catch(() => {});
   if (remaining.length || !parent) return;
-  // Complete → the final release info, once (the thread survives restarts; memory doesn't)
-  if (FINAL_POSTED.has(ts) || p.some(m => m.bot_id && /^\*Final release info/.test(m.text || ''))) { FINAL_POSTED.add(ts); return; }
+  await postFinalInfo(client, channel, ts, p);
+}
+
+// The final release info, once per announcement — for releases whose info
+// had to be confirmed (mobile: Description / Force-Optional lines).
+async function postFinalInfo(client, channel, ts, msgs = null) {
+  const p = msgs || ((await client.conversations.replies({ channel, ts, limit: 200 }).catch(() => ({ messages: [] }))).messages || []);
+  const parent = p[0];
+  if (!parent || !/Em gửi release cho/.test(parent.text || '')) return false;
+  if (!/•\s*(?:Description|Set up Force\/Optional Update):/i.test(parent.text) || announcementTbd(parent.text).length) return false;
+  if (FINAL_POSTED.has(ts) || p.some(m => m.bot_id && /^\*Final release info/.test(m.text || ''))) { FINAL_POSTED.add(ts); return false; }
   FINAL_POSTED.add(ts);
   const final = parent.text.replace(/^\*Em gửi release cho ([^*]+)\*/, (m, fam) => `*Final release info — ${fam}* (all confirmed)`);
   await client.chat.postMessage({ channel, thread_ts: ts, unfurl_links: false, text: final }).catch(() => {});
+  return true;
 }
 
 // Typed: 'update description to: …', 'set optional update', 'force update'
@@ -1034,6 +1044,7 @@ async function followUpAnnouncement(client, ts) {
     text: d.notReady.length ? `${lead}${renderReadiness(d)}` : `${lead}${renderReadiness(d).replace(/^\*Readiness:\* /, '')}` });
   const tbd = announcementTbd(parent.text);
   if (tbd.length) await askForTbd(client, RELEASE_CHANNEL, ts);
+  else await postFinalInfo(client, RELEASE_CHANNEL, ts);      // complete but never confirmed in the thread
   return { name: vs.map(v => v.name).join(' / '), notReady: d.notReady.length, total: d.total, tbd, ts };
 }
 
