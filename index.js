@@ -2249,11 +2249,12 @@ HARD RULES — follow exactly:
       // accounts'): the card can still be made from the bot's own analysis
       // in this thread instead of failing the request.
       if (!lib.isAiUnavailable(err)) throw err;
-      const fromAnalysis = await ticketFromThreadAnalysis(client, event.channel, event.thread_ts || event.ts, isTask);
+      const fromAnalysis = await ticketFromThreadAnalysis(client, event.channel, event.thread_ts || event.ts, isTask)
+        || await ticketFromReportText(client, event.channel, event.thread_ts || event.ts, isTask);
       if (!fromAnalysis) throw err;
-      logger.warn(`[QABot] AI unavailable (${(err.message || '').substring(0, 80)}) — drafting the card from the thread's analysis`);
+      logger.warn(`[QABot] AI unavailable (${(err.message || '').substring(0, 80)}) — drafting the card without AI (${fromAnalysis._from})`);
       tickets = [fromAnalysis];
-      draftedWithoutAi = true;
+      draftedWithoutAi = fromAnalysis._from;
     }
     const beforeDedup = tickets.length;
     const dedupedTickets = dedupeTickets(tickets);
@@ -2621,7 +2622,8 @@ HARD RULES — follow exactly:
 
     // ── Build Slack response ──────────────────
     const headline = isTask ? `📋 Done — I've created a ${issueType || 'Task'}` : "🐛 Done — I've logged this bug";
-    const aiNote = draftedWithoutAi ? '\n_The AI service was unavailable, so I built this card from the analysis above — worth a quick read in Jira._' : '';
+    const aiNote = draftedWithoutAi
+      ? `\n_The AI service was unavailable, so I built this card from ${draftedWithoutAi === 'analysis' ? 'the analysis above' : 'the report as written'} — worth a quick read in Jira._` : '';
     // Release attachment buffers as soon as uploads are done
     for (const att of attachments) att.buffer = null;
 
@@ -3139,7 +3141,42 @@ async function ticketFromThreadAnalysis(client, channel, threadTs, isTask) {
       `## Reference\n\n* **Slack thread:** https://everfitt.slack.com/archives/${channel}/p${String(threadTs).replace('.', '')}\n* ${reporterLine}`,
     ].filter(Boolean).join('\n\n');
     return { type: isTask ? 'Task' : 'Bug', summary: `[${platform}] ${title.replace(/^\[[^\]]*\]\s*/, '')}`, description,
-             priority, platform, acceptance_criteria: [] };
+             priority, platform, acceptance_criteria: [], _from: 'analysis' };
+  } catch { return null; }
+}
+
+// No analysis either (e.g. a QA post in a squad channel): build the card from
+// the report as written. QA posts already lead with '[Platform][Feature] …',
+// so the first line is the title; the post and the people's replies become
+// the description. Screenshots are attached by the normal pipeline.
+async function ticketFromReportText(client, channel, threadTs, isTask) {
+  try {
+    const rr = await client.conversations.replies({ channel, ts: threadTs, limit: 100 });
+    const msgs = rr.messages || [];
+    const parent = msgs[0];
+    if (!parent || parent.bot_id) return null;
+    const clean = (s) => lib.replaceMentionsCached(String(s || ''))
+      .replace(/<mailto:[^|>]+\|([^>]+)>/g, '$1').replace(/<(https?:[^|>]+)\|[^>]+>/g, '$1').replace(/<(https?:[^>]+)>/g, '$1')
+      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+    await lib.warmUserNames(client, [...new Set(msgs.flatMap(m => [m.user, ...((m.text || '').match(/<@([A-Z0-9]+)/g) || []).map(x => x.slice(2))]).filter(Boolean))]).catch(() => {});
+    // drop leading @people BEFORE names are filled in ('<@U…> [Android Client]…')
+    const body = clean(String(parent.text || '').replace(/^(?:\s*<@[A-Z0-9]+(?:\|[^>]*)?>[\s,]*)+/, '')).trim();
+    const firstLine = body.split('\n').find(l => l.trim()) || '';
+    if (firstLine.length < 8) return null;
+    const tags = (firstLine.match(/^(\s*\[[^\]]+\])+/) || [''])[0];
+    const platform = ((tags.match(/\[([^\]]+)\]/) || [])[1] || 'API').trim();
+    const titleRest = firstLine.slice(tags.length).replace(/[:：]\s*$/, '').trim();
+    const summary = `${tags || `[${platform}]`} ${titleRest || firstLine}`.replace(/\s+/g, ' ').trim().substring(0, 250);
+    const notes = msgs.slice(1).filter(m => !m.bot_id && m.user && !/<@[A-Z0-9]+(?:\|[^>]*)?>\s*(?:create|log|tạo|force)/i.test(m.text || ''))
+      .map(m => `* **${lib.replaceMentionsCached(`<@${m.user}>`).replace(/^@/, '')}:** ${clean(m.text).replace(/\n+/g, ' ')}`);
+    const lower = body.toLowerCase();
+    const priority = /\b(critical|blocker|crash|highest)\b/.test(lower) ? 'High' : /\b(low|lowest|minor|typo)\b/.test(lower) ? 'Low' : 'Medium';
+    const description = [
+      `## Report\n\n${body}`,
+      notes.length ? `## Thread notes\n\n${notes.join('\n')}` : '',
+      `## Reference\n\n* **Slack thread:** https://everfitt.slack.com/archives/${channel}/p${String(threadTs).replace('.', '')}`,
+    ].filter(Boolean).join('\n\n');
+    return { type: isTask ? 'Task' : 'Bug', summary, description, priority, platform, acceptance_criteria: [], _from: 'report' };
   } catch { return null; }
 }
 
