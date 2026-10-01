@@ -2833,6 +2833,13 @@ const coreMentionHandler = async (args) => {
   } finally {
     for (const c of _cleanups) { try { await c(); } catch (_) {} }
     await sweepLeftoverStatuses(args.client, args.event, startedAt);
+    // A request that ended (done, failed, or skipped) must not leave its ⏳:
+    // a leftover ⏳ blocked the next run on the same message as 'already
+    // being handled'. Requests waiting for the AI keep theirs until they run.
+    const waiting = [...AI_WAIT_JOBS.values()].some(j => j.event?.ts === ev.ts && j.event?.channel === ev.channel);
+    if (ev.ts && ev.channel && !waiting) {
+      await args.client.reactions.remove({ channel: ev.channel, name: 'hourglass_flowing_sand', timestamp: ev.ts }).catch(() => {});
+    }
   }
 };
 
@@ -2909,7 +2916,8 @@ async function coreMarkChoice(client, body, line) {
   } catch (_) {}
 }
 async function coreRunSynthetic(client, logger, payload, text, clickerId) {
-  const syntheticEvent = { channel: payload.c, thread_ts: payload.t, ts: payload.t, user: clickerId, text };
+  // A button click is a deliberate re-run, not a duplicate delivery → skip the claim
+  const syntheticEvent = { _synthetic: true, channel: payload.c, thread_ts: payload.t, ts: payload.t, user: clickerId, text };
   await coreMentionHandler({ event: syntheticEvent, client, logger });
 }
 

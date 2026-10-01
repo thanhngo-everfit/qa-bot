@@ -2773,7 +2773,7 @@ slackApp.event('app_mention', withWatchdog('mention', crMentionHandler, 150000,
 // Buttons re-invoke the full mention pipeline with a synthetic event, so
 // every capability (multi-ticket, assignment, status animation) applies.
 async function crRunSynthetic(client, logger, payload, text, clickerId) {
-  const syntheticEvent = { channel: payload.c, thread_ts: payload.t, ts: payload.t, user: clickerId, text };
+  const syntheticEvent = { _synthetic: true, channel: payload.c, thread_ts: payload.t, ts: payload.t, user: clickerId, text };
   await crMentionHandler({ event: syntheticEvent, client, logger });
 }
 
