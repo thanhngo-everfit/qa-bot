@@ -47,7 +47,9 @@ const NOT_A_RELEASE = /^(?:n\s*\/?\s*a|to be confirmed|will not release)\b|\(tbd
 // Web 4.37.1, Academy CMS 0.2.4, API Challenger 1.0.0. Two-part numbers
 // (iOS Coach 2.83) are the team's normal minor format. Anything else —
 // "Training - Mobile cards" — is a PC's draft placeholder.
-const VALID_VERSION_RE = /^(?:(?:iOS|Android)\s+(?:Coach|Client|White Label)|Web|API|Internal API|Academy\s+(?:Web|CMS)|CMS|MP API|(?:Web|API|iOS|Android)\s+Challenger)\s+\d+(?:\.\d+){1,3}$/i;
+// White Label versions may carry a build suffix: 'iOS White Label 3.88.3 (1)'.
+// 'White Label Client …' is NOT a format — White Label versions have no app side.
+const VALID_VERSION_RE = /^(?:(?:(?:iOS|Android)\s+(?:Coach|Client)|Web|API|Internal API|Academy\s+(?:Web|CMS)|CMS|MP API|Landing|Middleware|(?:Web|API|iOS|Android)\s+Challenger)\s+\d+(?:\.\d+){1,3}|(?:iOS|Android)\s+White Label\s+\d+(?:\.\d+){1,3}(?:\s*\(\d+\))?)$/i;
 const isRealVersionName = (name) => VALID_VERSION_RE.test((name || '').trim());
 
 const headers = () => ({ Authorization: jiraAuth(), Accept: 'application/json' });
@@ -583,7 +585,7 @@ function renderVersionCheck(flags) {
   const parts = [
     shipped,
     releasedOpen,
-    section('Draft version names', "not a real \"<Platform> <number>\" version yet — the PC still needs to decide it", flags.draft),
+    section('Version names not in the naming format', 'a draft name, or a typo in the format — rename it to "<Platform> <number>"', flags.draft),
     section('Release date passed', 'still not marked released in Jira — release it, or move the date', flags.overdue),
     section('No release date', 'cards are assigned but the version has no date', flags.noDate),
   ].filter(Boolean);
