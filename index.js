@@ -1878,6 +1878,7 @@ const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }
         `I'm alive.\n` +
         `• build \`${BUILD}\` · up ${upStr} · rss ${Math.round(mem.rss / 1048576)}MB\n` +
         `• AI: ${process.env.OPENAI_BASE_URL ? new URL(process.env.OPENAI_BASE_URL).host : 'api.openai.com'} · smart ${process.env.OPENAI_SMART_MODEL || 'gpt-4o'} · fallback ${process.env.OPENAI_FALLBACK_MODEL || 'gpt-4o-mini'}\n` +
+        `• tools (agent actions): ${await (async () => { const ok = await lib.toolsSupported(); const st = lib.toolsState(); return `${ok ? 'working' : 'NOT available'} — ${st.why}`; })()}\n` +
         (errs ? `• recent errors:\n${errs}` : `• no errors recorded since boot`),
     });
     return;

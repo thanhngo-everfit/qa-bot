@@ -215,28 +215,41 @@ async function aiComplete(paramsIn) {
 // Cached briefly, and an outage never counts as "no tool support": a 503
 // during the probe used to disable the agent's tools until the next restart.
 let _toolsSupported = null, _toolsCheckedAt = 0;
+let _toolsWhy = 'not checked yet';
 async function toolsSupported() {
   if (_toolsSupported === true) return true;
   if (_toolsSupported === false && Date.now() - _toolsCheckedAt < 30 * 60 * 1000) return false;
   try {
+    // Room to think: reasoning models (gpt-5.x / gpt-6) spend tokens before
+    // answering, and a 30-token probe was cut off before any tool call —
+    // read as 'no tool support', which disabled the agent.
     const res = await aiComplete({
-      model: 'gpt-4o-mini', max_tokens: 30,
+      model: 'gpt-4o-mini', max_tokens: 400,
       messages: [{ role: 'user', content: 'Call the ping tool.' }],
       tools: [{ type: 'function', function: { name: 'ping', description: 'test', parameters: { type: 'object', properties: {} } } }],
       tool_choice: 'required',
     });
-    _toolsSupported = !!res.choices?.[0]?.message?.tool_calls?.length;
+    const choice = res.choices?.[0] || {};
+    if (choice.message?.tool_calls?.length) { _toolsSupported = true; _toolsWhy = 'the model called the test tool'; }
+    else if (choice.finish_reason === 'length' || !(choice.message?.content || '').trim()) {
+      // Cut off / empty: inconclusive — don't disable the agent over it
+      _toolsSupported = null; _toolsWhy = `inconclusive (${choice.finish_reason || 'empty reply'}) — assuming tools work`;
+      console.warn(`[AI] Tools probe inconclusive (${choice.finish_reason || 'empty'}) — not disabling the agent`);
+      return true;
+    } else { _toolsSupported = false; _toolsWhy = 'the model answered in text instead of calling the tool'; }
     _toolsCheckedAt = Date.now();
   } catch (err) {
     console.warn('[AI] Tools probe errored:', err.message);
-    if (isAiUnavailable(err)) return false;         // outage: don't remember it — probe again next time
-    _toolsSupported = false;
+    if (isAiUnavailable(err)) { _toolsWhy = `AI unavailable during the check (${String(err.message).substring(0, 80)})`; return false; }
+    if (/tool|function/i.test(err.message || '')) { _toolsSupported = false; _toolsWhy = `the endpoint rejected tools (${String(err.message).substring(0, 100)})`; }
+    else { _toolsWhy = `check failed (${String(err.message).substring(0, 100)}) — assuming tools work`; return true; }
     _toolsCheckedAt = Date.now();
   }
-  if (!_toolsSupported) console.warn('[AI] ⚠️ THIS ENDPOINT DOES NOT SUPPORT FUNCTION CALLING — the agent loop cannot act (read/create/assign in Jira). Check the gateway or switch OPENAI_BASE_URL.');
+  if (!_toolsSupported) console.warn(`[AI] ⚠️ Function calling not available: ${_toolsWhy}`);
   else console.log('[AI] Tools probe OK — function calling supported.');
-  return _toolsSupported;
+  return !!_toolsSupported;
 }
+const toolsState = () => ({ supported: _toolsSupported, why: _toolsWhy });
 
 // Convenience wrapper (system + user → content string)
 async function aiCall(system, userContent, maxTokens = 1000, jsonMode = false, model = 'gpt-4o-mini', timeoutMs = null) {
@@ -1437,7 +1450,7 @@ module.exports = {
   shutdownLiveStatuses, LIVE_STATUSES, getMonthlyTbdVersion, listOpenEpics, setIssueParent,
   getLastActiveSprint, getVersionName, getIssueTitle, bulkSetParentForChannel, BULK_MOVE_RE, isBulkMoveRequest, resolveEpicCandidate,
   isNoTicketReportRequest, findThreadsWithoutTickets, isBulkCreateRequest, BULK_CREATE_RE, postLabel,
-  parseBulkMove, getIssueBrief, logWork, fmtDuration, withRequesterTag, ownText, isAiUnavailable,
+  parseBulkMove, getIssueBrief, logWork, fmtDuration, withRequesterTag, ownText, isAiUnavailable, toolsState,
   CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, challengerEpicFor, challengerSummary,
   LOW_PRIORITY_SPRINT_ID, LOW_PRIORITY_STATUS, LOW_PRIORITIES, LOW_PRIORITY_RULES, lowPriorityRule, getSprintInfo, transitionToStatus,
   PROJECT_BOARDS, getActiveSprintForProject,
