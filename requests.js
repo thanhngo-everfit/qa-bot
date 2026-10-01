@@ -128,6 +128,59 @@ function readThread(msgs, botUid) {
   return { parent, finished, pending, remindersForStep, blocker, mine, cancelled };
 }
 
+// ── The person in charge, not the whole group ────────────────────────
+// A step often tags a group ('@qa Let's do the smoke test…'). The person in
+// charge of THIS release for that role is usually known from the thread:
+// who clicked or was named in the earlier steps of that role, or posted the
+// checklist (QA) / the action items (dev). Else Jira: the QA field (QA) or
+// the main assignee (dev) on the version's cards. Group only as a fallback.
+function roleOfStep(label) {
+  if (/checklist|test passed on staging|regression|smoke test/.test(label)) return 'qa';
+  if (/sanity/.test(label)) return 'ba';
+  if (/list the cards|action items|rolling out|rollout/.test(label)) return 'dev';
+  if (/approve/.test(label)) return 'approver';
+  return null;
+}
+function personInChargeFromThread(msgs, botUid, role, beforeTs) {
+  let found = null;
+  for (const m of msgs) {
+    if (parseFloat(m.ts) >= parseFloat(beforeTs)) break;
+    const t = fullText(m);
+    if (m.bot_id && m.user !== botUid) {
+      // The request's first step is always the dev's (whoever opened it)
+      const stepRole = m === msgs[0] ? 'dev' : roleOfStep(stepLabel(t));
+      if (stepRole !== role) continue;
+      const clicker = (t.match(/<@([A-Z0-9]+)(?:\|[^>]*)?>\s*clicked/) || [])[1];
+      const named = waitingOn(t).filter(x => x.startsWith('<@')).map(x => x.slice(2, -1));
+      found = clicker || named[0] || found;
+    } else if (!m.bot_id && m.user) {
+      if (role === 'qa' && /release\s+checklist|checklist/i.test(t)) found = m.user;
+      if (role === 'dev' && /^\s*(?:actions?\s*:|release notes)/im.test(t)) found = m.user;
+    }
+  }
+  return found;
+}
+async function personInChargeFromJira(client, parentText, role) {
+  if (role !== 'qa' && role !== 'dev') return null;
+  const v = await jiraVersionFor(parentText);
+  if (!v) return null;
+  const r = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
+    params: { jql: `fixVersion = ${v.id}`, maxResults: 100, fields: 'assignee,customfield_10131' },
+    headers: { Authorization: jiraAuth(), Accept: 'application/json' },
+  }).catch(() => ({ data: { issues: [] } }));
+  const names = (r.data?.issues || []).map(i => role === 'qa' ? i.fields?.customfield_10131?.displayName : i.fields?.assignee?.displayName).filter(Boolean);
+  const top = Object.entries(names.reduce((a, n) => ((a[n] = (a[n] || 0) + 1), a), {})).sort((a, b) => b[1] - a[1])[0]?.[0];
+  return top ? require('./release').slackIdByName(client, top) : null;
+}
+async function whoToTag(client, msgs, botUid, pending, label) {
+  const named = waitingOn(pending.text);
+  if (named.some(x => x.startsWith('<@'))) return { tags: named.filter(x => x.startsWith('<@')), how: 'named in the step' };
+  const role = roleOfStep(label);
+  const person = (role && personInChargeFromThread(msgs, botUid, role, pending.ts)) || await personInChargeFromJira(client, msgs[0]?.text, role).catch(() => null);
+  if (person) return { tags: [`<@${person}>`], how: 'in charge of this release' };
+  return { tags: named, how: 'the group named in the step' };
+}
+
 // ── Dependencies ('Waiting API 4.32.0') ──────────────────────────────
 const DEP_RE = /\b(Web|API|Android|iOS|Middleware|Internal\s*API|Academy(?:\s*(?:Web|CMS))?|CMS|Landing(?:\s*Page)?|olly|MP\s*API)\s*(?:(Coach|Client)[_\s]*)?v?(\d+(?:\.\d+){1,3})\b/i;
 function depOf(text) {
@@ -210,7 +263,7 @@ async function scan(client, { force = false, onlyTs = null, logger = console } =
     }
     if (!s.pending) { report.push({ name, state: 'in progress', ts: p.ts }); continue; }
     const step = stepLabel(s.pending.text), action = s.pending._action || 'the button', since = s.pending.ts, waited = mins(since);
-    const who = waitingOn(s.pending.text);
+    const who = (await whoToTag(client, msgs, botUid, s.pending, step)).tags;
     // Blocked by a dependency someone noted
     if (s.blocker) {
       const dep = depOf(s.blocker.text);
@@ -297,4 +350,4 @@ async function handleStatus({ event, client }) {
     text: lines.length ? `Release requests in <#${CHANNEL}> that aren't done:\n${lines.join('\n')}` : 'Every release request from the last week is finished and marked released.' });
 }
 
-module.exports = { start, scan, readThread, stepLabel, actionOf, waitingOn, depOf, isRequestStatusCommand, handleStatus, isCancelCommand, handleCancel };
+module.exports = { start, scan, readThread, stepLabel, actionOf, waitingOn, depOf, isRequestStatusCommand, handleStatus, isCancelCommand, handleCancel, whoToTag, roleOfStep };

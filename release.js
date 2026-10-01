@@ -1526,7 +1526,7 @@ function register(slackApp) {
 module.exports = {
   __test_recover: (client) => recoverAnnounced(client),
   __test_tick: async (client) => { await postReadiness(client); await remindTbd(client); },
-  register, startScheduler, isReleaseCommand, handleCommand, recheckThread, isPagesCommand, handlePagesCommand, isReleaseFollowupCommand, handleReleaseFollowup, handleAnnouncementEdit, askForTbd, announcementTbd, setAnnouncementField,
+  register, startScheduler, isReleaseCommand, handleCommand, recheckThread, isPagesCommand, handlePagesCommand, slackIdByName, isReleaseFollowupCommand, handleReleaseFollowup, handleAnnouncementEdit, askForTbd, announcementTbd, setAnnouncementField,
   // exported for tests
   versionFamily, upcomingWorkdays, itemLabel, renderAnnouncement, renderReadiness, buildDraft, upcomingGroups,
   versionTagRegex, findCandidates, moveToVersion, PLACEHOLDER_VERSION_IDS, draftUpcoming, remindPending,
