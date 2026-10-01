@@ -41,7 +41,10 @@ const FAMILY_GROUPS = {
   Challenger:     [],
 };
 
-const DONE_STATUSES = new Set(['qa success', 'done', 'released', 'closed', 'will not fix', 'ba success', 'qa completed']);
+// Ready to ship = QA Success (or Done / Released / Closed). 'QA Completed'
+// is NOT the final state — those cards still need QA Success.
+const DONE_STATUSES = new Set(['qa success', 'done', 'released', 'closed']);
+const WONT_SHIP = new Set(['will not fix']);        // shouldn't be in a release at all
 const NOT_A_RELEASE = /^(?:n\s*\/?\s*a|to be confirmed|will not release)\b|\(tbd\)|\btbd\b/i;   // placeholders, not releases
 // A real release version is "<Platform> <number>" — e.g. iOS Coach 2.83.1,
 // Web 4.37.1, Academy CMS 0.2.4, API Challenger 1.0.0. Two-part numbers
@@ -242,7 +245,8 @@ async function buildDraft(client, group) {
   }
 
   // Readiness
-  const notReady = allIssues.filter(i => !DONE_STATUSES.has((i.fields?.status?.name || '').toLowerCase()));
+  const wontShip = allIssues.filter(i => WONT_SHIP.has((i.fields?.status?.name || '').toLowerCase()));
+  const notReady = allIssues.filter(i => { const s = (i.fields?.status?.name || '').toLowerCase(); return !DONE_STATUSES.has(s) && !WONT_SHIP.has(s); });
   const notReadyLines = [];
   for (const i of notReady.slice(0, 15)) {
     const a = i.fields?.assignee;
@@ -253,7 +257,7 @@ async function buildDraft(client, group) {
   const candidates = await findCandidates(perVersion);
   return {
     group, perVersion, itemsBySide: [...itemsBySide.entries()].map(([side, set]) => [side, order(set)]),
-    pic, total: allIssues.length, notReady, notReadyLines, candidates,
+    pic, total: allIssues.length, notReady, notReadyLines, candidates, wontShip: wontShip.map(i => i.key),
     force: null, notes: null,
   };
 }
@@ -311,10 +315,16 @@ async function neutralize(client, text) {
 
 function renderReadiness(d) {
   if (!d.total) return '_No cards in this version yet._';
-  const ready = d.total - d.notReady.length;
-  if (!d.notReady.length) return `*Readiness:* ${d.total === 1 ? 'the only card is' : `all ${d.total} cards are`} QA Success ✅`;
-  return `*Readiness:* ${ready}/${d.total} cards ready. Not ready yet:\n${d.notReadyLines.join('\n')}` +
-    (d.notReady.length > d.notReadyLines.length ? `\n_…and ${d.notReady.length - d.notReadyLines.length} more_` : '');
+  const wont = d.wontShip?.length
+    ? `\n_${d.wontShip.length} card${d.wontShip.length > 1 ? 's are' : ' is'} Will Not Fix — move ${d.wontShip.length > 1 ? 'them' : 'it'} out of the version: ${d.wontShip.join(', ')}_` : '';
+  const shipping = d.total - (d.wontShip?.length || 0);
+  if (!d.notReady.length) return `*Readiness:* ${shipping === 1 ? 'the only card is' : `all ${shipping} cards are`} QA Success ✅${wont}`;
+  // Group by status so 'QA Completed' stands out from real in-progress work
+  const byStatus = {};
+  for (const i of d.notReady) { const s = i.fields?.status?.name || '?'; byStatus[s] = (byStatus[s] || 0) + 1; }
+  const breakdown = Object.entries(byStatus).map(([s, n]) => `${n} ${s}`).join(', ');
+  return `*Readiness:* ${shipping - d.notReady.length}/${shipping} cards QA Success — not ready yet (${breakdown}):\n${d.notReadyLines.join('\n')}` +
+    (d.notReady.length > d.notReadyLines.length ? `\n_…and ${d.notReady.length - d.notReadyLines.length} more_` : '') + wont;
 }
 
 // ── Draft state + approval ───────────────────────────────────────────
@@ -474,7 +484,7 @@ async function releasedButUnfinished() {
     let nextPageToken = null;
     for (let page = 0; page < 10; page++) {
       const res = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
-        params: { jql: `project = ${RELEASE_PROJECT} AND fixVersion in releasedVersions(${RELEASE_PROJECT}) AND statusCategory != Done ORDER BY key ASC`,
+        params: { jql: `project = ${RELEASE_PROJECT} AND fixVersion in releasedVersions(${RELEASE_PROJECT}) AND (statusCategory != Done OR status = "QA Completed") ORDER BY key ASC`,
                   maxResults: 100, fields: 'summary,status,assignee,fixVersions', ...(nextPageToken ? { nextPageToken } : {}) },
         headers: headers(),
       });
@@ -747,7 +757,7 @@ async function postReadiness(client, logger = console) {
       channel: RELEASE_CHANNEL, thread_ts: a.ts, unfurl_links: false,
       text: d.notReady.length
         ? `${isReleaseDay ? '*Release day* — ' : ''}${renderReadiness(d)}`
-        : `*Release day* — ${d.total === 1 ? 'the only card is' : `all ${d.total} cards are`} QA Success ✅`,
+        : `*Release day* — ${renderReadiness(d).replace(/^\*Readiness:\* /, '')}`,
     }).catch(err => logger.warn?.('[Release] readiness post failed:', err.message));
   }
 }
@@ -846,6 +856,38 @@ async function handleDraftCommand({ event, client, logger, tTs }) {
     else if (await alreadyAnnouncedInChannel(client, g)) d.note = 'This version already appears in a release post in the channel — check before posting it again.';
     await sendDraft(client, d, { channel: event.channel, threadTs: tTs });
   }
+}
+
+// ── Re-check readiness in a release announcement thread ──────────────
+// "check again", "recheck", "readiness?", "kiểm tra lại" — straight from
+// Jira, no AI needed.
+const RECHECK_RE = /\b(?:check|re-?check|readiness|ready|status)\b|kiểm\s*tra|xem\s*lại/i;
+async function announcementVersions(client, channel, threadTs) {
+  try {
+    const rr = await client.conversations.replies({ channel, ts: threadTs, limit: 1 });
+    const p = (rr.messages || [])[0];
+    if (!p || !/Em gửi release cho/.test(p.text || '')) return null;
+    const vs = [...(p.text || '').matchAll(/\/versions\/(\d+)\/tab\/release-report-all-issues\|([^>]+)>/g)].map(m => ({ id: m[1], name: m[2].replace(/&amp;/g, '&') }));
+    return vs.length ? vs : null;
+  } catch { return null; }
+}
+async function recheckThread({ event, client }) {
+  const threadTs = event.thread_ts;
+  if (!threadTs || !RECHECK_RE.test((event.text || '').replace(/<@[A-Z0-9]+(?:\|[^>]*)?>/g, ''))) return false;
+  const versions = await announcementVersions(client, event.channel, threadTs);
+  if (!versions) return false;
+  const st = lib.agentStatus(client, event.channel, threadTs);
+  await st.start("I'm checking the release's cards in Jira");
+  try {
+    const family = versionFamily(versions[0].name);
+    const d = await buildDraft(client, { key: `${family}|recheck`, family, releaseDate: null, versions });
+    await st.done();
+    await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, unfurl_links: false, text: renderReadiness(d) });
+  } catch (err) {
+    await st.done();
+    await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: `I couldn't check the cards in Jira: \`${(err.message || '').substring(0, 160)}\`` });
+  }
+  return true;
 }
 
 // ── Interactions ─────────────────────────────────────────────────────
@@ -1006,7 +1048,7 @@ function register(slackApp) {
 }
 
 module.exports = {
-  register, startScheduler, isReleaseCommand, handleCommand,
+  register, startScheduler, isReleaseCommand, handleCommand, recheckThread,
   // exported for tests
   versionFamily, upcomingWorkdays, itemLabel, renderAnnouncement, renderReadiness, buildDraft, upcomingGroups,
   versionTagRegex, findCandidates, moveToVersion, PLACEHOLDER_VERSION_IDS, draftUpcoming, remindPending,

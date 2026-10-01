@@ -212,9 +212,12 @@ async function aiComplete(paramsIn) {
 // Some OpenAI-compatible gateways silently strip the tools parameter —
 // the agent loop then gets a plain answer and honestly claims it cannot
 // act. Detect that once so the loop can tell the truth about WHY.
-let _toolsSupported = null;
+// Cached briefly, and an outage never counts as "no tool support": a 503
+// during the probe used to disable the agent's tools until the next restart.
+let _toolsSupported = null, _toolsCheckedAt = 0;
 async function toolsSupported() {
-  if (_toolsSupported !== null) return _toolsSupported;
+  if (_toolsSupported === true) return true;
+  if (_toolsSupported === false && Date.now() - _toolsCheckedAt < 30 * 60 * 1000) return false;
   try {
     const res = await aiComplete({
       model: 'gpt-4o-mini', max_tokens: 30,
@@ -223,9 +226,12 @@ async function toolsSupported() {
       tool_choice: 'required',
     });
     _toolsSupported = !!res.choices?.[0]?.message?.tool_calls?.length;
+    _toolsCheckedAt = Date.now();
   } catch (err) {
-    _toolsSupported = false;
     console.warn('[AI] Tools probe errored:', err.message);
+    if (isAiUnavailable(err)) return false;         // outage: don't remember it — probe again next time
+    _toolsSupported = false;
+    _toolsCheckedAt = Date.now();
   }
   if (!_toolsSupported) console.warn('[AI] ⚠️ THIS ENDPOINT DOES NOT SUPPORT FUNCTION CALLING — the agent loop cannot act (read/create/assign in Jira). Check the gateway or switch OPENAI_BASE_URL.');
   else console.log('[AI] Tools probe OK — function calling supported.');

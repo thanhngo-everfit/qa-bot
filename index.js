@@ -1812,6 +1812,9 @@ const coreMentionHandlerInner = async ({ event, client, logger, _cleanups = [] }
     return;
   }
 
+  // "check again" in a release announcement thread → readiness from Jira now
+  if (event.thread_ts && await release.recheckThread({ event, client })) return;
+
   // Release coordination: "draft release for Web 4.37.1" / "release plan"
   if (release.isReleaseCommand(event.text)) {
     await release.handleCommand({ event, client, logger });
