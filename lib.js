@@ -125,6 +125,10 @@ async function aiComplete(paramsIn) {
         const eff = model === FALLBACK_MODEL ? BULK_EFFORT : SMART_EFFORT;
         if (eff) callParams.reasoning_effort = eff;
       }
+      // OpenAI refuses function tools together with reasoning_effort on some
+      // models ('Function tools with reasoning_effort are not supported for
+      // gpt-5.6-luna') — that disabled the agent. Tool calls go without it.
+      if (callParams.tools?.length) delete callParams.reasoning_effort;
       const res = await openai.chat.completions.create({ ..._adaptParams(callParams), model }, { timeout: __timeoutMs || AI_TIMEOUT_MS });
       clearInterval(heartbeat);
       console.log(`[AI] ← ${model} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
