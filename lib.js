@@ -100,6 +100,47 @@ function _adaptParams(params) {
 // on the fast fallback model so the user still gets a result.
 const AI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '90000', 10);
 
+// ── Tool calls through the Responses API ─────────────────────────────
+// Newer OpenAI models (gpt-5.x / gpt-6) only accept function tools on
+// /v1/responses ('Function tools with reasoning_effort are not supported
+// for gpt-6-astra in /v1/chat/completions'). Calls with tools are sent
+// there, translated from/to the chat-completions shape the agent uses.
+let _toolsViaResponses = (process.env.AI_TOOLS_API || '').toLowerCase() === 'responses';
+function _toResponsesInput(messages) {
+  const input = [];
+  for (const m of messages || []) {
+    const text = typeof m.content === 'string' ? m.content
+      : Array.isArray(m.content) ? m.content.filter(p => p.type === 'text').map(p => p.text).join('\n') : '';
+    if (m.role === 'system') input.push({ role: 'developer', content: text });
+    else if (m.role === 'tool') input.push({ type: 'function_call_output', call_id: m.tool_call_id, output: String(m.content ?? '') });
+    else if (m.role === 'assistant') {
+      if (text) input.push({ role: 'assistant', content: text });
+      for (const tc of m.tool_calls || []) input.push({ type: 'function_call', call_id: tc.id, name: tc.function?.name, arguments: tc.function?.arguments || '{}' });
+    } else input.push({ role: m.role || 'user', content: text });
+  }
+  return input;
+}
+async function _responsesAsChat(openai, p, timeout) {
+  const body = {
+    model: p.model,
+    input: _toResponsesInput(p.messages),
+    tools: (p.tools || []).map(t => t.type === 'function' && t.function
+      ? { type: 'function', name: t.function.name, description: t.function.description || '', parameters: t.function.parameters || { type: 'object', properties: {} }, strict: false }
+      : t),
+    ...(p.tool_choice ? { tool_choice: typeof p.tool_choice === 'string' ? p.tool_choice : { type: 'function', name: p.tool_choice.function?.name } } : {}),
+    ...(p.max_tokens || p.max_completion_tokens ? { max_output_tokens: Math.max(p.max_tokens || p.max_completion_tokens, 256) } : {}),
+  };
+  const r = await openai.responses.create(body, { timeout });
+  const calls = (r.output || []).filter(o => o.type === 'function_call')
+    .map(o => ({ id: o.call_id, type: 'function', function: { name: o.name, arguments: o.arguments || '{}' } }));
+  const text = r.output_text || (r.output || []).filter(o => o.type === 'message').flatMap(o => o.content || []).filter(c => c.type === 'output_text').map(c => c.text).join('');
+  return {
+    choices: [{ index: 0, finish_reason: calls.length ? 'tool_calls' : r.status === 'incomplete' ? 'length' : 'stop',
+      message: { role: 'assistant', content: text || null, ...(calls.length ? { tool_calls: calls } : {}) } }],
+    usage: r.usage,
+  };
+}
+
 async function aiComplete(paramsIn) {
   let params = paramsIn;
   const openai = getOpenAI();
@@ -130,7 +171,9 @@ async function aiComplete(paramsIn) {
       // gpt-5.6-luna') — that disabled the agent. Tool calls go without it.
       if (callParams.tools?.length && !__toolsNoReasoning) delete callParams.reasoning_effort;
       if (__toolsNoReasoning) callParams.reasoning_effort = 'none';
-      const res = await openai.chat.completions.create({ ..._adaptParams(callParams), model }, { timeout: __timeoutMs || AI_TIMEOUT_MS });
+      const res = (callParams.tools?.length && _toolsViaResponses)
+        ? await _responsesAsChat(openai, { ...callParams, model }, __timeoutMs || AI_TIMEOUT_MS)
+        : await openai.chat.completions.create({ ..._adaptParams(callParams), model }, { timeout: __timeoutMs || AI_TIMEOUT_MS });
       clearInterval(heartbeat);
       console.log(`[AI] ← ${model} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
       if (model === FALLBACK_MODEL) _bulkTimeouts = 0;
@@ -174,6 +217,12 @@ async function aiComplete(paramsIn) {
           messages: params.messages.map(m => Array.isArray(m.content)
             ? { ...m, content: m.content.filter(p => p.type === 'text').map(p => p.text).join('\n') + '\n\n(Note: the screenshots could not be read.)' }
             : m) };
+        continue;
+      }
+      // Tools only work on /v1/responses for this model → send tool calls there
+      if (params.tools?.length && !_toolsViaResponses && /\/v1\/chat\/completions|responses api|\/v1\/responses/i.test(msg)) {
+        _toolsViaResponses = true;
+        console.warn('[AI] Tools need the Responses API on this endpoint — sending tool calls to /v1/responses from now on');
         continue;
       }
       // A reasoning model refuses function tools while it reasons ('Function
