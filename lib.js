@@ -120,7 +120,7 @@ async function aiComplete(paramsIn) {
     console.log(`[AI] → ${model} max_tokens=${params.max_tokens || '-'} json=${!!params.response_format} tools=${params.tools ? params.tools.length : 0} sys=${sysLen}c user=${usrLen}c`);
     const heartbeat = setInterval(() => console.log(`[AI] … still waiting on ${model} (${Math.round((Date.now() - t0) / 1000)}s)`), 20000);
     try {
-      const { __timeoutMs, __jsonWordRetried, __slowRetried, __imagesStripped, ...callParams } = params;
+      const { __timeoutMs, __jsonWordRetried, __slowRetried, __imagesStripped, __toolsNoReasoning, __toolsOnSmart, ...callParams } = params;
       if (!callParams.reasoning_effort && !_stripReasoningEffort) {
         const eff = model === FALLBACK_MODEL ? BULK_EFFORT : SMART_EFFORT;
         if (eff) callParams.reasoning_effort = eff;
@@ -128,7 +128,8 @@ async function aiComplete(paramsIn) {
       // OpenAI refuses function tools together with reasoning_effort on some
       // models ('Function tools with reasoning_effort are not supported for
       // gpt-5.6-luna') — that disabled the agent. Tool calls go without it.
-      if (callParams.tools?.length) delete callParams.reasoning_effort;
+      if (callParams.tools?.length && !__toolsNoReasoning) delete callParams.reasoning_effort;
+      if (__toolsNoReasoning) callParams.reasoning_effort = 'none';
       const res = await openai.chat.completions.create({ ..._adaptParams(callParams), model }, { timeout: __timeoutMs || AI_TIMEOUT_MS });
       clearInterval(heartbeat);
       console.log(`[AI] ← ${model} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -174,6 +175,22 @@ async function aiComplete(paramsIn) {
             ? { ...m, content: m.content.filter(p => p.type === 'text').map(p => p.text).join('\n') + '\n\n(Note: the screenshots could not be read.)' }
             : m) };
         continue;
+      }
+      // A reasoning model refuses function tools while it reasons ('Function
+      // tools with reasoning_effort are not supported for gpt-5.6-luna in
+      // /v1/chat/completions'): retry with reasoning off, then on the smart model
+      if (params.tools?.length && /function tools?.{0,40}reasoning|reasoning.{0,40}function tools?/i.test(msg)) {
+        if (!params.__toolsNoReasoning) {
+          console.warn(`[AI] ${model} refuses tools while reasoning — retrying with reasoning_effort=none`);
+          params = { ...params, __toolsNoReasoning: true };
+          continue;
+        }
+        if (!params.__toolsOnSmart && model !== SMART_MODEL) {
+          console.warn(`[AI] ${model} refuses tools — retrying on ${SMART_MODEL}`);
+          params = { ...params, __toolsOnSmart: true, __toolsNoReasoning: false };   // astra runs with its normal reasoning
+          model = SMART_MODEL;
+          continue;
+        }
       }
       // Non-reasoning model / gateway rejects reasoning_effort → stop sending it
       if (!_stripReasoningEffort && /reasoning_effort|reasoning\.effort/i.test(msg)) {
@@ -228,7 +245,7 @@ async function toolsSupported() {
     // answering, and a 30-token probe was cut off before any tool call —
     // read as 'no tool support', which disabled the agent.
     const res = await aiComplete({
-      model: 'gpt-4o-mini', max_tokens: 400,
+      model: 'gpt-4o', max_tokens: 400,                     // the agent's model (smart tier)
       messages: [{ role: 'user', content: 'Call the ping tool.' }],
       tools: [{ type: 'function', function: { name: 'ping', description: 'test', parameters: { type: 'object', properties: {} } } }],
       tool_choice: 'required',
