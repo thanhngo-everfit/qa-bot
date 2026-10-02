@@ -24,11 +24,16 @@ const { JIRA_HOST, jiraAuth } = lib;
 const CHANNEL = process.env.PROD_RELEASE_CHANNEL || 'CTT4J643Y';
 const APPROVERS = (process.env.RELEASE_APPROVERS || 'U0142GU335F,U0445EQS1ED').split(',').map(s => s.trim()).filter(Boolean);
 const REMIND_AFTER_MIN = parseInt(process.env.REQ_REMIND_AFTER_MIN || '30', 10);
-const REMIND_EVERY_MIN = parseInt(process.env.REQ_REMIND_EVERY_MIN || '60', 10);
-const MAX_REMINDERS    = parseInt(process.env.REQ_MAX_REMINDERS || '3', 10);
+const REMIND_EVERY_MIN = parseInt(process.env.REQ_REMIND_EVERY_MIN || '120', 10);
+const MAX_REMINDERS    = parseInt(process.env.REQ_MAX_REMINDERS || '2', 10);
 const LOOKBACK_DAYS    = parseInt(process.env.REQ_LOOKBACK_DAYS || '7', 10);
 const STALE_AFTER_MIN  = parseInt(process.env.REQ_STALE_AFTER_MIN || String(2 * 24 * 60), 10);   // 2 days
+const REMINDED = new Map();   // '<request ts>:<step ts>' → { count, at } — guard even if the thread read misses one
 const MARK = '⏳ This release is waiting';          // marker on the bot's reminders
+// Slack stores ⏳ as ':hourglass_flowing_sand:' — the old includes(MARK)
+// check never matched, so reminders were never counted (every 15 min, no cap)
+const MARK_RE = /(?:⏳|:hourglass_flowing_sand:)\s*This release is waiting/;
+const isReminder = (m) => MARK_RE.test(m?.text || '');
 const vn = () => new Date(Date.now() + 7 * 3600 * 1000);
 const hhmm = (ts) => new Date(parseFloat(ts) * 1000 + 7 * 3600 * 1000).toISOString().substring(11, 16);
 const mins = (ts) => Math.round((Date.now() / 1000 - parseFloat(ts)) / 60);
@@ -114,7 +119,7 @@ function readThread(msgs, botUid) {
   const mine = msgs.filter(m => m.user === botUid || (m.bot_id && /^⏳|^Blocked:|^Release finished/.test(m.text || '')));
   // Only reminders that point at THIS step count (a stale or misread one doesn't)
   const pointsAt = (m) => ((m.text || '').match(/archives\/[A-Z0-9]+\/p(\d{10})(\d{6})/) || []).slice(1).join('.');
-  const remindersForStep = pending ? mine.filter(m => (m.text || '').includes(MARK) && pointsAt(m) === pending.ts) : [];
+  const remindersForStep = pending ? mine.filter(m => isReminder(m) && pointsAt(m) === pending.ts) : [];
   // Cancelled: the bot's own 'Stopped following' marker, or someone saying so
   // after the pending step ('ko đi nữa', 'ignore giùm', 'release cancelled').
   // Only messages AFTER the step count, so a feature named 'Cancel
@@ -152,8 +157,9 @@ function personInChargeFromThread(msgs, botUid, role, beforeTs) {
       if (stepRole !== role) continue;
       const clicker = (t.match(/<@([A-Z0-9]+)(?:\|[^>]*)?>\s*clicked/) || [])[1];
       const named = waitingOn(t).filter(x => x.startsWith('<@')).map(x => x.slice(2, -1));
-      found = clicker || named[0] || found;
-    } else if (!m.bot_id && m.user) {
+      const pick = [clicker, ...named].find(id => id && !APPROVERS.includes(id));
+      found = pick || found;
+    } else if (!m.bot_id && m.user && !APPROVERS.includes(m.user)) {
       if (role === 'qa' && /release\s+checklist|checklist/i.test(t)) found = m.user;
       if (role === 'dev' && /^\s*(?:actions?\s*:|release notes)/im.test(t)) found = m.user;
     }
@@ -169,8 +175,12 @@ async function personInChargeFromJira(client, parentText, role) {
     headers: { Authorization: jiraAuth(), Accept: 'application/json' },
   }).catch(() => ({ data: { issues: [] } }));
   const names = (r.data?.issues || []).map(i => role === 'qa' ? i.fields?.customfield_10131?.displayName : i.fields?.assignee?.displayName).filter(Boolean);
-  const top = Object.entries(names.reduce((a, n) => ((a[n] = (a[n] || 0) + 1), a), {})).sort((a, b) => b[1] - a[1])[0]?.[0];
-  return top ? require('./release').slackIdByName(client, top) : null;
+  const ranked = Object.entries(names.reduce((a, n) => ((a[n] = (a[n] || 0) + 1), a), {})).sort((a, b) => b[1] - a[1]).map(x => x[0]);
+  for (const n of ranked) {
+    const id = await require('./release').slackIdByName(client, n);
+    if (id && !APPROVERS.includes(id)) return id;          // not the approvers — they aren't doing the QA / dev work
+  }
+  return null;
 }
 async function whoToTag(client, msgs, botUid, pending, label) {
   const named = waitingOn(pending.text);
@@ -233,7 +243,7 @@ async function scan(client, { force = false, onlyTs = null, logger = console } =
     const name = requestName(p.text);
     if (s.cancelled) {
       // Clean up my reminders once, then leave it alone
-      for (const r of s.mine.filter(m => (m.text || '').includes(MARK))) await client.chat.delete({ channel: CHANNEL, ts: r.ts }).catch(() => {});
+      for (const r of s.mine.filter(m => isReminder(m))) await client.chat.delete({ channel: CHANNEL, ts: r.ts }).catch(() => {});
       report.push({ name, state: 'cancelled', ts: p.ts });
       continue;
     }
@@ -254,7 +264,7 @@ async function scan(client, { force = false, onlyTs = null, logger = console } =
     }
     // A reminder of mine that points at a step which isn't the pending one
     // (it's done, or I misread it) is removed — no stale nagging in the thread
-    for (const r of s.mine.filter(m => (m.text || '').includes(MARK))) {
+    for (const r of s.mine.filter(m => isReminder(m))) {
       const pointed = ((r.text || '').match(/archives\/[A-Z0-9]+\/p(\d{10})(\d{6})/) || []).slice(1).join('.');
       if (pointed && (!s.pending || pointed !== s.pending.ts)) {
         await client.chat.delete({ channel: CHANNEL, ts: r.ts }).catch(() => {});
@@ -297,12 +307,18 @@ async function scan(client, { force = false, onlyTs = null, logger = console } =
       continue;
     }
     report.push({ name, state: `waiting on ${step}`, ts: p.ts, waited, who, action });
+    // Only the latest reminder for this step stays in the thread
+    for (const old of s.remindersForStep.slice(0, -1)) await client.chat.delete({ channel: CHANNEL, ts: old.ts }).catch(() => {});
     // Reminder?
     if (!force && waited < REMIND_AFTER_MIN) continue;
     const last = s.remindersForStep[s.remindersForStep.length - 1];
-    if (!force && last && mins(last.ts) < REMIND_EVERY_MIN) continue;
-    if (!force && s.remindersForStep.length >= MAX_REMINDERS) continue;
-    const n = s.remindersForStep.length + 1;
+    const guardKey = `${p.ts}:${since}`;
+    const sent = Math.max(s.remindersForStep.length, REMINDED.get(guardKey)?.count || 0);
+    const lastAt = Math.max(last ? parseFloat(last.ts) * 1000 : 0, REMINDED.get(guardKey)?.at || 0);
+    if (!force && lastAt && (Date.now() - lastAt) / 60000 < REMIND_EVERY_MIN) continue;
+    if (!force && sent >= MAX_REMINDERS) continue;
+    const n = sent + 1;
+    REMINDED.set(guardKey, { count: n, at: Date.now() });
     const fyiApprovers = n >= 2 && !who.some(w => APPROVERS.some(a => w.includes(a))) ? ` _fyi ${APPROVERS.map(u => `<@${u}>`).join(' ')}_` : '';
     await client.chat.postMessage({ channel: CHANNEL, thread_ts: p.ts, unfurl_links: false,
       text: `${who.join(' ') || APPROVERS.map(u => `<@${u}>`).join(' ')} ${MARK} on you to press *${action}* — <${link(since)}|${step}> (pending since ${hhmm(since)}, ${dur(waited)}).${fyiApprovers}` }).catch(() => {});
@@ -327,7 +343,7 @@ async function handleCancel({ event, client }) {
   const msgs = rr.messages || [];
   if (!/Release Request\*?\s*for platform/i.test(msgs[0]?.text || '')) return false;
   const { user_id: botUid } = await client.auth.test();
-  for (const r of msgs.filter(m => m.user === botUid && (m.text || '').includes(MARK))) await client.chat.delete({ channel: CHANNEL, ts: r.ts }).catch(() => {});
+  for (const r of msgs.filter(m => m.user === botUid && isReminder(m))) await client.chat.delete({ channel: CHANNEL, ts: r.ts }).catch(() => {});
   await client.chat.postMessage({ channel: CHANNEL, thread_ts: event.thread_ts,
     text: `Stopped following this release request (${requestName(msgs[0].text)}) — cancelled by <@${event.user}>. I removed my reminders here.` });
   return true;
