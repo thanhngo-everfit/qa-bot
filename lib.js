@@ -478,10 +478,22 @@ function agentStatus(client, channel, threadTs) {
 // Board per project, as reported by each project's own sprints (Sprint
 // field = customfield_10010 on this site). UP keeps its discovered board.
 const PROJECT_BOARDS = {
+  UP:   process.env.UP_BOARD_ID   || '26',    // Core NN-NN
   PAY:  process.env.PAY_BOARD_ID  || '317',   // Payment NN
   AIT:  process.env.AIT_BOARD_ID  || '218',   // AINN
   CHAL: process.env.CHAL_BOARD_ID || '619',   // Challenger N
 };
+
+// A board's active-sprint list also includes OTHER boards' sprints that hold
+// some of its cards — the UP board lists 'Challenger 1' (board 619) because
+// Challenger's epics live in UP. A card only ever joins the board's OWN sprint.
+function ownActiveSprints(sprints, boardId) {
+  const parking = new Set(Object.values(LOW_PRIORITY_RULES).map(r => String(r.sprint)));
+  return (sprints || [])
+    .filter(s => s.originBoardId == null || String(s.originBoardId) === String(boardId))
+    .filter(s => !/sm\s*review/i.test(s.name || '') && !parking.has(String(s.id)))
+    .sort((a, b) => new Date(b.startDate || 0) - new Date(a.startDate || 0));
+}
 
 // The active dev sprint of a project's board — never "SM Review" and never a
 // review-parking sprint (those are chosen explicitly for low priority).
@@ -500,10 +512,7 @@ async function getActiveSprintForProject(projectKey) {
       params: { state: 'active' },
       headers: { Authorization: jiraAuth(), Accept: 'application/json' },
     });
-    const parking = new Set(Object.values(LOW_PRIORITY_RULES).map(r => String(r.sprint)));
-    const eligible = (sprintRes.data?.values || [])
-      .filter(s => !/sm\s*review/i.test(s.name || '') && !parking.has(String(s.id)))
-      .sort((a, b) => new Date(b.startDate || 0) - new Date(a.startDate || 0));
+    const eligible = ownActiveSprints(sprintRes.data?.values, boardId);
     if (!eligible.length) return null;
     console.log(`[Sprint] ${projectKey}: active sprint ${eligible[0].name} (${eligible[0].id})`);
     return { id: eligible[0].id, name: eligible[0].name };
@@ -515,23 +524,16 @@ async function getActiveSprintForProject(projectKey) {
 
 async function getActiveSprintId() {
   try {
-    const boardRes = await axios.get(`${JIRA_HOST}/rest/agile/1.0/board`, {
-      params: { projectKeyOrId: JIRA_PROJECT, type: 'scrum' },
-      headers: { Authorization: jiraAuth(), Accept: 'application/json' },
-    });
-    const board = boardRes.data?.values?.[0];
-    if (!board) return null;
+    // UP's own board (Core NN-NN) — not whichever board happens to list UP first
+    const board = { id: PROJECT_BOARDS.UP };
     const sprintRes = await axios.get(`${JIRA_HOST}/rest/agile/1.0/board/${board.id}/sprint`, {
       params: { state: 'active' },
       headers: { Authorization: jiraAuth(), Accept: 'application/json' },
     });
-    const sprints = sprintRes.data?.values || [];
-    // Multiple sprints can be active at once (dev sprint + "SM Review").
-    // Tickets must ALWAYS go to the real Active Sprint — never SM Review.
-    const parking = new Set(Object.values(LOW_PRIORITY_RULES).map(r => String(r.sprint)));
-    const eligible = sprints.filter(s => !/sm\s*review/i.test(s.name || '') && !parking.has(String(s.id)));
+    // Multiple sprints can be active at once (dev sprint + "SM Review", and
+    // other boards' sprints). Tickets ALWAYS go to UP's own active sprint.
+    const eligible = ownActiveSprints(sprintRes.data?.values, board.id);
     if (!eligible.length) return null;
-    eligible.sort((a, b) => new Date(b.startDate || 0) - new Date(a.startDate || 0));
     console.log(`[Sprint] Selected active sprint: ${eligible[0].name} (${eligible[0].id})`);
     _lastSprint = { id: eligible[0].id, name: eligible[0].name };
     return eligible[0].id;
