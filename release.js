@@ -1139,8 +1139,11 @@ async function notReadyCards(client, versionId) {
     for (const i of res.data?.issues || []) {
       const st = (i.fields?.status?.name || '').toLowerCase();
       if (DONE_STATUSES.has(st) || WONT_SHIP.has(st)) continue;
-      const who = i.fields?.customfield_10131?.displayName || i.fields?.assignee?.displayName || null;
-      const id = client && who ? await slackIdByName(client, who).catch(() => null) : null;
+      const person = i.fields?.customfield_10131 || i.fields?.assignee || null;
+      const who = person?.displayName || null;
+      // Email is exact (Jira 'Linh Nguyen (BE)' is Slack 'Link (BE)'); the name is the fallback
+      const id = !client || !person ? null
+        : (person.emailAddress && await slackIdForEmail(client, person.emailAddress).catch(() => null)) || await slackIdByName(client, who).catch(() => null);
       out.push({ key: i.key, status: i.fields?.status?.name || '?', who, tag: id ? `<@${id}>` : (who || 'unassigned') });
     }
     nextPageToken = res.data?.nextPageToken || null;
@@ -1164,10 +1167,18 @@ async function slackIdByName(client, name) {
     }
     _slackUsersAt = Date.now();
   }
-  const norm = (s) => String(s || '').toLowerCase().replace(/\s*\(.*?\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
-  const n = norm(name);
-  const hit = _slackUsers.find(u => [u.real_name, u.profile?.real_name, u.profile?.display_name].some(x => norm(x) === n));
-  return hit?.id || null;
+  // Exact name first ('Linh Nguyen (BE)'), then the name without its
+  // '(team)' suffix — but only when that names one person: two 'Linh Nguyen'
+  // means we'd be guessing, so no tag rather than the wrong one
+  const names = (u) => [u.real_name, u.profile?.real_name, u.profile?.display_name];
+  const flat = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const exact = _slackUsers.filter(u => names(u).some(x => flat(x) === flat(name)));
+  if (exact.length === 1) return exact[0].id;
+  const norm = (s) => flat(String(s || '').replace(/\s*\(.*?\)\s*/g, ' '));
+  // …and the suffixes mustn't disagree: Jira 'Linh Nguyen (BE)' is not Slack 'Linh Nguyen (Design)'
+  const team = (s) => (String(s || '').match(/\(([^)]*)\)/) || [])[1]?.toLowerCase().trim() || null;
+  const loose = _slackUsers.filter(u => names(u).some(x => norm(x) === norm(name) && (!team(x) || !team(name) || team(x) === team(name))));
+  return loose.length === 1 ? loose[0].id : null;
 }
 async function jiraAccountForSlack(client, slackId) {
   try {
