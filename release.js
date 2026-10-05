@@ -372,12 +372,16 @@ function draftBlocks(id, d) {
   const groupOpts = Object.entries(handles).sort((a, b) => a[1].localeCompare(b[1])).slice(0, 100)
     .map(([gid, h]) => ({ text: { type: 'plain_text', text: `@${h}`.substring(0, 75) }, value: gid }));
   const picked = chosenGroups(d).map(gid => groupOpts.find(o => o.value === gid)).filter(Boolean);
-  const tagEls = [{ type: 'multi_users_select', action_id: 'rel_tag_users', max_selected_items: 10,
-    placeholder: { type: 'plain_text', text: 'Tag who handles it' }, ...(d.tagUsers?.length ? { initial_users: d.tagUsers } : {}) }];
-  if (groupOpts.length) tagEls.push({ type: 'multi_static_select', action_id: 'rel_tag_groups', max_selected_items: 10,
-    placeholder: { type: 'plain_text', text: 'Tag squads / groups' }, options: groupOpts, ...(picked.length ? { initial_options: picked } : {}) });
-  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `*Tagged in the post:* ${d.tagUsers?.length || d.tagGroups != null ? 'your picks below' : 'the usual groups for this platform'} — pick people and/or squads to change it.` }] });
-  blocks.push({ type: 'actions', block_id: `rel_tags|${id}`, elements: tagEls });
+  // Multi-selects are only allowed as a section's accessory (or in an input
+  // block) — never inside an 'actions' block (Slack: invalid_blocks)
+  blocks.push({ type: 'section', block_id: `rel_tagu|${id}`,
+    text: { type: 'mrkdwn', text: `*Tag in the post:* ${d.tagUsers?.length || d.tagGroups != null ? 'your picks' : 'the usual groups for this platform'} — pick the person handling it…` },
+    accessory: { type: 'multi_users_select', action_id: 'rel_tag_users', max_selected_items: 10,
+      placeholder: { type: 'plain_text', text: 'Tag who handles it' }, ...(d.tagUsers?.length ? { initial_users: d.tagUsers } : {}) } });
+  if (groupOpts.length) blocks.push({ type: 'section', block_id: `rel_tagg|${id}`,
+    text: { type: 'mrkdwn', text: '…and/or a squad' },
+    accessory: { type: 'multi_static_select', action_id: 'rel_tag_groups', max_selected_items: 10,
+      placeholder: { type: 'plain_text', text: 'Tag squads / groups' }, options: groupOpts, ...(picked.length ? { initial_options: picked } : {}) } });
   if (missing.length) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Still needs your decision: ${missing.join(' and ')}.` }] });
   const elements = [];
   if (mobile) {
