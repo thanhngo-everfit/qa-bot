@@ -262,14 +262,25 @@ async function buildDraft(client, group) {
     group, perVersion, itemsBySide: [...itemsBySide.entries()].map(([side, set]) => [side, order(set)]),
     pic, total: allIssues.length, notReady, notReadyLines, candidates, wontShip: wontShip.map(i => i.key),
     force: null, notes: null,
+    tagUsers: [], tagGroups: null,     // header tags — null groups = the platform's default groups
   };
+}
+
+// Who the header tags: the people and/or squads picked on the draft, or —
+// untouched — the platform's usual groups (Web → @frontend @qa …).
+function defaultGroups(d) { return FAMILY_GROUPS[d.group.family] || []; }
+function chosenGroups(d) { return d.tagGroups == null ? defaultGroups(d) : d.tagGroups; }
+function headerTags(d) {
+  const users = d.tagUsers || [], groups = chosenGroups(d);
+  const tags = [...users.map(u => `<@${u}>`), ...groups.map(g => `<!subteam^${g}>`)];
+  return (tags.length ? tags : defaultGroups(d).map(g => `<!subteam^${g}>`)).join(' ');
 }
 
 // ── Rendering: the announcement, in the team's format ────────────────
 function renderAnnouncement(d) {
   const g = d.group;
   const mobile = isMobileFamily(g.family);
-  const tags = (FAMILY_GROUPS[g.family] || []).map(s => `<!subteam^${s}>`).join(' ');
+  const tags = headerTags(d);
   const lines = [];
   lines.push(`*Em gửi release cho ${g.family === 'Challenger' ? '[CHALLENGER APP]' : g.family}* ${tags}`.trim());
   if (d.perVersion.length === 1) {
@@ -355,6 +366,18 @@ function draftBlocks(id, d) {
     blocks.push({ type: 'actions', elements: [{ type: 'button', action_id: 'rel_addfix', value: `${id}|${c.versionId}`,
       text: { type: 'plain_text', text: `Add ${c.issues.length} to ${c.versionName}`.substring(0, 75) } }] });
   }
+  // Who to tag in the post: the person handling it and/or a squad, instead
+  // of the platform's default groups. Applied to the preview right away.
+  const handles = _groupHandles || {};
+  const groupOpts = Object.entries(handles).sort((a, b) => a[1].localeCompare(b[1])).slice(0, 100)
+    .map(([gid, h]) => ({ text: { type: 'plain_text', text: `@${h}`.substring(0, 75) }, value: gid }));
+  const picked = chosenGroups(d).map(gid => groupOpts.find(o => o.value === gid)).filter(Boolean);
+  const tagEls = [{ type: 'multi_users_select', action_id: 'rel_tag_users', max_selected_items: 10,
+    placeholder: { type: 'plain_text', text: 'Tag who handles it' }, ...(d.tagUsers?.length ? { initial_users: d.tagUsers } : {}) }];
+  if (groupOpts.length) tagEls.push({ type: 'multi_static_select', action_id: 'rel_tag_groups', max_selected_items: 10,
+    placeholder: { type: 'plain_text', text: 'Tag squads / groups' }, options: groupOpts, ...(picked.length ? { initial_options: picked } : {}) });
+  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `*Tagged in the post:* ${d.tagUsers?.length || d.tagGroups != null ? 'your picks below' : 'the usual groups for this platform'} — pick people and/or squads to change it.` }] });
+  blocks.push({ type: 'actions', block_id: `rel_tags|${id}`, elements: tagEls });
   if (missing.length) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Still needs your decision: ${missing.join(' and ')}.` }] });
   const elements = [];
   if (mobile) {
@@ -1015,7 +1038,7 @@ async function afterAnnouncementUpdate(client, channel, ts, key, value, who) {
   const remaining = announcementTbd(parent?.text);
   // A change AFTER the final info went out must reach everyone again
   const wasFinal = FINAL_POSTED.has(ts) || p.some(m => m.bot_id && /^\*Final release info/.test(m.text || ''));
-  const teamTags = wasFinal ? [...new Set(((parent?.text || '').match(/<!subteam\^[A-Z0-9]+(?:\|[^>]*)?>/g) || []))].join(' ') : '';
+  const teamTags = wasFinal ? [...new Set(((parent?.text || '').match(/<!subteam\^[A-Z0-9]+(?:\|[^>]*)?>|<@[A-Z0-9]+>/g) || []))].join(' ') : '';
   await client.chat.postMessage({ channel, thread_ts: ts, unfurl_links: false,
     text: `${wasFinal ? `${teamTags} *Change to the final release info* — ` : 'Release info updated — '}*${label}:* ${shown} (by <@${who}>)` +
       `${remaining.length ? `\nStill TBD: ${remaining.map(k => TBD_FIELDS[k].replace('Set up ', '')).join(', ')}` : ''}` }).catch(() => {});
@@ -1320,6 +1343,20 @@ async function checklistBody(templateId, people) {
 
 // ── Interactions ─────────────────────────────────────────────────────
 function register(slackApp) {
+  // Tag pickers on a draft (block_id 'rel_tags|<draft id>')
+  const tagPick = (kind) => async ({ ack, body, client }) => {
+    await ack();
+    const a = body.actions?.[0] || {};
+    const id = String(a.block_id || '').split('|')[1];
+    const st = DRAFTS.get(id);
+    if (!st) return;
+    if (kind === 'users') st.d.tagUsers = a.selected_users || [];
+    else st.d.tagGroups = (a.selected_options || []).map(o => o.value);
+    await refreshDraft(client, id);
+  };
+  slackApp.action('rel_tag_users', tagPick('users'));
+  slackApp.action('rel_tag_groups', tagPick('groups'));
+
   slackApp.action('rel_force', async ({ ack, body, client }) => {
     await ack();
     const [id, choice] = (body.actions?.[0]?.selected_option?.value || '').split('|');
