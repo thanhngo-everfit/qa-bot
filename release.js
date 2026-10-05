@@ -1122,6 +1122,34 @@ const uuid = () => require('crypto').randomUUID();
 
 // Slack ↔ Jira people
 let _slackUsers = null, _slackUsersAt = 0;
+// Cards on a version that aren't ready to be called released: anything not
+// QA Success / Done / Released / Closed (QA Completed included). Will Not Fix
+// is left out — it shouldn't be on the version at all, the version check
+// reports it separately. Each card carries its QA person (else assignee) as
+// a Slack tag when one can be found.
+async function notReadyCards(client, versionId) {
+  const out = [];
+  let nextPageToken = null;
+  for (let page = 0; page < 5; page++) {
+    const res = await axios.get(`${JIRA_HOST}/rest/api/3/search/jql`, {
+      params: { jql: `fixVersion = ${versionId} ORDER BY key ASC`, maxResults: 100,
+                fields: 'summary,status,assignee,customfield_10131', ...(nextPageToken ? { nextPageToken } : {}) },
+      headers: headers(),
+    });
+    for (const i of res.data?.issues || []) {
+      const st = (i.fields?.status?.name || '').toLowerCase();
+      if (DONE_STATUSES.has(st) || WONT_SHIP.has(st)) continue;
+      const who = i.fields?.customfield_10131?.displayName || i.fields?.assignee?.displayName || null;
+      const id = client && who ? await slackIdByName(client, who).catch(() => null) : null;
+      out.push({ key: i.key, status: i.fields?.status?.name || '?', who, tag: id ? `<@${id}>` : (who || 'unassigned') });
+    }
+    nextPageToken = res.data?.nextPageToken || null;
+    if (!nextPageToken || res.data?.isLast) break;
+  }
+  return out;
+}
+const notReadyLine = (c) => `• <${JIRA_HOST}/browse/${c.key}|${c.key}> *${c.status}* · ${c.tag}`;
+
 async function slackIdByName(client, name) {
   if (!name) return null;
   if (!_slackUsers || Date.now() - _slackUsersAt > 3600e3) {
@@ -1320,6 +1348,13 @@ function register(slackApp) {
     const [versionId, day, name] = (body.actions?.[0]?.value || '').split('|');
     if (!RELEASE_APPROVERS.includes(body.user?.id)) {
       await client.chat.postEphemeral({ channel: body.channel.id, user: body.user.id, text: `Only ${RELEASE_APPROVERS.map(u => `<@${u}>`).join(' ')} can mark versions released.` }).catch(() => {});
+      return;
+    }
+    // Not while cards on it still need QA Success — QA Completed isn't the end
+    const open = await notReadyCards(client, versionId).catch(() => []);
+    if (open.length) {
+      await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message?.thread_ts || body.message?.ts, unfurl_links: false,
+        text: `<@${body.user.id}> I didn't mark *${esc(name)}* released — ${open.length} card(s) on it aren't QA Success yet:\n${open.slice(0, 15).map(notReadyLine).join('\n')}\nMove them to QA Success (or off the version), then press the button again.` }).catch(() => {});
       return;
     }
     let reply;
@@ -1526,7 +1561,7 @@ function register(slackApp) {
 module.exports = {
   __test_recover: (client) => recoverAnnounced(client),
   __test_tick: async (client) => { await postReadiness(client); await remindTbd(client); },
-  register, startScheduler, isReleaseCommand, handleCommand, recheckThread, isPagesCommand, handlePagesCommand, slackIdByName, isReleaseFollowupCommand, handleReleaseFollowup, handleAnnouncementEdit, askForTbd, announcementTbd, setAnnouncementField,
+  register, startScheduler, notReadyCards, notReadyLine, isReleaseCommand, handleCommand, recheckThread, isPagesCommand, handlePagesCommand, slackIdByName, isReleaseFollowupCommand, handleReleaseFollowup, handleAnnouncementEdit, askForTbd, announcementTbd, setAnnouncementField,
   // exported for tests
   versionFamily, upcomingWorkdays, itemLabel, renderAnnouncement, renderReadiness, buildDraft, upcomingGroups,
   versionTagRegex, findCandidates, moveToVersion, PLACEHOLDER_VERSION_IDS, draftUpcoming, remindPending,

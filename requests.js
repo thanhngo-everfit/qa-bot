@@ -224,6 +224,14 @@ async function jiraVersionFor(parentText) {
   return _versions.find(v => names.includes((v.name || '').toLowerCase())) || null;
 }
 
+// Slack adds block_id / verbatim / emoji to blocks it stores — drop those
+// so a posted message compares equal to the one we'd post again
+function stripBlock(b) {
+  const clean = (n) => Array.isArray(n) ? n.map(clean) : (n && typeof n === 'object')
+    ? Object.fromEntries(Object.entries(n).filter(([k]) => !['block_id', 'verbatim', 'emoji'].includes(k)).map(([k, v]) => [k, clean(v)])) : n;
+  return clean(b);
+}
+
 // ── One pass over the channel ────────────────────────────────────────
 function inHours() {
   const d = vn(), dow = d.getUTCDay(), hm = d.getUTCHours() * 60 + d.getUTCMinutes();
@@ -252,17 +260,35 @@ async function scan(client, { force = false, onlyTs = null, logger = console } =
       report.push({ name, state: 'cancelled', ts: p.ts });
       continue;
     }
-    // Finished → Jira released?
+    // Finished → Jira released? Only offer the button once every card on the
+    // version is QA Success (or Done/Released/Closed); until then the one
+    // 'Release finished' message lists the cards still open, and is kept up
+    // to date each pass — it turns into the button when they're all done.
     if (s.finished) {
       const v = await jiraVersionFor(p.text);
-      const asked = s.mine.some(m => /^Release finished/.test(m.text || ''));
-      if (v && !v.released && !asked) {
-        const day = new Date(parseFloat(msgs.find(m => /release already finished/i.test(m.text || ''))?.ts || p.ts) * 1000 + 7 * 3600 * 1000).toISOString().substring(0, 10);
-        await client.chat.postMessage({ channel: CHANNEL, thread_ts: p.ts, unfurl_links: false,
-          text: `Release finished — ${v.name} isn't marked released in Jira yet.`,
-          blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `Release finished — *${v.name}* isn't marked released in Jira yet. ${APPROVERS.map(u => `<@${u}>`).join(' ')}` } },
+      const prev = s.mine.filter(m => /^Release finished/.test(m.text || '')).pop();
+      if (v && !v.released) {
+        const R = require('./release');
+        let open = [];
+        try { open = await R.notReadyCards(client, v.id); } catch (_) { open = null; }   // lookup failed → don't offer the button blind
+        const day = new Date(parseFloat(msgs.find(m => /release already finished/i.test(fullText(m)))?.ts || p.ts) * 1000 + 7 * 3600 * 1000).toISOString().substring(0, 10);
+        let text, blocks;
+        if (open && open.length) {
+          text = `Release finished — ${v.name} can't be marked released in Jira yet: ${open.length} card(s) aren't QA Success.`;
+          blocks = [{ type: 'section', text: { type: 'mrkdwn', text: (`Release finished — *${v.name}* can't be marked released in Jira yet: ${open.length} card(s) aren't QA Success:\n` +
+            `${open.slice(0, 15).map(R.notReadyLine).join('\n')}${open.length > 15 ? `\n_…and ${open.length - 15} more_` : ''}\n` +
+            `I'll offer the button here once they're QA Success. ${APPROVERS.map(u => `<@${u}>`).join(' ')}`).substring(0, 2900) } }];
+        } else if (open) {
+          text = `Release finished — ${v.name} isn't marked released in Jira yet.`;
+          blocks = [{ type: 'section', text: { type: 'mrkdwn', text: `Release finished — *${v.name}* isn't marked released in Jira yet — all its cards are QA Success. ${APPROVERS.map(u => `<@${u}>`).join(' ')}` } },
             { type: 'actions', elements: [{ type: 'button', style: 'primary', action_id: `rel_mark_released_${v.id}`, value: `${v.id}|${day}|${v.name}`,
-              text: { type: 'plain_text', text: `Mark ${v.name} released`.substring(0, 75) } }] }] }).catch(() => {});
+              text: { type: 'plain_text', text: `Mark ${v.name} released`.substring(0, 75) } }] }];
+        }
+        if (text && !prev) {
+          await client.chat.postMessage({ channel: CHANNEL, thread_ts: p.ts, unfurl_links: false, text, blocks }).catch(() => {});
+        } else if (text && prev && JSON.stringify(blocks) !== JSON.stringify((prev.blocks || []).map(stripBlock))) {
+          await client.chat.update({ channel: CHANNEL, ts: prev.ts, text, blocks }).catch(() => {});
+        }
       }
       report.push({ name, state: 'finished', ts: p.ts, jiraReleased: v ? !!v.released : null });
       continue;
