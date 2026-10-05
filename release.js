@@ -52,7 +52,7 @@ const NOT_A_RELEASE = /^(?:n\s*\/?\s*a|to be confirmed|will not release)\b|\(tbd
 // "Training - Mobile cards" — is a PC's draft placeholder.
 // White Label versions may carry a build suffix: 'iOS White Label 3.88.3 (1)'.
 // 'White Label Client …' is NOT a format — White Label versions have no app side.
-const VALID_VERSION_RE = /^(?:(?:(?:iOS|Android)\s+(?:Coach|Client)|Web|API|Internal API|Academy\s+(?:Web|CMS)|CMS|MP API|Landing|Middleware|(?:Web|API|iOS|Android)\s+Challenger)\s+\d+(?:\.\d+){1,3}|(?:iOS|Android)\s+White Label\s+\d+(?:\.\d+){1,3}(?:\s*\(\d+\))?)$/i;
+const VALID_VERSION_RE = /^(?:(?:(?:iOS|Android)\s+(?:Coach|Client)|Web|API|Internal API|Academy\s+(?:Web|CMS)|CMS|MP API|Landing|Blog|Middleware|(?:Web|API|iOS|Android)\s+Challenger)\s+\d+(?:\.\d+){1,3}|(?:iOS|Android)\s+White Label\s+\d+(?:\.\d+){1,3}(?:\s*\(\d+\))?)$/i;
 const isRealVersionName = (name) => VALID_VERSION_RE.test((name || '').trim());
 
 const headers = () => ({ Authorization: jiraAuth(), Accept: 'application/json' });
@@ -121,8 +121,11 @@ async function versionIssues(versionId) {
 async function upcomingGroups({ workdays = LOOKAHEAD_WORKDAYS, onlyVersion = null } = {}) {
   const versions = await listVersions();
   const days = new Set(upcomingWorkdays(workdays));
+  // A named version: the exact one when it exists ('Web 4.39' is not also
+  // 'Web 4.39.1'); a prefix only when nothing matches exactly ('iOS 3.94')
+  const exact = onlyVersion ? versions.filter(v => v.name.toLowerCase() === onlyVersion.toLowerCase()) : [];
   const pick = onlyVersion
-    ? versions.filter(v => v.name.toLowerCase() === onlyVersion.toLowerCase() || v.name.toLowerCase().startsWith(onlyVersion.toLowerCase()))
+    ? (exact.length ? exact : versions.filter(v => v.name.toLowerCase().startsWith(onlyVersion.toLowerCase())))
     : versions.filter(v => v.releaseDate && days.has(v.releaseDate) && isRealVersionName(v.name));   // draft names are alerted, never drafted
   const groups = new Map();
   for (const v of pick) {
@@ -869,18 +872,38 @@ async function handleCommand({ event, client, logger }) {
 }
 
 async function handleDraftCommand({ event, client, logger, tTs }) {
-  const text = (event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim();
-  const vMatch = text.match(/\b((?:iOS|Android)\s+(?:Coach|Client)|Internal API|Academy\s+(?:Web|CMS)|Web Challenger|API|Web|CMS)\s+(\d+(?:\.\d+){1,3})\b/i);
+  const text = (event.text || '').replace(/<@[A-Z0-9]+(?:\|[^>]*)?>/g, '').trim();
+  // A version named anywhere after the command ('draft release\nBlog 1.1.6',
+  // 'draft release for iOS Coach 2.85') means THAT version only — matched
+  // against Jira's own version names, so any product (Blog, Landing, White
+  // Label…) works without a list here. Named but not found → say so; never
+  // fall back to drafting every upcoming release.
+  let named = null, vMatch = null;
+  const ask = text.replace(RELEASE_CMD_RE, ' ').replace(/\s+/g, ' ').trim();
+  const num = ask.match(/(^|\s)v?(\d+(?:\.\d+){1,3})\b/i);
   let groups;
   try {
-    groups = vMatch ? await upcomingGroups({ onlyVersion: `${vMatch[1]} ${vMatch[2]}` }) : await upcomingGroups();
+    if (num) {
+      const words = ask.slice(0, num.index).replace(/[^\w&\- ]/g, ' ').trim().split(/\s+/).filter(Boolean);
+      const all = (await listVersions()).map(v => v.name.toLowerCase());
+      for (let k = Math.min(4, words.length); k >= 1 && !named; k--) {
+        const cand = `${words.slice(-k).join(' ')} ${num[2]}`;
+        if (all.some(n => n === cand.toLowerCase())) named = cand;
+      }
+      for (let k = Math.min(4, words.length); k >= 1 && !named; k--) {
+        const cand = `${words.slice(-k).join(' ')} ${num[2]}`;
+        if (all.some(n => n.startsWith(cand.toLowerCase()))) named = cand;
+      }
+      vMatch = named ? [null, named] : [null, `${words.slice(-2).join(' ')} ${num[2]}`.trim()];
+    }
+    groups = !num ? await upcomingGroups() : named ? await upcomingGroups({ onlyVersion: named }) : [];
   } catch (err) {
     await client.chat.postMessage({ channel: event.channel, thread_ts: tTs, text: `I couldn't read the release versions from Jira: \`${err.message}\`` });
     return;
   }
   if (!groups.length) {
     await client.chat.postMessage({ channel: event.channel, thread_ts: tTs,
-      text: vMatch ? `I couldn't find an unreleased version named ${vMatch[1]} ${vMatch[2]}.` : `No releases scheduled in the next ${LOOKAHEAD_WORKDAYS} working days.` });
+      text: vMatch ? `I couldn't find an unreleased version named *${esc(vMatch[1])}* in ${RELEASE_PROJECT} — check the name in Jira's Releases page.` : `No releases scheduled in the next ${LOOKAHEAD_WORKDAYS} working days.` });
     return;
   }
   for (const g of groups) {
