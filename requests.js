@@ -20,6 +20,8 @@
 const axios = require('axios');
 const lib = require('./lib');
 const { JIRA_HOST, jiraAuth } = lib;
+// The version's Jira release page — the place to check its cards and mark it released
+const versionLink = (v) => `<${JIRA_HOST}/projects/UP/versions/${v.id}/tab/release-report-all-issues|${v.name}>`;
 
 const CHANNEL = process.env.PROD_RELEASE_CHANNEL || 'CTT4J643Y';
 const APPROVERS = (process.env.RELEASE_APPROVERS || 'U0142GU335F,U0445EQS1ED').split(',').map(s => s.trim()).filter(Boolean);
@@ -275,12 +277,12 @@ async function scan(client, { force = false, onlyTs = null, logger = console } =
         let text, blocks;
         if (open && open.length) {
           text = `Release finished — ${v.name} can't be marked released in Jira yet: ${open.length} card(s) aren't QA/BA Success.`;
-          blocks = [{ type: 'section', text: { type: 'mrkdwn', text: (`Release finished — *${v.name}* can't be marked released in Jira yet: ${open.length} card(s) aren't QA/BA Success:\n` +
+          blocks = [{ type: 'section', text: { type: 'mrkdwn', text: (`Release finished — *${versionLink(v)}* can't be marked released in Jira yet: ${open.length} card(s) aren't QA/BA Success:\n` +
             `${open.slice(0, 15).map(R.notReadyLine).join('\n')}${open.length > 15 ? `\n_…and ${open.length - 15} more_` : ''}\n` +
             `I'll offer the button here once they're QA/BA Success. ${APPROVERS.map(u => `<@${u}>`).join(' ')}`).substring(0, 2900) } }];
         } else if (open) {
           text = `Release finished — ${v.name} isn't marked released in Jira yet.`;
-          blocks = [{ type: 'section', text: { type: 'mrkdwn', text: `Release finished — *${v.name}* isn't marked released in Jira yet — all its cards are QA/BA Success. ${APPROVERS.map(u => `<@${u}>`).join(' ')}` } },
+          blocks = [{ type: 'section', text: { type: 'mrkdwn', text: `Release finished — *${versionLink(v)}* isn't marked released in Jira yet — all its cards are QA/BA Success. ${APPROVERS.map(u => `<@${u}>`).join(' ')}` } },
             { type: 'actions', elements: [{ type: 'button', style: 'primary', action_id: `rel_mark_released_${v.id}`, value: `${v.id}|${day}|${v.name}`,
               text: { type: 'plain_text', text: `Mark ${v.name} released`.substring(0, 75) } }] }];
         }

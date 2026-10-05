@@ -1434,14 +1434,14 @@ function register(slackApp) {
     const open = await notReadyCards(client, versionId).catch(() => []);
     if (open.length) {
       await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message?.thread_ts || body.message?.ts, unfurl_links: false,
-        text: `<@${body.user.id}> I didn't mark *${esc(name)}* released — ${open.length} card(s) on it aren't QA/BA Success yet:\n${open.slice(0, 15).map(notReadyLine).join('\n')}\nMove them to QA Success or BA Success (or off the version), then press the button again.` }).catch(() => {});
+        text: `<@${body.user.id}> I didn't mark *<${versionUrl(versionId)}|${esc(name)}>* released — ${open.length} card(s) on it aren't QA/BA Success yet:\n${open.slice(0, 15).map(notReadyLine).join('\n')}\nMove them to QA Success or BA Success (or off the version), then press the button again.` }).catch(() => {});
       return;
     }
     let reply;
     try {
       await axios.put(`${JIRA_HOST}/rest/api/3/version/${versionId}`, { released: true, releaseDate: day },
         { headers: { ...headers(), 'Content-Type': 'application/json' } });
-      reply = `Marked *${esc(name)}* released in Jira (release date ${prettyDate(day)}) — by <@${body.user.id}>.`;
+      reply = `Marked *<${versionUrl(versionId)}|${esc(name)}>* released in Jira (release date ${prettyDate(day)}) — by <@${body.user.id}>.`;
       // Drop the button so it can't be clicked twice
       const blocks = (body.message?.blocks || []).map(b => b.type !== 'actions' ? b
         : { ...b, elements: (b.elements || []).filter(el => el.action_id !== body.actions[0].action_id) })
