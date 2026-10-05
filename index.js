@@ -1019,7 +1019,7 @@ async function pickParentFromCanvas(client, channelId, bugPlatform) {
 
   // Statuses that mean the epic is closed — don't parent new tickets here
   const CLOSED_STATUSES = new Set([
-    'qa success', 'done', 'closed', 'released', 'complete',
+    'qa success', 'ba success', 'done', 'closed', 'released', 'complete',
     'completed', 'qa passed', "won't fix", 'resolved', 'cancelled',
   ]);
 
@@ -1448,7 +1448,7 @@ async function findSprintParent(activeSprintId, platform, channelName, ticketSum
       headers: { Authorization: jiraAuth(), Accept: 'application/json' },
     });
 
-    const CLOSED = new Set(['qa success','done','closed','released','complete','completed','qa passed',"won't fix",'resolved','cancelled']);
+    const CLOSED = new Set(['qa success','ba success','done','closed','released','complete','completed','qa passed',"won't fix",'resolved','cancelled']);
     const issues = (res.data.issues || []).filter(i => {
       const t = (i.fields.summary || '').toLowerCase().trim();
       const st = (i.fields.status?.name || '').toLowerCase();
@@ -2972,7 +2972,7 @@ slackApp.action('qa_core_dup_follow', async ({ ack, body, client, logger }) => {
     for (const key of keys.slice(0, 8)) {
       const snap = await getIssueSnapshot(key);
       if (!snap) continue;
-      const done = ['qa success', 'done', 'released', 'closed'].includes(snap.status.toLowerCase());
+      const done = ['qa success', 'ba success', 'done', 'released', 'closed'].includes(snap.status.toLowerCase());
       lines.push(`${done ? '✅' : '🔎'} <${JIRA_HOST}/browse/${key}|${key}> — *${snap.status}*${snap.assignee ? ` · ${snap.assignee}` : ''}`);
       if (!done) clientReport.registerFollowUp({ channelId: p.c, threadTs: p.t, jiraKey: key, jiraUrl: `${JIRA_HOST}/browse/${key}`, squad: null });
     }
@@ -3086,7 +3086,7 @@ slackApp.action(/^qa_followup_start_/, async ({ ack, body, client, logger }) => 
   const statusLc = status.toLowerCase();
   const alreadyTracked = clientReport.isTracked(p.k);
 
-  if (!alreadyTracked && !['qa success', 'done', 'released', 'closed'].includes(statusLc)) {
+  if (!alreadyTracked && !['qa success', 'ba success', 'done', 'released', 'closed'].includes(statusLc)) {
     clientReport.registerFollowUp({
       channelId: p.c, threadTs: p.t, jiraKey: p.k, jiraUrl: url, squad: null,
       assigneeSlackHint: p.a || null,
@@ -3108,7 +3108,7 @@ slackApp.action(/^qa_followup_start_/, async ({ ack, body, client, logger }) => 
   } catch (err) { logger.warn('[QAAgent] Could not update ticket message:', err.data?.error || err.message); }
 
   const who = p.a ? `<@${p.a}>` : (snap?.assignee ? `*${snap.assignee}*` : 'the assignee');
-  const done = ['qa success', 'done', 'released', 'closed'].includes(statusLc);
+  const done = ['qa success', 'ba success', 'done', 'released', 'closed'].includes(statusLc);
   await client.chat.postMessage({
     channel: p.c, thread_ts: p.t, unfurl_links: false,
     text: done

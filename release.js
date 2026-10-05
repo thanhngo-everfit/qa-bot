@@ -41,9 +41,9 @@ const FAMILY_GROUPS = {
   Challenger:     [],
 };
 
-// Ready to ship = QA Success (or Done / Released / Closed). 'QA Completed'
+// Ready to ship = QA Success / BA Success (or Done / Released / Closed). 'QA Completed'
 // is NOT the final state — those cards still need QA Success.
-const DONE_STATUSES = new Set(['qa success', 'done', 'released', 'closed']);
+const DONE_STATUSES = new Set(['qa success', 'ba success', 'done', 'released', 'closed']);
 const WONT_SHIP = new Set(['will not fix']);        // shouldn't be in a release at all
 const NOT_A_RELEASE = /^(?:n\s*\/?\s*a|to be confirmed|will not release)\b|\(tbd\)|\btbd\b/i;   // placeholders, not releases
 // A real release version is "<Platform> <number>" — e.g. iOS Coach 2.83.1,
@@ -318,12 +318,12 @@ function renderReadiness(d) {
   const wont = d.wontShip?.length
     ? `\n_${d.wontShip.length} card${d.wontShip.length > 1 ? 's are' : ' is'} Will Not Fix — move ${d.wontShip.length > 1 ? 'them' : 'it'} out of the version: ${d.wontShip.join(', ')}_` : '';
   const shipping = d.total - (d.wontShip?.length || 0);
-  if (!d.notReady.length) return `*Readiness:* ${shipping === 1 ? 'the only card is' : `all ${shipping} cards are`} QA Success ✅${wont}`;
+  if (!d.notReady.length) return `*Readiness:* ${shipping === 1 ? 'the only card is' : `all ${shipping} cards are`} QA/BA Success ✅${wont}`;
   // Group by status so 'QA Completed' stands out from real in-progress work
   const byStatus = {};
   for (const i of d.notReady) { const s = i.fields?.status?.name || '?'; byStatus[s] = (byStatus[s] || 0) + 1; }
   const breakdown = Object.entries(byStatus).map(([s, n]) => `${n} ${s}`).join(', ');
-  return `*Readiness:* ${shipping - d.notReady.length}/${shipping} cards QA Success — not ready yet (${breakdown}):\n${d.notReadyLines.join('\n')}` +
+  return `*Readiness:* ${shipping - d.notReady.length}/${shipping} cards QA/BA Success — not ready yet (${breakdown}):\n${d.notReadyLines.join('\n')}` +
     (d.notReady.length > d.notReadyLines.length ? `\n_…and ${d.notReady.length - d.notReadyLines.length} more_` : '') + wont;
 }
 
@@ -732,7 +732,7 @@ async function remindPending(client) {
     REMINDED.add(id);
     const mobile = isMobileFamily(st.d.group.family);
     const missing = [mobile && !st.d.notes ? 'release notes' : null, mobile && !st.d.force ? 'force/optional update' : null].filter(Boolean);
-    const notReady = st.d.notReady?.length ? ` · ${st.d.notReady.length} card(s) not QA Success yet` : '';
+    const notReady = st.d.notReady?.length ? ` · ${st.d.notReady.length} card(s) not QA/BA Success yet` : '';
     return `• <${threadLink(st.channel, st.ts, st.threadTs)}|${st.d.group.family} — ${st.d.perVersion.map(v => v.name).join(' / ')}>` +
       `${missing.length ? ` · still TBD: ${missing.join(', ')}` : ''}${notReady}`;
   });
@@ -1083,7 +1083,7 @@ async function handleReleaseFollowup({ event, client }) {
       const r = await followUpAnnouncement(client, a.ts);
       if (!r || r.released) continue;
       const link = `https://everfitt.slack.com/archives/${RELEASE_CHANNEL}/p${String(a.ts).replace('.', '')}`;
-      const bits = [r.notReady ? `${r.notReady}/${r.total} not QA Success` : 'all cards QA Success', r.tbd.length ? `TBD: ${r.tbd.map(k => TBD_FIELDS[k].replace('Set up ', '')).join(', ')}` : null].filter(Boolean);
+      const bits = [r.notReady ? `${r.notReady}/${r.total} not QA/BA Success` : 'all cards QA/BA Success', r.tbd.length ? `TBD: ${r.tbd.map(k => TBD_FIELDS[k].replace('Set up ', '')).join(', ')}` : null].filter(Boolean);
       lines.push(`• <${link}|${esc(r.name)}> — ${bits.join(' · ')}`);
     }
     await st.done();
@@ -1365,7 +1365,7 @@ function register(slackApp) {
     const open = await notReadyCards(client, versionId).catch(() => []);
     if (open.length) {
       await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message?.thread_ts || body.message?.ts, unfurl_links: false,
-        text: `<@${body.user.id}> I didn't mark *${esc(name)}* released — ${open.length} card(s) on it aren't QA Success yet:\n${open.slice(0, 15).map(notReadyLine).join('\n')}\nMove them to QA Success (or off the version), then press the button again.` }).catch(() => {});
+        text: `<@${body.user.id}> I didn't mark *${esc(name)}* released — ${open.length} card(s) on it aren't QA/BA Success yet:\n${open.slice(0, 15).map(notReadyLine).join('\n')}\nMove them to QA Success or BA Success (or off the version), then press the button again.` }).catch(() => {});
       return;
     }
     let reply;

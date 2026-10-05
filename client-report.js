@@ -1430,7 +1430,7 @@ function extractTextAndLinks(adfNode, out) {
 }
 
 async function rebuildFollowUpsFromJira() {
-  const DONE_STATUSES = ['qa success', 'done', 'released', 'closed'];
+  const DONE_STATUSES = ['qa success', 'ba success', 'done', 'released', 'closed'];
   let restored = 0, nextPageToken = null;
   try {
     for (let page = 0; page < 4; page++) {           // up to 400 tickets
@@ -1487,7 +1487,7 @@ async function rebuildFollowUpsFromJira() {
 // find threads with live, not-yet-done tickets, and re-register them —
 // so follow-ups survive redeploys AND the old bot's uninstallation.
 async function rebuildFollowUpsFromHistory(client) {
-  const DONE_STATUSES = ['qa success', 'done', 'released', 'closed'];
+  const DONE_STATUSES = ['qa success', 'ba success', 'done', 'released', 'closed'];
   const oldest = String((Date.now() - 14 * 24 * 3600 * 1000) / 1000);
   let restored = 0;
 
@@ -2297,7 +2297,7 @@ Answer the user's message conversationally and helpfully in ENGLISH only, 1-5 se
           if (sameEmail || sameName) matches.push({ key, details: d });
         }
 
-        const done = s => ['qa success', 'done', 'released', 'closed'].includes((s || '').toLowerCase());
+        const done = s => ['qa success', 'ba success', 'done', 'released', 'closed'].includes((s || '').toLowerCase());
         const open = matches.filter(m => !done(m.details.status));
         const chosen = open.length ? open : matches;
 
@@ -2826,7 +2826,7 @@ slackApp.action('qa_cr_dup_follow', async ({ ack, body, client, logger }) => {
     for (const key of (found || []).slice(0, 8)) {
       const d = await getJiraIssueDetails(key);
       if (!d) continue;
-      const done = ['qa success', 'done', 'released', 'closed'].includes((d.status || '').toLowerCase());
+      const done = ['qa success', 'ba success', 'done', 'released', 'closed'].includes((d.status || '').toLowerCase());
       lines.push(`${done ? '✅' : '🔎'} <${JIRA_HOST}/browse/${key}|${key}> — *${d.status}*${d.assigneeDisplay ? ` · ${d.assigneeDisplay}` : ''}`);
       if (!done) registerFollowUp({ channelId: p.c, threadTs: p.t, jiraKey: key, jiraUrl: `${JIRA_HOST}/browse/${key}`, squad: null });
     }
@@ -3217,7 +3217,7 @@ async function dropEpics(keys) {
 const FOLLOWUP_ADOPT_DAYS = parseFloat(process.env.FOLLOWUP_ADOPT_DAYS || '3');
 const QA_FIELD_ID = process.env.QA_FIELD_ID || 'customfield_10131';   // the ticket's 'QA' user field
 const KEY_RE = /\b(?:UP|PAY|AIT|CHAL)-\d+\b/g;
-const ADOPT_DONE = ['qa success', 'done', 'released', 'closed', 'will not fix', 'qa completed', 'ba success'];
+const ADOPT_DONE = ['qa success', 'ba success', 'done', 'released', 'closed', 'will not fix', 'qa completed'];
 
 async function adoptNewCardsInReply(client, event, logger = console) {
   const text = [event.text || '', ...(event.attachments || []).map(a => `${a.title_link || ''} ${a.from_url || ''} ${a.text || ''}`)].join(' ');
@@ -3538,7 +3538,7 @@ function statusEmoji(status) {
 function workStage(t) {
   if (t.jiraStatus) {
     const s = t.jiraStatus.toLowerCase();
-    if (['qa success', 'done', 'released', 'closed'].includes(s)) return 'DONE';
+    if (['qa success', 'ba success', 'done', 'released', 'closed'].includes(s)) return 'DONE';
     if (['in progress', 'in review', 'qa ready'].includes(s))     return 'IN DEVELOPMENT';
     return 'IN INVESTIGATION'; // to do
   }

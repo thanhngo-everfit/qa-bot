@@ -274,13 +274,13 @@ async function scan(client, { force = false, onlyTs = null, logger = console } =
         const day = new Date(parseFloat(msgs.find(m => /release already finished/i.test(fullText(m)))?.ts || p.ts) * 1000 + 7 * 3600 * 1000).toISOString().substring(0, 10);
         let text, blocks;
         if (open && open.length) {
-          text = `Release finished — ${v.name} can't be marked released in Jira yet: ${open.length} card(s) aren't QA Success.`;
-          blocks = [{ type: 'section', text: { type: 'mrkdwn', text: (`Release finished — *${v.name}* can't be marked released in Jira yet: ${open.length} card(s) aren't QA Success:\n` +
+          text = `Release finished — ${v.name} can't be marked released in Jira yet: ${open.length} card(s) aren't QA/BA Success.`;
+          blocks = [{ type: 'section', text: { type: 'mrkdwn', text: (`Release finished — *${v.name}* can't be marked released in Jira yet: ${open.length} card(s) aren't QA/BA Success:\n` +
             `${open.slice(0, 15).map(R.notReadyLine).join('\n')}${open.length > 15 ? `\n_…and ${open.length - 15} more_` : ''}\n` +
-            `I'll offer the button here once they're QA Success. ${APPROVERS.map(u => `<@${u}>`).join(' ')}`).substring(0, 2900) } }];
+            `I'll offer the button here once they're QA/BA Success. ${APPROVERS.map(u => `<@${u}>`).join(' ')}`).substring(0, 2900) } }];
         } else if (open) {
           text = `Release finished — ${v.name} isn't marked released in Jira yet.`;
-          blocks = [{ type: 'section', text: { type: 'mrkdwn', text: `Release finished — *${v.name}* isn't marked released in Jira yet — all its cards are QA Success. ${APPROVERS.map(u => `<@${u}>`).join(' ')}` } },
+          blocks = [{ type: 'section', text: { type: 'mrkdwn', text: `Release finished — *${v.name}* isn't marked released in Jira yet — all its cards are QA/BA Success. ${APPROVERS.map(u => `<@${u}>`).join(' ')}` } },
             { type: 'actions', elements: [{ type: 'button', style: 'primary', action_id: `rel_mark_released_${v.id}`, value: `${v.id}|${day}|${v.name}`,
               text: { type: 'plain_text', text: `Mark ${v.name} released`.substring(0, 75) } }] }];
         }
