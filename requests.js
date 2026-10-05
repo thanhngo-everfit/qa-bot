@@ -77,7 +77,7 @@ function actionOf(text) {
   return a === 'passed' ? 'PASSED' : a ? a[0].toUpperCase() + a.slice(1) : null;
 }
 function stepLabel(text) {
-  const t = (text || '').toLowerCase();
+  const t = (text || '').toLowerCase().replace(/[*`_~]/g, '');   // '*`approve`* this release request'
   if (/list out all (?:the )?cards/.test(t)) return 'list the cards in this release';
   if (/approve this release request/.test(t)) return 'approve the release request';
   if (/release checklist/.test(t)) return 'send the release checklist';
@@ -93,8 +93,11 @@ function stepLabel(text) {
 }
 const doneLine = (text) => /<@[A-Z0-9]+(?:\|[^>]*)?>\s*clicked\s*\*?`?\w+/i.test(text || '');
 // Who the step waits on: people/groups named before any 'fyi'
+// A thank-you is not an ask: 'Thank <@Bao> for your approval. … @qa please
+// send the release checklist' waits on @qa, not Bao.
+const THANKS_RE = /\bthanks?(?:\s+you)?\s*(?:(?:,|and|&)?\s*<@[A-Z0-9]+(?:\|[^>]*)?>\s*)+/gi;
 function waitingOn(text) {
-  const head = (text || '').split(/\bfyi\b/i)[0].replace(/<@[A-Z0-9]+(?:\|[^>]*)?>\s*clicked[\s\S]*$/i, '');
+  const head = (text || '').split(/\bfyi\b/i)[0].replace(/<@[A-Z0-9]+(?:\|[^>]*)?>\s*clicked[\s\S]*$/i, '').replace(THANKS_RE, ' ');
   return [...new Set((head.match(/<@[A-Z0-9]+(?:\|[^>]*)?>|<!subteam\^[A-Z0-9]+(?:\|[^>]*)?>/g) || []).map(m => m.replace(/\|[^>]*>/, '>')))];
 }
 function requestName(parentText) {
@@ -183,9 +186,11 @@ async function personInChargeFromJira(client, parentText, role) {
   return null;
 }
 async function whoToTag(client, msgs, botUid, pending, label) {
-  const named = waitingOn(pending.text);
-  if (named.some(x => x.startsWith('<@'))) return { tags: named.filter(x => x.startsWith('<@')), how: 'named in the step' };
   const role = roleOfStep(label);
+  // The approvers only act on approval steps — a QA or dev step that mentions
+  // them is thanking or cc'ing them, not waiting on them
+  const named = waitingOn(pending.text).filter(x => !role || role === 'approver' || !APPROVERS.some(a => x === `<@${a}>`));
+  if (named.some(x => x.startsWith('<@'))) return { tags: named.filter(x => x.startsWith('<@')), how: 'named in the step' };
   const person = (role && personInChargeFromThread(msgs, botUid, role, pending.ts)) || await personInChargeFromJira(client, msgs[0]?.text, role).catch(() => null);
   if (person) return { tags: [`<@${person}>`], how: 'in charge of this release' };
   return { tags: named, how: 'the group named in the step' };
