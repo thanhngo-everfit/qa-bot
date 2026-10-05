@@ -314,7 +314,7 @@ async function groupHandles(client) {
   try {
     const res = await client.usergroups.list({ include_disabled: false });
     for (const g of res.usergroups || []) _groupHandles[g.id] = g.handle || g.name;
-  } catch (_) { /* needs usergroups:read — fall back to a generic label */ }
+  } catch (err) { console.warn(`[Release] usergroups.list failed (${err.data?.error || err.message}) — the squad picker needs the usergroups:read scope`); }
   return _groupHandles;
 }
 async function neutralize(client, text) {
@@ -375,7 +375,8 @@ function draftBlocks(id, d) {
   // Multi-selects are only allowed as a section's accessory (or in an input
   // block) — never inside an 'actions' block (Slack: invalid_blocks)
   blocks.push({ type: 'section', block_id: `rel_tagu|${id}`,
-    text: { type: 'mrkdwn', text: `*Tag in the post:* ${d.tagUsers?.length || d.tagGroups != null ? 'your picks' : 'the usual groups for this platform'} — pick the person handling it…` },
+    text: { type: 'mrkdwn', text: `*Tag in the post:* ${d.tagUsers?.length || (d.tagGroups && d.tagGroups.length) ? 'your picks'
+      : defaultGroups(d).length ? 'the usual groups for this platform' : '*nobody yet* — this platform has no default group'} — pick the person handling it${groupOpts.length ? '…' : '.'}` },
     accessory: { type: 'multi_users_select', action_id: 'rel_tag_users', max_selected_items: 10,
       placeholder: { type: 'plain_text', text: 'Tag who handles it' }, ...(d.tagUsers?.length ? { initial_users: d.tagUsers } : {}) } });
   if (groupOpts.length) blocks.push({ type: 'section', block_id: `rel_tagg|${id}`,
@@ -428,11 +429,15 @@ async function alreadyAnnouncedInChannel(client, group) {
   try {
     const oldest = String((Date.now() - 21 * 86400 * 1000) / 1000);
     const res = await client.conversations.history({ channel: RELEASE_CHANNEL, oldest, limit: 200 });
-    const ids = group.versions.map(v => `/versions/${v.id}`);
-    const names = group.versions.map(v => v.name.toLowerCase());
+    // Only an actual announcement counts ('Em gửi release cho …'), not any
+    // message that happens to mention the version (bot reports, questions),
+    // and the name must match whole — 'Blog 1.1.6' is not in 'Blog 1.1.60'
+    const ids = group.versions.map(v => new RegExp(`/versions/${v.id}(?!\\d)`));
+    const names = group.versions.map(v => new RegExp(`(^|[^\\w.])${v.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.]*\\d)`, 'i'));
     return (res.messages || []).some(m => {
-      const t = (m.text || '').toLowerCase();
-      return ids.some(x => t.includes(x)) || names.some(n => t.includes(n));
+      const t = m.text || '';
+      if (!/Em gửi release cho/i.test(t)) return false;
+      return ids.some(r => r.test(t)) || names.some(r => r.test(t));
     });
   } catch { return false; }
 }
@@ -1636,7 +1641,7 @@ function register(slackApp) {
 module.exports = {
   __test_recover: (client) => recoverAnnounced(client),
   __test_tick: async (client) => { await postReadiness(client); await remindTbd(client); },
-  register, startScheduler, notReadyCards, notReadyLine, isReleaseCommand, handleCommand, recheckThread, isPagesCommand, handlePagesCommand, slackIdByName, isReleaseFollowupCommand, handleReleaseFollowup, handleAnnouncementEdit, askForTbd, announcementTbd, setAnnouncementField,
+  register, startScheduler, alreadyAnnouncedInChannel, notReadyCards, notReadyLine, isReleaseCommand, handleCommand, recheckThread, isPagesCommand, handlePagesCommand, slackIdByName, isReleaseFollowupCommand, handleReleaseFollowup, handleAnnouncementEdit, askForTbd, announcementTbd, setAnnouncementField,
   // exported for tests
   versionFamily, upcomingWorkdays, itemLabel, renderAnnouncement, renderReadiness, buildDraft, upcomingGroups,
   versionTagRegex, findCandidates, moveToVersion, PLACEHOLDER_VERSION_IDS, draftUpcoming, remindPending,
