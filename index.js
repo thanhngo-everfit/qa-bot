@@ -952,11 +952,17 @@ async function getChannelCanvasContent(client, channelId) {
   try {
     let canvasFileId = null;
 
-    // Method 1: channel properties (primary channel canvas)
+    // Method 1: the channel's canvas tabs — a tab named 'Project Info' is the
+    // one teams keep their epics in, so it wins over the channel's primary
+    // canvas (which can be an older, different canvas). Then the primary one.
     try {
       const chan = await client.conversations.info({ channel: channelId });
-      canvasFileId = chan.channel?.properties?.canvas?.file_id;
-      if (canvasFileId) console.log(`[QABot] Canvas via channel.properties: ${canvasFileId}`);
+      const props = chan.channel?.properties || {};
+      const fileOf = (t) => t?.data?.file_id || t?.file_id || (/^F[A-Z0-9]+$/.test(t?.id || '') ? t.id : null);
+      const canvasTabs = (props.tabs || []).filter(t => /canvas/i.test(t?.type || '') && fileOf(t));
+      const projectInfo = canvasTabs.find(t => /project\s*info/i.test(t.label || t.data?.title || ''));
+      canvasFileId = fileOf(projectInfo) || props.canvas?.file_id || fileOf(canvasTabs[0]) || null;
+      if (canvasFileId) console.log(`[QABot] Canvas via channel ${projectInfo ? '"Project Info" tab' : 'properties'}: ${canvasFileId}`);
     } catch (e) { console.log(`[QABot] conversations.info failed: ${e.message}`); }
 
     // Method 2: bookmarks — canvas bookmark links contain the file ID
@@ -1064,8 +1070,8 @@ async function pickParentFromCanvas(client, channelId, bugPlatform) {
   // Sort by UP number descending — higher = more recently created = current sprint ticket.
   // Ensures that when canvas has both old and new tickets for the same platform, the newer wins.
   candidates.sort((a, b) => {
-    const numA = parseInt(a.key.replace('UP-', ''), 10) || 0;
-    const numB = parseInt(b.key.replace('UP-', ''), 10) || 0;
+    const numA = parseInt(a.key.replace(/^[A-Z]+-/, ''), 10) || 0;   // UP-, CHAL-, PAY-…
+    const numB = parseInt(b.key.replace(/^[A-Z]+-/, ''), 10) || 0;
     return numB - numA;
   });
 
@@ -2475,8 +2481,18 @@ HARD RULES — follow exactly:
       // (iOS → Client Report (iOS), etc.) unless the request names an epic
       // or parent. The sprint-epic search below is for other channels only.
       if (!epicKey && projectRoute?.challenger) {
-        parentKey = await lib.challengerEpicFor(ticket.platform);
-        logger.info(`[QABot] Challenger epic for ${ticket.platform}: ${parentKey || 'none'}`);
+        // The channel's Project Info canvas is what the team maintains — when
+        // it lists an open epic for this platform, that's the parent. The
+        // newest 'Post-release fixes' epic is only the fallback.
+        parentKey = await Promise.race([
+          pickParentFromCanvas(client, event.channel, ticket.platform).catch(() => null),
+          new Promise(resolve => setTimeout(() => resolve(null), 15000)),
+        ]);
+        if (parentKey) logger.info(`[QABot] Challenger epic from the channel canvas for ${ticket.platform}: ${parentKey}`);
+        else {
+          parentKey = await lib.challengerEpicFor(ticket.platform);
+          logger.info(`[QABot] Challenger epic for ${ticket.platform}: ${parentKey || 'none'} (canvas had none)`);
+        }
       } else if (inProdAudit && !epicKey && !projectRoute) {
         parentKey = chProfile.epic;
         logger.info(`[QABot] Production Audit epic: ${parentKey}`);
