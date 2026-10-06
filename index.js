@@ -1003,6 +1003,9 @@ async function getChannelCanvasContent(client, channelId) {
 }
 
 // ── Pick parent from canvas based on bug platform ──
+// Last epic each channel's canvas gave per platform — survives a slow lookup
+const CANVAS_EPIC_CACHE = new Map();
+
 async function pickParentFromCanvas(client, channelId, bugPlatform) {
   const canvasContent = await getChannelCanvasContent(client, channelId);
   if (!canvasContent) return null;
@@ -2473,10 +2476,22 @@ HARD RULES — follow exactly:
         // The channel's Project Info canvas is what the team maintains — when
         // it lists an open epic for this platform, that's the parent. The
         // newest 'Post-release fixes' epic is only the fallback.
-        parentKey = await Promise.race([
-          pickParentFromCanvas(client, event.channel, ticket.platform).catch(() => null),
-          new Promise(resolve => setTimeout(() => { logger.warn?.('[QABot] Canvas epic lookup timed out (30s) — using the fallback epic'); resolve(null); }, 30000)),
+        // A slow or failed canvas/Jira read must not silently drop the card
+        // into the old epic: use the epic this channel's canvas gave for the
+        // same platform last time (kept 24h), and only then the fallback.
+        const ck = `${event.channel}|${ticket.platform}`;
+        const got = await Promise.race([
+          pickParentFromCanvas(client, event.channel, ticket.platform).catch(e => { logger.warn?.(`[QABot] Canvas epic lookup failed: ${e.message}`); return 'FAILED'; }),
+          new Promise(resolve => setTimeout(() => resolve('FAILED'), 30000)),
         ]);
+        if (got === 'FAILED') {
+          const hit = CANVAS_EPIC_CACHE.get(ck);
+          parentKey = hit && Date.now() - hit.at < 24 * 3600e3 ? hit.key : null;
+          logger.warn?.(`[QABot] Canvas epic lookup failed/timed out for ${ck} — ${parentKey ? `using last known ${parentKey}` : 'no cached epic'}`);
+        } else {
+          parentKey = got;
+          if (got) CANVAS_EPIC_CACHE.set(ck, { key: got, at: Date.now() });
+        }
         if (parentKey) logger.info(`[QABot] Challenger epic from the channel canvas for ${ticket.platform}: ${parentKey}`);
         else {
           parentKey = await lib.challengerEpicFor(ticket.platform);
