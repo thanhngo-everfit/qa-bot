@@ -949,68 +949,57 @@ async function getLinkedEpicsFromPI(planKey) {
 
 // ── Read channel canvas content ───────────────
 async function getChannelCanvasContent(client, channelId) {
+  // Every canvas the channel has — its primary canvas, canvas tabs (Slack's
+  // tab objects don't reliably carry the canvas title), bookmarks and canvas
+  // files — then pick by the canvas's REAL title from files.info: 'Project
+  // Info' first, the primary canvas next, the rest after. The first one whose
+  // content holds Jira keys wins, so an empty or unreadable canvas never hides
+  // the one the team actually maintains.
+  const ids = [];
+  const add = (f) => { if (f && /^F[A-Z0-9]+$/.test(f) && !ids.includes(f)) ids.push(f); };
+  let primary = null;
   try {
-    let canvasFileId = null;
+    const chan = await client.conversations.info({ channel: channelId });
+    const props = chan.channel?.properties || {};
+    primary = props.canvas?.file_id || null;
+    add(primary);
+    // any file_id anywhere in properties — tabs, tabz, whatever shape Slack uses
+    for (const m of JSON.stringify(props).matchAll(/"(?:file_id|id)":"(F[A-Z0-9]{6,})"/g)) add(m[1]);
+  } catch (e) { console.log(`[QABot] conversations.info failed: ${e.data?.error || e.message}`); }
+  try {
+    const bookmarks = await client.bookmarks.list({ channel_id: channelId });
+    for (const b of (bookmarks.bookmarks || [])) add(((b.link || '').match(/\/docs\/[A-Z0-9]+\/(F[A-Z0-9]+)/i) || [])[1]);
+  } catch (e) { console.log(`[QABot] bookmarks.list failed: ${e.data?.error || e.message}`); }
+  try {
+    const files = await client.files.list({ channel: channelId, types: 'canvases', count: 20 });
+    for (const f of (files.files || [])) if (f.filetype === 'quip' || f.filetype === 'canvas') add(f.id);
+  } catch (e) { console.log(`[QABot] files.list failed: ${e.data?.error || e.message}`); }
 
-    // Method 1: the channel's canvas tabs — a tab named 'Project Info' is the
-    // one teams keep their epics in, so it wins over the channel's primary
-    // canvas (which can be an older, different canvas). Then the primary one.
-    try {
-      const chan = await client.conversations.info({ channel: channelId });
-      const props = chan.channel?.properties || {};
-      const fileOf = (t) => t?.data?.file_id || t?.file_id || (/^F[A-Z0-9]+$/.test(t?.id || '') ? t.id : null);
-      const canvasTabs = (props.tabs || []).filter(t => /canvas/i.test(t?.type || '') && fileOf(t));
-      const projectInfo = canvasTabs.find(t => /project\s*info/i.test(t.label || t.data?.title || ''));
-      canvasFileId = fileOf(projectInfo) || props.canvas?.file_id || fileOf(canvasTabs[0]) || null;
-      if (canvasFileId) console.log(`[QABot] Canvas via channel ${projectInfo ? '"Project Info" tab' : 'properties'}: ${canvasFileId}`);
-    } catch (e) { console.log(`[QABot] conversations.info failed: ${e.message}`); }
+  if (!ids.length) { console.warn(`[QABot] No canvas found for channel ${channelId}`); return null; }
 
-    // Method 2: bookmarks — canvas bookmark links contain the file ID
-    if (!canvasFileId) {
-      try {
-        const bookmarks = await client.bookmarks.list({ channel_id: channelId });
-        for (const b of (bookmarks.bookmarks || [])) {
-          // Canvas bookmarks have link like https://everfit.slack.com/docs/TXXX/FXXX
-          const m = (b.link || '').match(/\/docs\/[A-Z0-9]+\/(F[A-Z0-9]+)/i);
-          if (m) { canvasFileId = m[1]; console.log(`[QABot] Canvas via bookmarks: ${canvasFileId}`); break; }
-        }
-      } catch (e) { console.log(`[QABot] bookmarks.list failed: ${e.message}`); }
-    }
-
-    // Method 3: files.list scoped to channel, look for a file of type 'quip' or 'canvas'
-    if (!canvasFileId) {
-      try {
-        const files = await client.files.list({ channel: channelId, types: 'canvases', count: 5 });
-        const canvasFile = (files.files || []).find(f => f.filetype === 'quip' || f.filetype === 'canvas');
-        if (canvasFile) { canvasFileId = canvasFile.id; console.log(`[QABot] Canvas via files.list: ${canvasFileId}`); }
-      } catch (e) { console.log(`[QABot] files.list failed: ${e.message}`); }
-    }
-
-    if (!canvasFileId) {
-      console.warn('[QABot] No canvas found for channel ' + channelId);
-      return null;
-    }
-
-    // Fetch canvas content — Slack canvases use this endpoint
-    const fileInfo = await client.files.info({ file: canvasFileId });
-    const url = fileInfo.file?.url_private || fileInfo.file?.url_private_download;
-
-    if (!url) {
-      console.warn('[QABot] Canvas file has no url_private');
-      return null;
-    }
-
-    const res = await axios.get(url, {
-      headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-      responseType: 'text',
-    });
-    const content = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-    console.log(`[QABot] Canvas content length: ${content.length}, sample: ${content.substring(0, 200)}`);
-    return content;
-  } catch (err) {
-    console.warn('[QABot] Could not read canvas:', err.message);
-    return null;
+  // Titles, then order: Project Info → primary → others
+  const infos = [];
+  for (const id of ids.slice(0, 8)) {
+    try { const fi = await client.files.info({ file: id }); infos.push({ id, title: fi.file?.title || fi.file?.name || '', url: fi.file?.url_private || fi.file?.url_private_download }); }
+    catch (e) { console.log(`[QABot] files.info ${id} failed: ${e.data?.error || e.message}`); }
   }
+  const rank = (c) => /project\s*info/i.test(c.title) ? 0 : c.id === primary ? 1 : 2;
+  infos.sort((a, b) => rank(a) - rank(b));
+  console.log(`[QABot] Canvases in ${channelId}: ${infos.map(c => `${c.id} "${c.title}"`).join(' | ') || 'none readable'}`);
+
+  for (const c of infos) {
+    if (!c.url) continue;
+    try {
+      const res = await axios.get(c.url, { headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` }, responseType: 'text', timeout: 10000 });
+      const content = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+      if (/\b(?:UP|PAY|AIT|CHAL|PLAN)-\d+/.test(content)) {
+        console.log(`[QABot] Using canvas ${c.id} "${c.title}" (${content.length} chars)`);
+        return content;
+      }
+      console.log(`[QABot] Canvas ${c.id} "${c.title}" has no Jira keys${/<html/i.test(content) && /sign in|login/i.test(content) ? ' — got a login page, check the files:read scope' : ''}`);
+    } catch (e) { console.log(`[QABot] Could not download canvas ${c.id}: ${e.response?.status || e.message}`); }
+  }
+  return null;
 }
 
 // ── Pick parent from canvas based on bug platform ──
@@ -1019,7 +1008,7 @@ async function pickParentFromCanvas(client, channelId, bugPlatform) {
   if (!canvasContent) return null;
 
   // Extract all UP- and PLAN- keys from canvas
-  const upKeys   = [...new Set((canvasContent.match(/\b(?:UP|PAY|AIT|CHAL)-\d+\b/g)   || []))];
+  const upKeys   = [...new Set((canvasContent.match(/\b(?:UP|PAY|AIT|CHAL)-\d+(?!\d)/g) || []))];
   const planKeys = [...new Set((canvasContent.match(/PLAN-\d+/g) || []))];
   console.log(`[QABot] Canvas keys: UP=${upKeys.join(',')} PLAN=${planKeys.join(',')}`);
 
@@ -2486,7 +2475,7 @@ HARD RULES — follow exactly:
         // newest 'Post-release fixes' epic is only the fallback.
         parentKey = await Promise.race([
           pickParentFromCanvas(client, event.channel, ticket.platform).catch(() => null),
-          new Promise(resolve => setTimeout(() => resolve(null), 15000)),
+          new Promise(resolve => setTimeout(() => { logger.warn?.('[QABot] Canvas epic lookup timed out (30s) — using the fallback epic'); resolve(null); }, 30000)),
         ]);
         if (parentKey) logger.info(`[QABot] Challenger epic from the channel canvas for ${ticket.platform}: ${parentKey}`);
         else {
