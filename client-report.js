@@ -122,7 +122,7 @@ const SQUAD_ROSTER = {
   'AI Features': {
     contacts: [
       { email: 'hoanguyen@everfit.io', id: 'UQZ2PNPN3' },
-      { email: 'diemdo@everfit.io',    id: null },
+      { email: 'diemdo@everfit.io',    id: 'U0BQ00SL5NF' },   // Diem Do (PC) — Data & AI
     ],
     domains: [
       'ai', 'artificial intelligence', 'ai feature',
@@ -132,6 +132,9 @@ const SQUAD_ROSTER = {
       'olly', 'olly voice', 'ask olly',
       'bi dashboard', 'compare check-in',
       'ai suggest', 'ai generate', 'ai coach', 'ai meal', 'ai analysis', 'log food with ai',
+      // MacroSnap = AI photo-to-macros: recognition, detection, calorie/portion estimates
+      'macrosnap', 'macro snap', 'no food detected', 'food detected', 'food recognition',
+      'image recognition', 'meal photo', 'meal scan', 'photo of a meal', 'scan a meal',
     ],
   },
   'Payment & Billing': {
@@ -145,7 +148,10 @@ const SQUAD_ROSTER = {
       'trial', 'renewal', 'pricing', 'receipt', 'transaction',
       'license', 'licence', 'seat', 'not eligible', 'license assignment',
       'remaining license', 'assigned license',
-      'macrosnap', 'macro snap',
+      // MacroSnap only as a paid add-on (buying, trial, license) — its
+      // recognition / accuracy issues are AI Features
+      'macrosnap add-on', 'macrosnap addon', 'macrosnap subscription', 'macrosnap license',
+      'macrosnap billing', 'macrosnap purchase', 'macrosnap trial', 'macrosnap pricing',
       // Packages & sequences (payment products) and every asset they deliver:
       // selling, purchase, activation/trial, cancellation / self-cancel, and
       // the assignment or removal of the included assets
@@ -880,9 +886,11 @@ SQUAD ROUTING HINTS:
     Builder, logging food WITH AI) is AI Features.
   - "AI Features": AI Workout Builder, AI Recipe Builder, AI Alternative Recipe,
     Olly / Olly Voice / Ask Olly, Smart Response, Knowledge Base, BI Dashboard,
-    Push-up Challenge, Compare Check-in, anything AI-generated
+    Push-up Challenge, Compare Check-in, MacroSnap (photo → food recognition,
+    "No food detected", calorie / portion estimates), anything AI-generated
   - "Payment & Billing": payments, subscriptions, invoices, refunds, Stripe,
-    licenses/seats, MacroSnap, PACKAGES and SEQUENCES (payment products) —
+    licenses/seats, MacroSnap ONLY as a paid add-on (purchase, trial, license,
+    billing), PACKAGES and SEQUENCES (payment products) —
     selling, purchase / checkout, activation and trials, cancellation and the
     client self-cancel setting, AND every asset delivered through them: if a
     client got the wrong assets, missing assets, or lost assets after
