@@ -1183,6 +1183,10 @@ function buildAnalysisReply(analysis, squad, contacts, reporterId = null) {
   const checks  = (analysis.checks || []).filter(s => s && s.trim()).slice(0, 3);
   const missing = (analysis.missing_info || []).filter(s => s && s.trim()).slice(0, 3);
 
+  // Who decides what happens next — tagged ONCE, at the top
+  const smPc = contacts ? `${contacts.smMention} ${contacts.pcMention}` : `<!subteam^${GROUP_SM}>`;
+  lines.push(`*Decision maker:* ${smPc}`);
+  lines.push('');
   // Sections are separated by a blank line so the reply is scannable.
   lines.push(`*Summary:* ${issue_summary}`);
   lines.push('');
@@ -1209,7 +1213,7 @@ function buildAnalysisReply(analysis, squad, contacts, reporterId = null) {
   lines.push('');
   lines.push(`*Next action:*`);
   const askCsFirst = missing.length ? ' — ideally after the reporter answers the questions above' : '';
-  const smPc = contacts ? `${contacts.smMention} ${contacts.pcMention}` : `<!subteam^${GROUP_SM}>`;
+  // No tags here — the decision makers are tagged at the top
 
   if (tickets?.length) {
     // Tag the people ONCE. One ticket → one line; several → one line per
@@ -1222,9 +1226,9 @@ function buildAnalysisReply(analysis, squad, contacts, reporterId = null) {
     const article = (role) => /^[aeiou]/i.test(role) ? 'an' : 'a';
     if (tickets.length === 1) {
       const role = roleOf(tickets[0].platform);
-      lines.push(`• ${smPc} — assign ${article(role)} *${role}* dev to ${phrase(tickets[0])}${askCsFirst}`);
+      lines.push(`• Assign ${article(role)} *${role}* dev to ${phrase(tickets[0])}${askCsFirst}`);
     } else {
-      lines.push(`• ${smPc} — ${tickets.length} pieces of work:`);
+      lines.push(`• ${tickets.length} pieces of work:`);
       tickets.forEach((t, i) => {
         const role = roleOf(t.platform);
         lines.push(`    ${i + 1}. ${article(role).replace(/^a/, 'A')} *${role}* dev to ${phrase(t)}`);
@@ -1232,7 +1236,7 @@ function buildAnalysisReply(analysis, squad, contacts, reporterId = null) {
       if (askCsFirst) lines.push(`_Ideally after the reporter answers the questions above._`);
     }
   } else {
-    lines.push(`• ${smPc} — review this thread and decide next action`);
+    lines.push(`• Review this thread and decide next action`);
   }
 
   return lines.join('\n');
