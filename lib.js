@@ -848,6 +848,32 @@ function isChallengerRequest(channelId, text) {
   return CHALLENGER_CHANNELS.has(channelId) || /\bchallenger\b/i.test(text || '');   // "challenger", never "challenge"
 }
 
+// Every Challenger app channel, present and future — by NAME, so a new one
+// (viet-new-client-app-challenge-app, spec-update-client-app-challenge-app,
+// …) works the day it's created without anyone listing it here. '…challenge-app'
+// or 'challenger' — never a bare 'challenge' (push-up-challenge is AI Features).
+const CHALLENGER_CHANNEL_NAME_RE = /challeng(?:e|er)[-_]?app|challenger/i;
+const _chalChannelCache = new Map();
+async function isChallengerChannel(client, channelId) {
+  if (!channelId) return false;
+  if (CHALLENGER_CHANNELS.has(channelId)) return true;
+  const hit = _chalChannelCache.get(channelId);
+  if (hit && Date.now() - hit.at < 3600e3) return hit.yes;
+  let yes = false;
+  try {
+    const info = await client.conversations.info({ channel: channelId });
+    yes = CHALLENGER_CHANNEL_NAME_RE.test(info.channel?.name || '');
+  } catch (_) { /* DM or no access — not a Challenger channel */ }
+  _chalChannelCache.set(channelId, { yes, at: Date.now() });
+  return yes;
+}
+
+// The requester asking for a CHAL card in their own words: 'CHAL card',
+// 'under CHAL project', 'Chal-card not UP card'
+function asksForChallengerCard(text) {
+  return /\bchal(?:[- ]?(?:card|project|board|ticket))?\b(?!-\d)/i.test(String(text || '').replace(/<[^>]+>/g, ' '));
+}
+
 function challengerPlatform(platform) {
   const p = (platform || '').toLowerCase();
   if (p.startsWith('ios'))     return 'iOS';
@@ -1523,7 +1549,7 @@ module.exports = {
   getLastActiveSprint, getVersionName, getIssueTitle, bulkSetParentForChannel, BULK_MOVE_RE, isBulkMoveRequest, resolveEpicCandidate,
   isNoTicketReportRequest, findThreadsWithoutTickets, isBulkCreateRequest, BULK_CREATE_RE, postLabel,
   parseBulkMove, getIssueBrief, logWork, fmtDuration, withRequesterTag, ownText, isAiUnavailable, toolsState,
-  CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, challengerEpicFor, challengerSummary,
+  CHALLENGER_PROJECT, CHALLENGER_CHANNELS, isChallengerRequest, isChallengerChannel, asksForChallengerCard, challengerEpicFor, challengerSummary,
   LOW_PRIORITY_SPRINT_ID, LOW_PRIORITY_STATUS, LOW_PRIORITIES, LOW_PRIORITY_RULES, lowPriorityRule, getSprintInfo, transitionToStatus,
   PROJECT_BOARDS, getActiveSprintForProject,
   resolveUserName, resolveInlineMentions, warmUserNames, replaceMentionsCached, qaTaskWork,

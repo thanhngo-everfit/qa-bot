@@ -2377,12 +2377,14 @@ HARD RULES — follow exactly:
     }
     // Challenger app → CHAL board, from any channel. Checked last so it wins
     // over the squad routing above.
-    if (lib.isChallengerRequest(event.channel, `${event.text || ''}\n${context || ''}`)) {
+    if (await lib.isChallengerChannel(client, event.channel)
+        || lib.asksForChallengerCard(event.text)
+        || lib.isChallengerRequest(event.channel, `${event.text || ''}\n${context || ''}`)) {
       targetProject = lib.CHALLENGER_PROJECT;
       projectRoute  = { project: lib.CHALLENGER_PROJECT, parent: null, challenger: true };
       logger.info('[QABot] Challenger app → project CHAL');
     }
-    const ticketFixVersionId = projectRoute?.challenger ? null        // CHAL doesn't use Fix Versions
+    let ticketFixVersionId = projectRoute?.challenger ? null        // CHAL doesn't use Fix Versions
       : projectRoute ? await lib.getMonthlyTbdVersion(targetProject) : fixVersionId;
 
     // Resolve reporter: the person who tagged the bot (NOT the thread author)
@@ -2406,7 +2408,7 @@ HARD RULES — follow exactly:
     const sprintId       = await getActiveSprintId();
     // Every board runs its own sprints (PAY → Payment NN, AIT → AINN,
     // CHAL → Challenger N): the card joins ITS project's active sprint.
-    const targetSprint = targetProject === JIRA_PROJECT
+    let targetSprint = targetProject === JIRA_PROJECT
       ? (sprintId ? { id: sprintId, name: lib.getLastActiveSprint()?.name || null } : null)
       : await lib.getActiveSprintForProject(targetProject);
     logger.info(`[QABot] Active sprint: ${sprintId || 'none found — ticket will not be added to a sprint'}`);
@@ -2527,6 +2529,16 @@ HARD RULES — follow exactly:
       if (!parentKey && !projectRoute?.challenger && !epicNamed && Date.now() - tParent < 20000) {
         parentKey = await pickParentFromCanvas(client, event.channel, ticket.platform);
         logger.info(`[QABot] Parent from canvas: ${parentKey || 'none'} for platform=${ticket.platform}`);
+      }
+
+      // A card under a CHAL epic IS a Challenger card — never a UP card with a
+      // CHAL parent (UP-80704/80705). Switch project, sprint and fix version.
+      if (/^CHAL-\d+$/.test(parentKey || '') && targetProject !== lib.CHALLENGER_PROJECT) {
+        logger.info(`[QABot] Parent ${parentKey} is a Challenger epic — creating the card in CHAL, not ${targetProject}`);
+        targetProject = lib.CHALLENGER_PROJECT;
+        projectRoute  = { project: lib.CHALLENGER_PROJECT, parent: null, challenger: true };
+        ticketFixVersionId = null;
+        targetSprint = await lib.getActiveSprintForProject(targetProject).catch(() => null);
       }
 
       const jiraIds = (
