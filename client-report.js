@@ -1300,6 +1300,7 @@ async function getJiraIssueDetails(issueKey) {
       statusName:      fields.status?.name || '',
       assigneeEmail:   fields.assignee?.emailAddress || null,
       assigneeDisplay: fields.assignee?.displayName || null,
+      assigneeActive:  fields.assignee ? fields.assignee.active !== false : null,   // false = deactivated account
       summary:         fields.summary || '',
       updatedMs:       fields.updated ? Date.parse(fields.updated) : null,
       createdMs:       fields.created ? Date.parse(fields.created) : null,
@@ -1636,6 +1637,15 @@ async function hoursSinceAssigneeReply(client, channelId, threadTs, assigneeSlac
 // "48h old" on Monday morning.
 const FOLLOWUP_CADENCE_BH = parseFloat(process.env.FOLLOWUP_CADENCE_BH || '18');   // 2 working days (9h/day)
 const ESCALATE_AFTER_NUDGES = parseInt(process.env.FOLLOWUP_ESCALATE_AFTER || '2', 10);
+// At most this many reminders per card, EVER (counted in the thread, so a
+// deploy doesn't reset it): 2 to the assignee, then 1 that loops in the SM
+// and says it's the last. After that the card is the SM's call, not the bot's.
+const MAX_REMINDERS = parseInt(process.env.FOLLOWUP_MAX_REMINDERS || String(ESCALATE_AFTER_NUDGES + 1), 10);
+// The bot's own reminder messages (all wordings, old and new)
+const REMINDER_RE = /is assigned to you and still \*?To Do|checking in on .*\*?In Progress|has been \*?In Review\*? for|No response after \d+ reminder/i;
+// A person in the thread asking the bot to stop: 'đừng ping nữa', 'ko xài bot',
+// 'k muốn spam bot', 'stop reminding', 'cancel tracking'…
+const STOP_ASK_RE = /đừng (?:ping|nhắc|spam)|dung (?:ping|nhac)|(?:khỏi|không cần|ko cần|k cần) nhắc|(?:ko|k|không|khong) muốn spam|stop (?:remind|ping|follow|track)|no need to (?:remind|follow)|cancel (?:tracking|follow)|don'?t (?:ping|remind|spam)/i;
 
 function businessHoursBetween(startMs, endMs) {
   if (!startMs || endMs <= startMs) return 0;
@@ -1853,6 +1863,26 @@ function startFollowUpScheduler(client) {
         const workedHours = businessHoursBetween(since, Date.now());
         if (workedHours < FOLLOWUP_CADENCE_BH) continue;
 
+        // ── Should this card be chased at all? ─────────
+        // Reminders live in the Slack thread, so they're counted THERE — an
+        // in-memory count reset on every deploy and let old threads be nagged
+        // forever ('No response after 4 reminders'). Each stop is silent: the
+        // card simply leaves the follow-up list.
+        let replies = [];
+        try { replies = (await client.conversations.replies({ channel: item.channelId, ts: item.threadTs, limit: 200 })).messages || []; } catch (_) {}
+        const pastReminders = replies.filter(m => m.bot_id && (m.text || '').includes(jiraKey) && REMINDER_RE.test(m.text || '')).length;
+        const humanAskedToStop = replies.some(m => !m.bot_id && STOP_ASK_RE.test(m.text || ''));
+        const stopWhy =
+            !assigneeDisplay                  ? 'no assignee — nobody to remind'
+          : details.assigneeActive === false  ? `assignee ${assigneeDisplay} is deactivated`
+          : humanAskedToStop                  ? 'someone in the thread asked to stop the reminders'
+          : pastReminders >= MAX_REMINDERS    ? `already reminded ${pastReminders} time(s) — the limit`
+          : null;
+        if (stopWhy) {
+          console.log(`[FollowUp] ${jiraKey}: stop following up — ${stopWhy}`);
+          item.done = true; continue;
+        }
+
         // ── Read the thread before nudging ─────────────
         const threadContext = await getThread(client, item.channelId, item.threadTs);
         const hoursStale    = await hoursSinceAssigneeReply(client, item.channelId, item.threadTs, assigneeSlackId);
@@ -1869,7 +1899,7 @@ function startFollowUpScheduler(client) {
         if (assessment.action === 'close') { item.done = true; continue; }
         if (assessment.action === 'skip') { item.lastPingAt = Date.now(); continue; }   // recent activity → restart the clock
 
-        item.nudgeCount = (item.nudgeCount || 0) + 1;
+        item.nudgeCount = pastReminders + 1;            // this reminder's number, from the thread
         // Report the true age in the current status, not time since the last reminder
         const inStatusSince = Math.max(item.registeredAt || 0, item.lastStatusAt || 0);
         const days = Math.max(2, Math.floor(businessHoursBetween(inStatusSince, Date.now()) / 9));
@@ -1883,11 +1913,14 @@ function startFollowUpScheduler(client) {
         } else {
           pingText = `${assigneeMention}, ${link} has been *In Review* for ${days} working days. Once it's approved, please move it to *QA Ready* so QA can pick it up.`;
         }
-        // Repeated silence → loop in the squad lead
-        if (escalate) pingText += `\n_No response after ${item.nudgeCount - 1} reminders — fyi ${smMention}_`;
+        // Repeated silence → loop in the squad lead; the last reminder says so
+        const last = item.nudgeCount >= MAX_REMINDERS;
+        if (last) pingText += `\n_No response after ${item.nudgeCount - 1} reminders, so this is my last one — ${smMention}, please reassign, re-plan or close it._`;
+        else if (escalate) pingText += `\n_No response after ${item.nudgeCount - 1} reminders — fyi ${smMention}_`;
 
         await post(pingText);
         item.lastPingAt = Date.now();
+        if (last) { console.log(`[FollowUp] ${jiraKey}: last reminder sent — no longer following up`); item.done = true; }
 
       } catch (err) {
         console.error(`[FollowUp] Error processing ${jiraKey}:`, err.message);
