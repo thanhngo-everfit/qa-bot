@@ -51,8 +51,7 @@ const SQUAD_ROSTER = {
   // at runtime via users.lookupByEmail (hydrateRosterIds).
   'Core Product - Training & Automation': {
     contacts: [
-      { email: 'thanhngo@everfit.io',      id: 'U0142GU335F' },
-      { email: 'duyentran@everfit.io',     id: 'U06401J6QR4' },
+      { email: 'baoho@everfit.io',         id: 'U0445EQS1ED' },   // SM for every Core squad
       { email: 'anhlethi@everfit.io',      id: null },
     ],
     backend: 'Dong Vo', web: 'Hanh Tran', android: 'Khoa Huynh', ios: 'Tuyen Tran',
@@ -67,8 +66,7 @@ const SQUAD_ROSTER = {
   'Core Product - Platform Capability': {
     // Absorbed Integration & Middleware scope (squad dissolved)
     contacts: [
-      { email: 'thanhngo@everfit.io',      id: 'U0142GU335F' },
-      { email: 'duyentran@everfit.io',     id: 'U06401J6QR4' },
+      { email: 'baoho@everfit.io',         id: 'U0445EQS1ED' },   // SM for every Core squad
       { email: 'ngocnguyenthi@everfit.io', id: null },
     ],
     backend: 'Hong Tu', web: 'Nhan Huynh', android: 'Lam Bui', ios: 'Thinh Le',
@@ -97,7 +95,6 @@ const SQUAD_ROSTER = {
     contacts: [
       { email: 'baoho@everfit.io',     id: 'U0445EQS1ED' },
       { email: 'anhle@everfit.io',     id: 'U04PN2RHT4K' },
-      { email: 'duyentran@everfit.io', id: 'U06401J6QR4' },
     ],
     domains: [
       'enablement', 'coach onboarding', 'getting started', 'setup wizard',
