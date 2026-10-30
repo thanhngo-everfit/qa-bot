@@ -52,7 +52,7 @@ const SQUAD_ROSTER = {
   'Core Product - Training & Automation': {
     contacts: [
       { email: 'baoho@everfit.io',         id: 'U0445EQS1ED' },   // SM for every Core squad
-      { email: 'anhlethi@everfit.io',      id: null },
+      { email: 'anhlethi@everfit.io',      id: 'U0C1P9AB9HA' },   // Jessica Le (ASM)
     ],
     backend: 'Dong Vo', web: 'Hanh Tran', android: 'Khoa Huynh', ios: 'Tuyen Tran',
     domains: [
@@ -67,6 +67,7 @@ const SQUAD_ROSTER = {
     // Absorbed Integration & Middleware scope (squad dissolved)
     contacts: [
       { email: 'baoho@everfit.io',         id: 'U0445EQS1ED' },   // SM for every Core squad
+      { email: 'anhlethi@everfit.io',      id: 'U0C1P9AB9HA' },   // Jessica Le (ASM)
       { email: 'ngocnguyenthi@everfit.io', id: null },
     ],
     backend: 'Hong Tu', web: 'Nhan Huynh', android: 'Lam Bui', ios: 'Thinh Le',
